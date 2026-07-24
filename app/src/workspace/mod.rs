@@ -17,6 +17,7 @@ mod native_modal;
 mod one_time_modal_model;
 mod registry;
 pub mod rewind_confirmation_dialog;
+pub mod project_key;
 pub mod sync_inputs;
 pub mod tab_group;
 pub mod tab_settings;
