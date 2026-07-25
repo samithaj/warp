@@ -5182,6 +5182,10 @@ impl Workspace {
     }
 
     fn tab_navigation_data(&self, window_id: WindowId, ctx: &AppContext) -> Vec<TabNavigationData> {
+        // In project mode the Ctrl-Tab palette lists only the selected project's
+        // tasks, so most-recently-used cycling stays inside the project the user
+        // is working in rather than jumping across projects.
+        let project_visible = self.project_visible_indices(ctx);
         self.tab_mru_order
             .iter()
             .filter_map(|&pane_group_id| {
@@ -5190,6 +5194,11 @@ impl Workspace {
                     .iter()
                     .enumerate()
                     .find(|(_, t)| t.pane_group.id() == pane_group_id)?;
+                if let Some(visible) = &project_visible
+                    && !visible.contains(&tab_index)
+                {
+                    return None;
+                }
                 let title = tab.pane_group.as_ref(ctx).display_title(ctx);
                 let subtitle = tab
                     .pane_group
@@ -22737,15 +22746,21 @@ impl Workspace {
     /// clickable row per open project. Clicking a project dispatches
     /// `WorkspaceAction::SelectProject`, which activates that project's
     /// most-recently-used tab (and, via the active∈selected invariant, filters
-    /// the top tab bar to it). The selected project is marked with a leading
-    /// caret. Only meaningful when the feature is enabled and >1 project is open.
+    /// the top tab bar to it). The selected project row is highlighted, and rows
+    /// highlight on hover. Only shown when the feature is enabled and more than
+    /// one project is open.
     fn render_project_rail(&self, ctx: &AppContext) -> Box<dyn Element> {
-        const RAIL_MAX_WIDTH: f32 = 160.;
+        const RAIL_WIDTH: f32 = 168.;
+        const ROW_CORNER_RADIUS: f32 = 6.;
+        const ROW_SIDE_MARGIN: f32 = 6.;
 
         let appearance = Appearance::as_ref(ctx);
         let theme = appearance.theme();
         let font_family = appearance.ui_font_family();
         let text_color = theme.main_text_color(theme.background());
+        let muted_color = theme.sub_text_color(theme.background());
+        let selected_bg = internal_colors::fg_overlay_2(theme);
+        let hover_bg = internal_colors::fg_overlay_1(theme);
         let layout = ProjectLayout::compute(&self.tabs, ctx);
         let selected = self.selected_project.clone();
 
@@ -22753,7 +22768,7 @@ impl Workspace {
         column.add_child(
             Container::new(
                 Text::new_inline("Projects".to_string(), font_family, 11.)
-                    .with_color(text_color.into())
+                    .with_color(muted_color.into())
                     .finish(),
             )
             .with_padding_left(12.)
@@ -22770,22 +22785,29 @@ impl Workspace {
                 .entry(entry.id.clone())
                 .or_default()
                 .clone();
-            // A leading caret marks the selected project without custom styling.
-            let marker = if is_selected { "▸" } else { " " };
-            let label = format!("{marker} {}", entry.display_name);
+            let label = entry.display_name.clone();
             let dispatch_id = entry.id.clone();
-            let row = Hoverable::new(mouse_state, move |_state| {
-                Container::new(
+            let row = Hoverable::new(mouse_state, move |state| {
+                let mut container = Container::new(
                     Text::new_inline(label, font_family, 13.)
                         .with_color(text_color.into())
                         .finish(),
                 )
-                .with_padding_left(12.)
-                .with_padding_right(12.)
+                .with_padding_left(10.)
+                .with_padding_right(10.)
                 .with_padding_top(5.)
                 .with_padding_bottom(5.)
-                .finish()
+                .with_margin_left(ROW_SIDE_MARGIN)
+                .with_margin_right(ROW_SIDE_MARGIN)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)));
+                if is_selected {
+                    container = container.with_background(selected_bg);
+                } else if state.is_hovered() {
+                    container = container.with_background(hover_bg);
+                }
+                container.finish()
             })
+            .with_cursor(Cursor::PointingHand)
             .on_click(move |ctx, _, _| {
                 ctx.dispatch_typed_action(WorkspaceAction::SelectProject(dispatch_id.clone()));
             })
@@ -22794,7 +22816,7 @@ impl Workspace {
         }
 
         ConstrainedBox::new(column.finish())
-            .with_max_width(RAIL_MAX_WIDTH)
+            .with_width(RAIL_WIDTH)
             .finish()
     }
 
