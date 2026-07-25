@@ -64,3 +64,18 @@ fn other_bucket_is_named_other() {
     let layout = layout_from(vec![ProjectId::Other]);
     assert!(!layout.has_multiple_projects());
 }
+
+#[test]
+fn cycle_next_and_prev_wrap_within_subset() {
+    use super::{cycle_next, cycle_prev};
+    let visible = [0usize, 2, 5];
+    assert_eq!(cycle_next(&visible, 0), 2);
+    assert_eq!(cycle_next(&visible, 5), 0); // wraps to start
+    assert_eq!(cycle_prev(&visible, 0), 5); // wraps to end
+    assert_eq!(cycle_prev(&visible, 2), 0);
+    // A current index outside the subset falls back to the first visible tab.
+    assert_eq!(cycle_next(&visible, 3), 0);
+    assert_eq!(cycle_prev(&visible, 3), 0);
+    // Empty subset returns current unchanged.
+    assert_eq!(cycle_next(&[], 4), 4);
+}

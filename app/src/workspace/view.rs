@@ -496,7 +496,7 @@ use crate::workspace::header_toolbar_editor::{HeaderToolbarEditorEvent, HeaderTo
 use crate::workspace::header_toolbar_item::HeaderToolbarItemKind;
 use crate::workspace::one_time_modal_model::OneTimeModalModel;
 use crate::workspace::sync_inputs::SyncedInputState;
-use crate::workspace::project_layout::{ProjectId, ProjectLayout};
+use crate::workspace::project_layout::{self, ProjectId, ProjectLayout};
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::TabCloseButtonPosition;
 use crate::workspace::toast_stack::{
@@ -5395,6 +5395,20 @@ impl Workspace {
     /// Computes the current project-layout projection from the open tabs.
     pub(crate) fn project_layout(&self, ctx: &AppContext) -> ProjectLayout {
         ProjectLayout::compute(&self.tabs, ctx)
+    }
+
+    /// When project mode is active and a project is selected, the raw
+    /// `Workspace::tabs` indices visible under it (in tab order). `None` means
+    /// no project filtering — the feature is off or nothing is selected — and
+    /// callers fall back to operating over all tabs. This is the single filter
+    /// every navigation/render path consults, so what renders and what
+    /// navigates always agree.
+    fn project_visible_indices(&self, ctx: &AppContext) -> Option<Vec<usize>> {
+        if !FeatureFlag::Projects.is_enabled() {
+            return None;
+        }
+        let selected = self.selected_project.as_ref()?;
+        Some(ProjectLayout::compute(&self.tabs, ctx).visible_tab_indices(selected))
     }
 
     /// Selects a project in the rail by activating that project's
@@ -11834,6 +11848,11 @@ impl Workspace {
     }
 
     pub fn activate_prev_tab(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(visible) = self.project_visible_indices(ctx) {
+            let index = project_layout::cycle_prev(&visible, self.active_tab_index);
+            self.activate_tab(index, ctx);
+            return;
+        }
         let index = if self.vertical_tabs_panel.search_query.is_empty() {
             if self.active_tab_index > 0 {
                 self.active_tab_index - 1
@@ -11858,6 +11877,11 @@ impl Workspace {
     }
 
     pub fn activate_next_tab(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(visible) = self.project_visible_indices(ctx) {
+            let index = project_layout::cycle_next(&visible, self.active_tab_index);
+            self.activate_tab(index, ctx);
+            return;
+        }
         let index = if self.vertical_tabs_panel.search_query.is_empty() {
             if self.active_tab_index + 1 < self.tabs.len() {
                 self.active_tab_index + 1
@@ -11884,6 +11908,19 @@ impl Workspace {
         if self.tabs.len() > 1 {
             let target_index = self.tabs.len() - 1;
             self.activate_tab(target_index, ctx);
+        }
+    }
+
+    /// Activates the `num`-th tab (1-based). In project mode this counts within
+    /// the selected project's visible tabs; otherwise it is the raw index.
+    pub fn activate_tab_by_number(&mut self, num: usize, ctx: &mut ViewContext<Self>) {
+        let nth = num.saturating_sub(1);
+        let index = match self.project_visible_indices(ctx) {
+            Some(visible) => visible.get(nth).or_else(|| visible.last()).copied(),
+            None => Some(nth),
+        };
+        if let Some(index) = index {
+            self.activate_tab(index, ctx);
         }
     }
 
@@ -12197,10 +12234,15 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) {
         // Figure out what indices we want to delete for the "other tabs" case.
-        let indices_to_remove = (0..self.tabs.len()).filter(|i| *i != index);
+        // In project mode this is scoped to the selected project's visible tabs,
+        // so it never closes tabs belonging to another project.
+        let indices_to_remove: Vec<usize> = match self.project_visible_indices(ctx) {
+            Some(visible) => visible.into_iter().filter(|i| *i != index).collect(),
+            None => (0..self.tabs.len()).filter(|i| *i != index).collect(),
+        };
 
         let tabs_closed = self.close_tabs(
-            indices_to_remove,
+            indices_to_remove.into_iter(),
             OpenDialogSource::CloseOtherTabs { tab_index: index },
             skip_confirmation,
             true,
@@ -12227,12 +12269,24 @@ impl Workspace {
         skip_confirmation: bool,
         ctx: &mut ViewContext<Self>,
     ) {
-        let indices_to_remove = match direction {
-            TabMovement::Left => 0..index,
-            TabMovement::Right => (index + 1)..self.tabs.len(),
+        // In project mode, "left/right" is relative to the tab's position within
+        // its project's visible tabs, so other projects' tabs are never closed.
+        let indices_to_remove: Vec<usize> = match self.project_visible_indices(ctx) {
+            Some(visible) => {
+                let pos = visible.iter().position(|&i| i == index);
+                match (direction, pos) {
+                    (TabMovement::Left, Some(p)) => visible[..p].to_vec(),
+                    (TabMovement::Right, Some(p)) => visible[p + 1..].to_vec(),
+                    _ => Vec::new(),
+                }
+            }
+            None => match direction {
+                TabMovement::Left => (0..index).collect(),
+                TabMovement::Right => ((index + 1)..self.tabs.len()).collect(),
+            },
         };
         let tabs_closed = self.close_tabs(
-            indices_to_remove,
+            indices_to_remove.into_iter(),
             OpenDialogSource::CloseTabsDirection {
                 tab_index: index,
                 direction,
@@ -20989,8 +21043,10 @@ impl Workspace {
 
             // Collapse tabs into render slots: each ungrouped tab is a
             // `Single`, and each contiguous run of same-group tabs is one
-            // `Group`.
-            let slots = self.tab_bar_slots();
+            // `Group`. In project mode the bar is filtered to the selected
+            // project's visible tabs.
+            let project_visible = self.project_visible_indices(ctx);
+            let slots = self.tab_bar_slots(project_visible.as_deref());
 
             // Render each slot in the tab bar, either an individual tab or tab group.
             for slot in &slots {
@@ -23854,7 +23910,7 @@ impl TypedActionView for Workspace {
 
         match action {
             ActivateTab(index) => self.activate_tab(*index, ctx),
-            ActivateTabByNumber(num) => self.activate_tab(num.saturating_sub(1), ctx),
+            ActivateTabByNumber(num) => self.activate_tab_by_number(*num, ctx),
             ActivatePrevTab => self.activate_prev_tab(ctx),
             OpenLaunchConfigSaveModal => self.open_launch_config_save_modal(ctx),
             ActivateNextTab => self.activate_next_tab(ctx),
@@ -27945,10 +28001,20 @@ impl Workspace {
     /// Collapses `self.tabs` into layout slots: each ungrouped tab is a `Single`,
     /// and each contiguous run of same-group tabs becomes one `Group`. Shared by
     /// tab/group rendering and insertion index calculations.
-    fn tab_bar_slots(&self) -> Vec<TabBarSlot> {
-        let grouped_tabs_enabled = FeatureFlag::GroupedTabs.is_enabled();
+    /// Builds the top tab bar's layout slots. When `visible` is `Some` (project
+    /// mode), only those raw `Workspace::tabs` indices are shown and manual
+    /// tab-groups are suppressed — the project is the grouping dimension, and
+    /// suppressing groups also avoids the contiguous-run hazard of interleaving
+    /// projects within a group. `TabBarSlot` still carries the real tab index.
+    fn tab_bar_slots(&self, visible: Option<&[usize]>) -> Vec<TabBarSlot> {
+        let grouped_tabs_enabled = FeatureFlag::GroupedTabs.is_enabled() && visible.is_none();
         let mut slots: Vec<TabBarSlot> = Vec::with_capacity(self.tabs.len());
         for (idx, tab) in self.tabs.iter().enumerate() {
+            if let Some(visible) = visible
+                && !visible.contains(&idx)
+            {
+                continue;
+            }
             let group_id = if grouped_tabs_enabled {
                 tab.group_id.filter(|gid| self.tab_groups.contains_key(gid))
             } else {
@@ -28022,7 +28088,10 @@ impl Workspace {
         // group, never inside; each ungrouped tab keeps its own row. Rects
         // clipped by overflow or outside the tab bar are dropped.
         let mut visible_tabs: Vec<(usize, RectF)> = Vec::with_capacity(self.tabs.len());
-        for slot in self.tab_bar_slots() {
+        // Use the same project filter the tab bar renders with, so drag
+        // insertion geometry matches what is on screen in project mode.
+        let project_visible = self.project_visible_indices(ctx);
+        for slot in self.tab_bar_slots(project_visible.as_deref()) {
             match slot {
                 TabBarSlot::Single { index } => {
                     if let Some(tab_position) =

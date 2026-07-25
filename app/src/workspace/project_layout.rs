@@ -118,6 +118,33 @@ impl ProjectLayout {
     }
 }
 
+/// The index reached by moving forward one step through `indices` from
+/// `current`, wrapping at the end. If `current` is not in `indices`, returns
+/// the first element (or `current` when empty). Used to cycle next-tab within a
+/// project's visible tabs.
+pub fn cycle_next(indices: &[usize], current: usize) -> usize {
+    if indices.is_empty() {
+        return current;
+    }
+    match indices.iter().position(|&index| index == current) {
+        Some(pos) => indices[(pos + 1) % indices.len()],
+        None => indices[0],
+    }
+}
+
+/// The index reached by moving backward one step through `indices` from
+/// `current`, wrapping at the start. If `current` is not in `indices`, returns
+/// the first element (or `current` when empty).
+pub fn cycle_prev(indices: &[usize], current: usize) -> usize {
+    if indices.is_empty() {
+        return current;
+    }
+    match indices.iter().position(|&index| index == current) {
+        Some(pos) => indices[(pos + indices.len() - 1) % indices.len()],
+        None => indices[0],
+    }
+}
+
 #[cfg(test)]
 #[path = "project_layout_tests.rs"]
 mod tests;
