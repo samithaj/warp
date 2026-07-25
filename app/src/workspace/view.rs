@@ -1029,6 +1029,9 @@ pub struct Workspace {
     pub(crate) tab_groups: HashMap<TabGroupId, TabGroup>,
     /// Per-group hover state for the horizontal tab bar.
     horizontal_tab_group_mouse_states: RefCell<HashMap<TabGroupId, HorizontalTabGroupMouseStates>>,
+    /// Per-project hover/click state for the project rail (created once per
+    /// project and persisted across renders, per the MouseStateHandle rule).
+    project_rail_mouse_states: RefCell<HashMap<ProjectId, MouseStateHandle>>,
     tab_rename_editor: ViewHandle<EditorView>,
     pane_rename_editor: ViewHandle<EditorView>,
     tab_group_rename_editor: ViewHandle<EditorView>,
@@ -3387,6 +3390,7 @@ impl Workspace {
             traffic_light_mouse_states: Default::default(),
             tab_groups: HashMap::new(),
             horizontal_tab_group_mouse_states: RefCell::default(),
+            project_rail_mouse_states: RefCell::default(),
             tab_rename_editor: Self::tab_rename_editor(ctx),
             pane_rename_editor: Self::pane_rename_editor(ctx),
             tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
@@ -22715,6 +22719,72 @@ impl Workspace {
         }
     }
 
+    /// Renders the project rail (Herdr-style Projects × Tasks layout): one
+    /// clickable row per open project. Clicking a project dispatches
+    /// `WorkspaceAction::SelectProject`, which activates that project's
+    /// most-recently-used tab (and, via the active∈selected invariant, filters
+    /// the top tab bar to it). The selected project is marked with a leading
+    /// caret. Only meaningful when the feature is enabled and >1 project is open.
+    fn render_project_rail(&self, ctx: &AppContext) -> Box<dyn Element> {
+        const RAIL_MAX_WIDTH: f32 = 160.;
+
+        let appearance = Appearance::as_ref(ctx);
+        let theme = appearance.theme();
+        let font_family = appearance.ui_font_family();
+        let text_color = theme.main_text_color(theme.background());
+        let layout = ProjectLayout::compute(&self.tabs, ctx);
+        let selected = self.selected_project.clone();
+
+        let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Start);
+        column.add_child(
+            Container::new(
+                Text::new_inline("Projects".to_string(), font_family.clone(), 11.)
+                    .with_color(text_color.into())
+                    .finish(),
+            )
+            .with_padding_left(12.)
+            .with_padding_top(10.)
+            .with_padding_bottom(6.)
+            .finish(),
+        );
+
+        for entry in layout.projects() {
+            let is_selected = selected.as_ref() == Some(&entry.id);
+            let mouse_state = self
+                .project_rail_mouse_states
+                .borrow_mut()
+                .entry(entry.id.clone())
+                .or_default()
+                .clone();
+            // A leading caret marks the selected project without custom styling.
+            let marker = if is_selected { "▸" } else { " " };
+            let label = format!("{marker} {}", entry.display_name);
+            let ff = font_family.clone();
+            let dispatch_id = entry.id.clone();
+            let row = Hoverable::new(mouse_state, move |_state| {
+                Container::new(
+                    Text::new_inline(label, ff, 13.)
+                        .with_color(text_color.into())
+                        .finish(),
+                )
+                .with_padding_left(12.)
+                .with_padding_right(12.)
+                .with_padding_top(5.)
+                .with_padding_bottom(5.)
+                .finish()
+            })
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(WorkspaceAction::SelectProject(dispatch_id.clone()));
+            })
+            .finish();
+            column.add_child(row);
+        }
+
+        ConstrainedBox::new(column.finish())
+            .with_max_width(RAIL_MAX_WIDTH)
+            .finish()
+    }
+
     fn render_panels(
         &self,
         app: &AppContext,
@@ -22723,6 +22793,17 @@ impl Workspace {
     ) -> Box<dyn Element> {
         let mut panels_view = Flex::row();
         let mut prev_panel_added = false;
+
+        // Project rail (Herdr-style Projects × Tasks layout) sits at the far
+        // left, as an outer sibling of the existing panels. Shown only when the
+        // feature is enabled and more than one project is open.
+        if !hide_vertical_tabs
+            && FeatureFlag::Projects.is_enabled()
+            && self.project_layout(app).has_multiple_projects()
+        {
+            panels_view.add_child(self.render_project_rail(app));
+            panels_view.add_child(Self::render_panel_separator(app));
+        }
 
         // Config-driven vertical-tabs-era panels (left side).
         // Hidden for simplified WASM views (notebooks, shared sessions, etc.)

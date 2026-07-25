@@ -924,6 +924,7 @@ impl WorkspaceAction {
             ContinueThirdPartyConversationLocally { .. } => true,
             ActivateTab(_)
             | ActivateTabByNumber(_)
+            | SelectProject(_)
             | ActivatePrevTab
             | ActivateNextTab
             | ActivateLastTab
