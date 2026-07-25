@@ -64,7 +64,9 @@ impl ProjectKey {
             .as_ref()
             .and_then(LocalOrRemotePath::to_local_path)
             .unwrap_or(local);
-        StandardizedPath::try_from_local(dir).ok().map(Self::LocalDir)
+        StandardizedPath::try_from_local(dir)
+            .ok()
+            .map(Self::LocalDir)
     }
 
     #[cfg(not(feature = "local_fs"))]

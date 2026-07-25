@@ -59,9 +59,7 @@ impl HeaderToolbarItemKind {
     /// Does not check user show/hide preferences — use `is_available` for that.
     pub fn is_supported(&self, app: &AppContext) -> bool {
         match self {
-            Self::TabsPanel => {
-                vertical_tabs_layout_active(app)
-            }
+            Self::TabsPanel => vertical_tabs_layout_active(app),
             Self::ToolsPanel => true,
             Self::AgentManagement => {
                 let is_web_anonymous_user = AuthStateProvider::as_ref(app)

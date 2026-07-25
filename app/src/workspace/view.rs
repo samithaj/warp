@@ -495,8 +495,8 @@ use crate::workspace::cross_window_tab_drag::{
 use crate::workspace::header_toolbar_editor::{HeaderToolbarEditorEvent, HeaderToolbarEditorModal};
 use crate::workspace::header_toolbar_item::HeaderToolbarItemKind;
 use crate::workspace::one_time_modal_model::OneTimeModalModel;
-use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::project_layout::{self, ProjectId, ProjectLayout};
+use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::TabCloseButtonPosition;
 use crate::workspace::toast_stack::{
@@ -4136,8 +4136,7 @@ impl Workspace {
         workspace_setting: &NewWorkspaceSource,
         ctx: &AppContext,
     ) -> bool {
-        let should_default_open =
-            vertical_tabs_layout_active(ctx);
+        let should_default_open = vertical_tabs_layout_active(ctx);
 
         match workspace_setting {
             NewWorkspaceSource::Restored {
@@ -5390,11 +5389,6 @@ impl Workspace {
         }
     }
 
-    /// The project currently selected in the rail, if the feature is active.
-    pub(crate) fn selected_project(&self) -> Option<&ProjectId> {
-        self.selected_project.as_ref()
-    }
-
     /// Computes the current project-layout projection from the open tabs.
     pub(crate) fn project_layout(&self, ctx: &AppContext) -> ProjectLayout {
         ProjectLayout::compute(&self.tabs, ctx)
@@ -5414,24 +5408,51 @@ impl Workspace {
         Some(ProjectLayout::compute(&self.tabs, ctx).visible_tab_indices(selected))
     }
 
-    /// Selects a project in the rail by activating that project's
-    /// most-recently-used visible tab, preserving the invariant that the active
-    /// tab belongs to the selected project. If the project has no open tabs, the
-    /// selection is set directly.
-    pub(crate) fn select_project(&mut self, project: &ProjectId, ctx: &mut ViewContext<Self>) {
-        let layout = ProjectLayout::compute(&self.tabs, ctx);
-        let visible = layout.visible_tab_indices(project);
-        let target = visible.iter().copied().min_by_key(|&index| {
+    /// The most-recently-used tab among `indices`, by consulting
+    /// `tab_mru_order`. Indices not present in the MRU order sort last.
+    fn mru_tab_index(&self, indices: &[usize]) -> Option<usize> {
+        indices.iter().copied().min_by_key(|&index| {
             let pane_group_id = self.tabs[index].pane_group.id();
             self.tab_mru_order
                 .iter()
                 .position(|id| *id == pane_group_id)
                 .unwrap_or(usize::MAX)
-        });
-        match target {
+        })
+    }
+
+    /// Selects a project in the rail by activating that project's
+    /// most-recently-used visible tab, preserving the invariant that the active
+    /// tab belongs to the selected project. If the project has no open tabs, the
+    /// selection is set directly.
+    pub(crate) fn select_project(&mut self, project: &ProjectId, ctx: &mut ViewContext<Self>) {
+        let visible = ProjectLayout::compute(&self.tabs, ctx).visible_tab_indices(project);
+        match self.mru_tab_index(&visible) {
             Some(index) => self.set_active_tab_index(index, ctx),
             None => self.selected_project = Some(project.clone()),
         }
+    }
+
+    /// The directory a new tab should open in so it becomes a task under the
+    /// selected project, rather than landing in another project (or "Other").
+    ///
+    /// Uses the working directory of the project's most-recently-used tab,
+    /// which keeps `+` inside the specific worktree the user was last in —
+    /// the project key is the repo's shared git dir, which for a linked
+    /// worktree points at the *main* checkout, so it is not a usable cwd.
+    /// Returns `None` (falling back to the default startup directory) when the
+    /// feature is off, nothing is selected, or the project is remote.
+    fn selected_project_startup_directory(&self, ctx: &AppContext) -> Option<PathBuf> {
+        if !FeatureFlag::Projects.is_enabled() {
+            return None;
+        }
+        let selected = self.selected_project.as_ref()?;
+        let visible = ProjectLayout::compute(&self.tabs, ctx).visible_tab_indices(selected);
+        let index = self.mru_tab_index(&visible)?;
+        self.tabs[index]
+            .pane_group
+            .as_ref(ctx)
+            .active_session_path(ctx)
+            .filter(|path| path.is_dir())
     }
 
     /// Change the active tab index. This must be used instead of setting `self.active_tab_index`
@@ -5471,9 +5492,7 @@ impl Workspace {
                 self.selected_project = Some(project);
             }
         }
-        if self.vertical_tabs_panel_open
-            && vertical_tabs_layout_active(ctx)
-        {
+        if self.vertical_tabs_panel_open && vertical_tabs_layout_active(ctx) {
             self.vertical_tabs_panel.scroll_to_tab(index);
         }
 
@@ -6898,8 +6917,7 @@ impl Workspace {
         anchor: NewSessionMenuAnchor,
         ctx: &ViewContext<Self>,
     ) -> f32 {
-        let use_vertical_tabs =
-            vertical_tabs_layout_active(ctx);
+        let use_vertical_tabs = vertical_tabs_layout_active(ctx);
         match anchor {
             NewSessionMenuAnchor::AddTabButton(position)
                 if use_vertical_tabs && self.vertical_tabs_panel_open =>
@@ -6927,8 +6945,7 @@ impl Workspace {
     }
 
     fn toggle_tab_configs_menu(&mut self, ctx: &mut ViewContext<Self>) {
-        let use_vertical_tabs =
-            vertical_tabs_layout_active(ctx);
+        let use_vertical_tabs = vertical_tabs_layout_active(ctx);
         if self.show_new_session_dropdown_menu.is_some() {
             self.close_new_session_dropdown_menu(ctx);
             return;
@@ -12635,14 +12652,19 @@ impl Workspace {
             .map(PathBuf::from)
             .filter(|path| path.is_dir());
 
-        let startup_directory = startup_directory_from_conversation.or_else(|| {
-            self.get_new_tab_startup_directory(
-                new_session_source,
-                previous_session_window_id,
-                chosen_shell.as_ref(),
-                ctx,
-            )
-        });
+        // In project mode, `+` creates a task inside the selected project, so the
+        // new tab shows up under the project the user is looking at. A restored
+        // conversation's own directory still wins.
+        let startup_directory = startup_directory_from_conversation
+            .or_else(|| self.selected_project_startup_directory(ctx))
+            .or_else(|| {
+                self.get_new_tab_startup_directory(
+                    new_session_source,
+                    previous_session_window_id,
+                    chosen_shell.as_ref(),
+                    ctx,
+                )
+            });
 
         self.add_tab_with_pane_layout(
             PanesLayout::SingleTerminal(Box::new(NewTerminalOptions {
@@ -14213,8 +14235,8 @@ impl Workspace {
             || self.traffic_light_mouse_states.are_traffic_lights_hovered();
 
         // Check if any of the menus/popups rendered relative to the tab bar are open.
-        let is_vertical_tabs_active = vertical_tabs_layout_active(app)
-            && self.vertical_tabs_panel_open;
+        let is_vertical_tabs_active =
+            vertical_tabs_layout_active(app) && self.vertical_tabs_panel_open;
         let is_tab_menu_open = self.show_tab_bar_overflow_menu
             || (self.show_tab_right_click_menu.is_some() && !is_vertical_tabs_active)
             || (self.show_new_session_dropdown_menu.is_some() && !is_vertical_tabs_active)
@@ -20452,8 +20474,7 @@ impl Workspace {
         appearance: &Appearance,
         ctx: &AppContext,
     ) -> Box<dyn Element> {
-        let vertical_tabs_active =
-            vertical_tabs_layout_active(ctx);
+        let vertical_tabs_active = vertical_tabs_layout_active(ctx);
 
         let (is_active, tooltip_text, action, keybinding_name, save_position_id) =
             if vertical_tabs_active {
@@ -20922,8 +20943,7 @@ impl Workspace {
         }
 
         // Check if vertical tabs mode is active
-        let vertical_tabs_active =
-            vertical_tabs_layout_active(ctx);
+        let vertical_tabs_active = vertical_tabs_layout_active(ctx);
 
         // Render config-driven left-side toolbar buttons (both horizontal and vertical tabs)
         let knowledge_center_closed = true;
@@ -21168,8 +21188,7 @@ impl Workspace {
         if !item.is_available(ctx) {
             return None;
         }
-        let vertical_tabs_active =
-            vertical_tabs_layout_active(ctx);
+        let vertical_tabs_active = vertical_tabs_layout_active(ctx);
         let inner = match item {
             HeaderToolbarItemKind::TabsPanel => self.render_left_toggle_button(appearance, ctx),
             HeaderToolbarItemKind::ToolsPanel => {
@@ -22104,8 +22123,7 @@ impl Workspace {
             None => active_content,
         };
 
-        let vertical_tabs_active =
-            vertical_tabs_layout_active(app);
+        let vertical_tabs_active = vertical_tabs_layout_active(app);
         let pane_group = self.active_tab_pane_group().as_ref(app);
         let is_right_open = pane_group.right_panel_open;
         let is_right_maximized = is_right_open && pane_group.is_right_panel_maximized;
@@ -22650,8 +22668,7 @@ impl Workspace {
         let mut contents = contents;
 
         let traffic_light_data = traffic_light_data(app, self.window_id);
-        let vertical_tabs_active =
-            vertical_tabs_layout_active(app);
+        let vertical_tabs_active = vertical_tabs_layout_active(app);
         // Add a spacer for the traffic light buttons on Windows/Linux.
         if traffic_light_data.is_some_and(|data| data.side == TrafficLightSide::Right)
             && *side == PanelPosition::Right
@@ -22735,7 +22752,7 @@ impl Workspace {
         let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Start);
         column.add_child(
             Container::new(
-                Text::new_inline("Projects".to_string(), font_family.clone(), 11.)
+                Text::new_inline("Projects".to_string(), font_family, 11.)
                     .with_color(text_color.into())
                     .finish(),
             )
@@ -22756,11 +22773,10 @@ impl Workspace {
             // A leading caret marks the selected project without custom styling.
             let marker = if is_selected { "▸" } else { " " };
             let label = format!("{marker} {}", entry.display_name);
-            let ff = font_family.clone();
             let dispatch_id = entry.id.clone();
             let row = Hoverable::new(mouse_state, move |_state| {
                 Container::new(
-                    Text::new_inline(label, ff, 13.)
+                    Text::new_inline(label, font_family, 13.)
                         .with_color(text_color.into())
                         .finish(),
                 )
@@ -22805,8 +22821,7 @@ impl Workspace {
         // Config-driven vertical-tabs-era panels (left side).
         // Hidden for simplified WASM views (notebooks, shared sessions, etc.)
         // where these panels are unnecessary.
-        let vertical_tabs_active = !hide_vertical_tabs
-            && vertical_tabs_layout_active(app);
+        let vertical_tabs_active = !hide_vertical_tabs && vertical_tabs_layout_active(app);
 
         // In vertical tabs mode, config-driven panels are rendered here.
         // In horizontal tabs mode, they're rendered inside render_banner_and_active_tab.
@@ -24854,9 +24869,7 @@ impl TypedActionView for Workspace {
                 }
             }
             ToggleVerticalTabsSettingsPopup => {
-                if vertical_tabs_layout_active(ctx)
-                    && self.vertical_tabs_panel_open
-                {
+                if vertical_tabs_layout_active(ctx) && self.vertical_tabs_panel_open {
                     self.vertical_tabs_panel.show_settings_popup =
                         !self.vertical_tabs_panel.show_settings_popup;
                     ctx.notify();
@@ -26865,8 +26878,7 @@ impl View for Workspace {
         }
 
         if let Some((tab_idx, right_click_menu_anchor)) = self.show_tab_right_click_menu {
-            let is_vertical = vertical_tabs_layout_active(app)
-                && self.vertical_tabs_panel_open;
+            let is_vertical = vertical_tabs_layout_active(app) && self.vertical_tabs_panel_open;
             if tab_bar_mode.has_tab_bar() || is_vertical {
                 let positioning = if is_vertical {
                     match right_click_menu_anchor {
@@ -26926,8 +26938,7 @@ impl View for Workspace {
         // Rendered for both the horizontal tab bar and the vertical tabs panel
         // — the right-click handlers on both surfaces dispatch the same action.
         if let Some((_tab_idx, anchor)) = self.show_tab_selection_right_click_menu {
-            let is_vertical = vertical_tabs_layout_active(app)
-                && self.vertical_tabs_panel_open;
+            let is_vertical = vertical_tabs_layout_active(app) && self.vertical_tabs_panel_open;
             if tab_bar_mode.has_tab_bar() || is_vertical {
                 let position = match anchor {
                     TabContextMenuAnchor::Pointer(position) => position,
@@ -26957,8 +26968,7 @@ impl View for Workspace {
 
         // Tab group more-options menu (reuses the `tab_right_click_menu` view).
         if let Some((group_id, anchor)) = self.show_tab_group_right_click_menu {
-            let is_vertical = vertical_tabs_layout_active(app)
-                && self.vertical_tabs_panel_open;
+            let is_vertical = vertical_tabs_layout_active(app) && self.vertical_tabs_panel_open;
             let positioning = match (is_vertical, anchor) {
                 (true, TabContextMenuAnchor::VerticalTabsKebab) => {
                     let tabs_side = Self::tabs_panel_side(
@@ -27011,8 +27021,7 @@ impl View for Workspace {
         // Render the new session dropdown menu. This is outside the tab bar visibility
         // gate because it can also be opened from the vertical tabs panel.
         if let Some(menu_anchor) = self.show_new_session_dropdown_menu {
-            let is_vertical = vertical_tabs_layout_active(app)
-                && self.vertical_tabs_panel_open;
+            let is_vertical = vertical_tabs_layout_active(app) && self.vertical_tabs_panel_open;
 
             match (is_vertical, menu_anchor) {
                 (true, NewSessionMenuAnchor::AddTabButton(_)) => {
@@ -27284,8 +27293,7 @@ impl View for Workspace {
         }
 
         if self.should_show_session_config_tab_config_chip() {
-            let use_vertical = vertical_tabs_layout_active(app)
-                && self.vertical_tabs_panel_open;
+            let use_vertical = vertical_tabs_layout_active(app) && self.vertical_tabs_panel_open;
             let chip =
                 self.render_session_config_tab_config_chip(use_vertical, Appearance::as_ref(app));
             if use_vertical {
@@ -28661,8 +28669,7 @@ impl Workspace {
             return;
         }
 
-        let use_vertical_tabs =
-            vertical_tabs_layout_active(ctx);
+        let use_vertical_tabs = vertical_tabs_layout_active(ctx);
         let groups_enabled = FeatureFlag::GroupedTabs.is_enabled();
 
         if groups_enabled {
