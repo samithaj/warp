@@ -496,6 +496,7 @@ use crate::workspace::header_toolbar_editor::{HeaderToolbarEditorEvent, HeaderTo
 use crate::workspace::header_toolbar_item::HeaderToolbarItemKind;
 use crate::workspace::one_time_modal_model::OneTimeModalModel;
 use crate::workspace::sync_inputs::SyncedInputState;
+use crate::workspace::project_layout::{ProjectId, ProjectLayout};
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::TabCloseButtonPosition;
 use crate::workspace::toast_stack::{
@@ -1015,6 +1016,11 @@ pub struct Workspace {
     /// Tracks tab activation order (most-recently-used first).
     /// Each entry is the `pane_group.id()` of the corresponding tab.
     tab_mru_order: Vec<EntityId>,
+    /// The project currently selected in the project rail (Herdr-style
+    /// Projects × Tasks layout, gated by `FeatureFlag::Projects`). This is a
+    /// derived runtime value kept equal to the project of the active tab; it is
+    /// not persisted (reconstructed from the restored active tab).
+    selected_project: Option<ProjectId>,
     pub(crate) hovered_tab_index: Option<TabBarHoverIndex>,
     tab_bar_hover_state: MouseStateHandle,
     tab_fixed_width: Option<f32>,
@@ -3375,6 +3381,7 @@ impl Workspace {
             tabs: Vec::new(),
             active_tab_index: 0,
             tab_mru_order: Vec::new(),
+            selected_project: None,
             hovered_tab_index: None,
             tab_bar_hover_state: Default::default(),
             traffic_light_mouse_states: Default::default(),
@@ -5380,6 +5387,36 @@ impl Workspace {
         }
     }
 
+    /// The project currently selected in the rail, if the feature is active.
+    pub(crate) fn selected_project(&self) -> Option<&ProjectId> {
+        self.selected_project.as_ref()
+    }
+
+    /// Computes the current project-layout projection from the open tabs.
+    pub(crate) fn project_layout(&self, ctx: &AppContext) -> ProjectLayout {
+        ProjectLayout::compute(&self.tabs, ctx)
+    }
+
+    /// Selects a project in the rail by activating that project's
+    /// most-recently-used visible tab, preserving the invariant that the active
+    /// tab belongs to the selected project. If the project has no open tabs, the
+    /// selection is set directly.
+    pub(crate) fn select_project(&mut self, project: &ProjectId, ctx: &mut ViewContext<Self>) {
+        let layout = ProjectLayout::compute(&self.tabs, ctx);
+        let visible = layout.visible_tab_indices(project);
+        let target = visible.iter().copied().min_by_key(|&index| {
+            let pane_group_id = self.tabs[index].pane_group.id();
+            self.tab_mru_order
+                .iter()
+                .position(|id| *id == pane_group_id)
+                .unwrap_or(usize::MAX)
+        });
+        match target {
+            Some(index) => self.set_active_tab_index(index, ctx),
+            None => self.selected_project = Some(project.clone()),
+        }
+    }
+
     /// Change the active tab index. This must be used instead of setting `self.active_tab_index`
     /// directly, as it updates related state.
     pub(crate) fn set_active_tab_index(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
@@ -5403,6 +5440,19 @@ impl Workspace {
             let pane_group_id = tab.pane_group.id();
             self.tab_mru_order.retain(|id| *id != pane_group_id);
             self.tab_mru_order.insert(0, pane_group_id);
+        }
+
+        // Projects × Tasks invariant: the active tab always belongs to the
+        // selected project, so activating any tab re-points the rail selection
+        // at that tab's project. Only maintained when the feature is enabled.
+        if FeatureFlag::Projects.is_enabled() {
+            let project = self
+                .tabs
+                .get(index)
+                .map(|tab| ProjectLayout::project_of_tab_data(tab, ctx));
+            if let Some(project) = project {
+                self.selected_project = Some(project);
+            }
         }
         if self.vertical_tabs_panel_open
             && FeatureFlag::VerticalTabs.is_enabled()

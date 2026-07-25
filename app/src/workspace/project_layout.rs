@@ -62,7 +62,7 @@ impl ProjectLayout {
         let mut tab_pane_group_ids = Vec::with_capacity(tabs.len());
 
         for tab in tabs {
-            let id = Self::project_id_for_tab(tab, ctx);
+            let id = Self::project_of_tab_data(tab, ctx);
             if !projects.iter().any(|entry| entry.id == id) {
                 projects.push(ProjectEntry {
                     display_name: id.display_name(),
@@ -81,7 +81,7 @@ impl ProjectLayout {
     }
 
     /// Resolves the project of a single tab from its focused session path.
-    fn project_id_for_tab(tab: &TabData, ctx: &AppContext) -> ProjectId {
+    pub fn project_of_tab_data(tab: &TabData, ctx: &AppContext) -> ProjectId {
         let path: Option<PathBuf> = tab.pane_group.as_ref(ctx).active_session_path(ctx);
         path.and_then(|path| ProjectKey::for_path(&LocalOrRemotePath::Local(path), ctx))
             .map(ProjectId::Key)
