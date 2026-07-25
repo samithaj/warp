@@ -579,6 +579,22 @@ define_settings_group!(TabSettings, settings: [
     directory_tab_colors: DirectoryTabColors,
 ]);
 
+/// Whether the vertical-tabs sidebar layout is active.
+///
+/// Single source of truth for the vertical-vs-horizontal tab layout decision,
+/// so no render site can disagree with another. In project mode
+/// (`FeatureFlag::Projects`, the Herdr-style Projects × Tasks layout) the left
+/// rail is owned by the project list and tasks live on the horizontal top tab
+/// bar, so the vertical tabs sidebar is suppressed.
+pub fn vertical_tabs_layout_active(ctx: &warpui::AppContext) -> bool {
+    use warp_core::features::FeatureFlag;
+    use warpui::SingletonEntity as _;
+
+    FeatureFlag::VerticalTabs.is_enabled()
+        && *TabSettings::as_ref(ctx).use_vertical_tabs
+        && !FeatureFlag::Projects.is_enabled()
+}
+
 #[cfg(test)]
 #[path = "tab_settings_tests.rs"]
 mod tests;
