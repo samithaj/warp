@@ -23949,6 +23949,7 @@ impl TypedActionView for Workspace {
                 );
             }
             SetActiveTabName(name) => self.set_active_tab_name(name, ctx),
+            SelectProject(project) => self.select_project(project, ctx),
             SetActiveTabColor(color) => {
                 // When the active tab is in a group, redirect to the group's color.
                 // The tab color selection menu is hidden when a tab is part of a group

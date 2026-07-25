@@ -12,6 +12,7 @@ use warpui::platform::Cursor;
 use warpui::{EntityId, WeakViewHandle, WindowId};
 
 use super::global_actions::{ForkFromExchange, ForkedConversationDestination};
+use super::project_layout::ProjectId;
 use super::tab_settings::{
     VerticalTabsCompactSubtitle, VerticalTabsDisplayGranularity, VerticalTabsPrimaryInfo,
     VerticalTabsTabItemMode, VerticalTabsViewMode,
@@ -146,6 +147,9 @@ pub enum WorkspaceAction {
     /// (see #9351). The context-menu path keeps using `RenamePane(locator)`.
     RenameActivePane,
     SetActiveTabName(String),
+    /// Selects a project in the project rail (Herdr-style Projects × Tasks
+    /// layout). Activates that project's most-recently-used visible tab.
+    SelectProject(ProjectId),
     /// Sets the manual color override for the active tab.
     ///
     /// - `Color(_)` — apply that color.
