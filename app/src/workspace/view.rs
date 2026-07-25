@@ -151,7 +151,8 @@ use super::rewind_confirmation_dialog::{
 };
 use super::tab_settings::{
     HeaderToolbarChipSelection, NewTabPlacement, TabSettings, TabSettingsChangedEvent,
-    VerticalTabsDisplayGranularity, WorkspaceDecorationVisibility, vertical_tabs_layout_active,
+    VerticalTabsDisplayGranularity, WorkspaceDecorationVisibility, project_layout_active,
+    vertical_tabs_layout_active,
 };
 use super::util::{
     PaneViewLocator, TabMovement, TerminalSessionFallbackBehavior, WelcomeTipsViewState,
@@ -3799,6 +3800,25 @@ impl Workspace {
                 self.sync_window_button_visibility(ctx);
                 ctx.notify();
             }
+            TabSettingsChangedEvent::UseProjectLayout { .. } => {
+                if project_layout_active(ctx) {
+                    // Seed the rail selection from the active tab so the
+                    // active-in-selected invariant holds as soon as the layout
+                    // is switched on. Project mode owns the left rail and puts
+                    // tasks on the top bar, so the vertical panel stays closed.
+                    self.selected_project = self
+                        .tabs
+                        .get(self.active_tab_index)
+                        .map(|tab| ProjectLayout::project_of_tab_data(tab, ctx));
+                    self.vertical_tabs_panel_open = false;
+                } else {
+                    self.selected_project = None;
+                    self.vertical_tabs_panel_open = vertical_tabs_layout_active(ctx);
+                }
+                self.sync_panel_positions_from_config(ctx);
+                self.sync_window_button_visibility(ctx);
+                ctx.notify();
+            }
             TabSettingsChangedEvent::ShowVerticalTabPanelInRestoredWindows { .. } => {
                 if vertical_tabs_layout_active(ctx)
                     && *TabSettings::as_ref(ctx).show_vertical_tab_panel_in_restored_windows
@@ -5410,7 +5430,7 @@ impl Workspace {
     /// every navigation/render path consults, so what renders and what
     /// navigates always agree.
     fn project_visible_indices(&self, ctx: &AppContext) -> Option<Vec<usize>> {
-        if !FeatureFlag::Projects.is_enabled() {
+        if !project_layout_active(ctx) {
             return None;
         }
         let selected = self.selected_project.as_ref()?;
@@ -5451,7 +5471,7 @@ impl Workspace {
     /// Returns `None` (falling back to the default startup directory) when the
     /// feature is off, nothing is selected, or the project is remote.
     fn selected_project_startup_directory(&self, ctx: &AppContext) -> Option<PathBuf> {
-        if !FeatureFlag::Projects.is_enabled() {
+        if !project_layout_active(ctx) {
             return None;
         }
         let selected = self.selected_project.as_ref()?;
@@ -5492,7 +5512,7 @@ impl Workspace {
         // Projects × Tasks invariant: the active tab always belongs to the
         // selected project, so activating any tab re-points the rail selection
         // at that tab's project. Only maintained when the feature is enabled.
-        if FeatureFlag::Projects.is_enabled() {
+        if project_layout_active(ctx) {
             let project = self
                 .tabs
                 .get(index)
@@ -22833,7 +22853,7 @@ impl Workspace {
         // left, as an outer sibling of the existing panels. Shown only when the
         // feature is enabled and more than one project is open.
         if !hide_vertical_tabs
-            && FeatureFlag::Projects.is_enabled()
+            && project_layout_active(app)
             && self.project_layout(app).has_multiple_projects()
         {
             panels_view.add_child(self.render_project_rail(app));
@@ -23162,6 +23182,10 @@ impl Workspace {
 
         if *session_settings.honor_ps1 {
             context.set.insert(flags::HONOR_PS1_CONTEXT_FLAG);
+        }
+
+        if *tab_settings.use_project_layout {
+            context.set.insert(flags::PROJECT_LAYOUT_CONTEXT_FLAG);
         }
 
         if session_settings

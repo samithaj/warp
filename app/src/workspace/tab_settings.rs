@@ -507,6 +507,17 @@ define_settings_group!(TabSettings, settings: [
         toml_path: "appearance.vertical_tabs.enabled",
         description: "Whether to display tabs vertically instead of horizontally.",
     },
+    use_project_layout: UseProjectLayout {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.project_layout.enabled",
+        description: "Group sessions by project: a project rail on the left, with that project's tasks as tabs along the top.",
+        feature_flag: warp_core::features::FeatureFlag::Projects,
+    },
     show_vertical_tab_panel_in_restored_windows: ShowVerticalTabPanelInRestoredWindows {
         type: bool,
         default: false,
@@ -592,7 +603,19 @@ pub fn vertical_tabs_layout_active(ctx: &warpui::AppContext) -> bool {
 
     FeatureFlag::VerticalTabs.is_enabled()
         && *TabSettings::as_ref(ctx).use_vertical_tabs
-        && !FeatureFlag::Projects.is_enabled()
+        && !project_layout_active(ctx)
+}
+
+/// Whether the Projects × Tasks layout is active: a project rail on the left,
+/// with the selected project's tasks on the horizontal top tab bar.
+///
+/// Single source of truth for the feature's gating — the flag plus the user
+/// setting — so the rail, the tab projection, and every navigation path agree.
+pub fn project_layout_active(ctx: &warpui::AppContext) -> bool {
+    use warp_core::features::FeatureFlag;
+    use warpui::SingletonEntity as _;
+
+    FeatureFlag::Projects.is_enabled() && *TabSettings::as_ref(ctx).use_project_layout
 }
 
 #[cfg(test)]

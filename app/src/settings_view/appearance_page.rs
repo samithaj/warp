@@ -134,6 +134,14 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
     // Add all the toggle settings from the Appearance Page that you want to show up on the Command Palette here.
     let mut toggle_binding_pairs = vec![
         ToggleSettingActionPair::new(
+            "project layout",
+            builder(SettingsAction::AppearancePageToggle(
+                AppearancePageAction::ToggleProjectLayout,
+            )),
+            context,
+            flags::PROJECT_LAYOUT_CONTEXT_FLAG,
+        ),
+        ToggleSettingActionPair::new(
             "compact mode",
             builder(SettingsAction::AppearancePageToggle(
                 AppearancePageAction::ToggleCompactMode,
@@ -516,6 +524,7 @@ pub enum AppearancePageAction {
     ToggleJumpToBottomOfBlockButton,
     ToggleShowBlockDividers,
     ToggleCompactMode,
+    ToggleProjectLayout,
     ToggleCursorBlink,
     ToggleRespectSystemTheme,
     ToggleOpenWindowsAtCustomSize,
@@ -655,6 +664,7 @@ impl TypedActionView for AppearanceSettingsPageView {
             ToggleJumpToBottomOfBlockButton => self.toggle_jump_to_bottom_of_block_button(ctx),
             ToggleShowBlockDividers => self.toggle_show_block_dividers(ctx),
             ToggleCompactMode => self.toggle_compact_mode(ctx),
+            ToggleProjectLayout => self.toggle_project_layout(ctx),
             ToggleCursorBlink => self.toggle_cursor_blink(ctx),
             ToggleOpenWindowsAtCustomSize => self.toggle_open_windows_at_custom_size(ctx),
             ToggleRespectSystemTheme => self.toggle_respect_system_theme(ctx),
@@ -2314,6 +2324,18 @@ impl AppearanceSettingsPageView {
                 terminal_settings
                     .spacing_mode
                     .set_value(current_value.other_mode(), ctx)
+            );
+        });
+    }
+
+    /// Toggles the Projects × Tasks layout (project rail + project-scoped tabs).
+    pub fn toggle_project_layout(&mut self, ctx: &mut ViewContext<Self>) {
+        TabSettings::handle(ctx).update(ctx, |tab_settings, ctx| {
+            let current_value = *tab_settings.use_project_layout;
+            report_if_error!(
+                tab_settings
+                    .use_project_layout
+                    .set_value(!current_value, ctx)
             );
         });
     }
