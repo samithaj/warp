@@ -165,7 +165,7 @@ use crate::ai::agent::CancellationReason;
 use crate::ai::agent::api::ServerConversationToken;
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::agent::conversation::AIAgentHarness;
-use crate::ai::agent::conversation::{AIConversation, AIConversationId};
+use crate::ai::agent::conversation::{AIConversation, AIConversationId, ConversationStatus};
 use crate::ai::agent::{AIAgentInput, EntrypointType};
 #[cfg(target_family = "wasm")]
 use crate::ai::agent_conversations_model::AgentConversationsModelEvent;
@@ -211,6 +211,7 @@ use crate::ai::blocklist::{
 use crate::ai::cloud_agent_settings::CloudAgentSettings;
 #[cfg(target_family = "wasm")]
 use crate::ai::conversation_details_panel::ConversationDetailsPanel;
+use crate::ai::conversation_status_ui::render_status_element;
 use crate::ai::conversation_utils;
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentModel};
 use crate::ai::execution_profiles::ExecutionProfileId;
@@ -22762,6 +22763,45 @@ impl Workspace {
         }
     }
 
+    /// The agent status of a single tab, matching what the tab itself displays:
+    /// a long-running shell command reads as in-progress, otherwise the focused
+    /// session's active conversation status (ignoring empty/passive ones).
+    fn tab_conversation_status(tab: &TabData, ctx: &AppContext) -> Option<ConversationStatus> {
+        let terminal_view = tab.pane_group.as_ref(ctx).focused_session_view(ctx)?;
+        let terminal_view_ref = terminal_view.as_ref(ctx);
+        if terminal_view_ref.is_long_running() {
+            return Some(ConversationStatus::InProgress);
+        }
+        let conversation =
+            BlocklistAIHistoryModel::as_ref(ctx).active_conversation(terminal_view_ref.id())?;
+        if conversation.is_empty() || conversation.is_entirely_passive() {
+            return None;
+        }
+        Some(conversation.status().clone())
+    }
+
+    /// Aggregates the agent status of a project's tasks into the one status
+    /// worth showing on its rail row.
+    ///
+    /// A task that needs the user (blocked on an approval, or waiting for
+    /// input) wins over one that is merely working — with many projects open,
+    /// "which project is waiting on me?" is the question the rail should answer
+    /// at a glance. Projects with no agent activity get no indicator.
+    fn project_status(&self, indices: &[usize], ctx: &AppContext) -> Option<ConversationStatus> {
+        let mut working = None;
+        for tab in indices.iter().filter_map(|index| self.tabs.get(*index)) {
+            match Self::tab_conversation_status(tab, ctx) {
+                Some(
+                    status @ (ConversationStatus::Blocked { .. }
+                    | ConversationStatus::WaitingForEvents),
+                ) => return Some(status),
+                Some(status @ ConversationStatus::InProgress) => working = Some(status),
+                _ => {}
+            }
+        }
+        working
+    }
+
     /// Renders the project rail (Herdr-style Projects × Tasks layout): one
     /// clickable row per open project. Clicking a project dispatches
     /// `WorkspaceAction::SelectProject`, which activates that project's
@@ -22773,6 +22813,7 @@ impl Workspace {
         const RAIL_WIDTH: f32 = 168.;
         const ROW_CORNER_RADIUS: f32 = 6.;
         const ROW_SIDE_MARGIN: f32 = 6.;
+        const PROJECT_STATUS_ICON_SIZE: f32 = 10.;
 
         let appearance = Appearance::as_ref(ctx);
         let theme = appearance.theme();
@@ -22807,19 +22848,37 @@ impl Workspace {
                 .clone();
             let label = entry.display_name.clone();
             let dispatch_id = entry.id.clone();
+            // Surfaces the project's aggregate agent status, so a project that
+            // is blocked on the user is visible without selecting it.
+            let status = self.project_status(&layout.visible_tab_indices(&entry.id), ctx);
             let row = Hoverable::new(mouse_state, move |state| {
-                let mut container = Container::new(
-                    Text::new_inline(label, font_family, 13.)
-                        .with_color(text_color.into())
+                let mut row_content = Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Expanded::new(
+                            1.,
+                            Text::new_inline(label, font_family, 13.)
+                                .with_clip(ClipConfig::ellipsis())
+                                .with_color(text_color.into())
+                                .finish(),
+                        )
                         .finish(),
-                )
-                .with_padding_left(10.)
-                .with_padding_right(10.)
-                .with_padding_top(5.)
-                .with_padding_bottom(5.)
-                .with_margin_left(ROW_SIDE_MARGIN)
-                .with_margin_right(ROW_SIDE_MARGIN)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)));
+                    );
+                if let Some(status) = &status {
+                    row_content.add_child(render_status_element(
+                        status,
+                        PROJECT_STATUS_ICON_SIZE,
+                        appearance,
+                    ));
+                }
+                let mut container = Container::new(row_content.finish())
+                    .with_padding_left(10.)
+                    .with_padding_right(10.)
+                    .with_padding_top(5.)
+                    .with_padding_bottom(5.)
+                    .with_margin_left(ROW_SIDE_MARGIN)
+                    .with_margin_right(ROW_SIDE_MARGIN)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)));
                 if is_selected {
                     container = container.with_background(selected_bg);
                 } else if state.is_hovered() {
