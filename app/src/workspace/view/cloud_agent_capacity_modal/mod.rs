@@ -3,6 +3,7 @@ use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 use thousands::Separable;
+use warp_core::channel::ChannelState;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::theme::Fill;
 use warp_graphql::billing::StripeSubscriptionPlan;
@@ -32,7 +33,23 @@ const MODAL_HEIGHT: f32 = 532.;
 const COMPACT_MODAL_HEIGHT: f32 = 360.;
 const HEADER_HEIGHT: f32 = 92.;
 const BUTTON_DIAMETER: f32 = 20.;
-const BILLING_AND_USAGE_URL: &str = "warp://settings/billing_and_usage";
+/// Path of the billing-and-usage settings deeplink, appended to the channel's
+/// own URL scheme by [`billing_and_usage_url`].
+const BILLING_AND_USAGE_PATH: &str = "settings/billing_and_usage";
+
+/// The billing-and-usage deeplink for the running channel.
+///
+/// The scheme must come from [`ChannelState::url_scheme`] rather than a
+/// hardcoded `warp://`: only the Stable channel claims `warp://`, so a literal
+/// scheme fails to open on Preview/Dev/Local/OSS builds (macOS reports
+/// `kLSApplicationNotFoundErr`).
+fn billing_and_usage_url() -> String {
+    format!(
+        "{}://{}",
+        ChannelState::url_scheme(),
+        BILLING_AND_USAGE_PATH
+    )
+}
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub enum CloudAgentCapacityModalVariant {
@@ -116,7 +133,7 @@ impl CloudAgentCapacityModal {
         if Self::can_upgrade(customer_type, self.variant) {
             Self::get_upgrade_url(ctx)
         } else {
-            Some(BILLING_AND_USAGE_URL.to_string())
+            Some(billing_and_usage_url())
         }
     }
 
