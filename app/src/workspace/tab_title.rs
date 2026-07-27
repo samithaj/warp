@@ -12,6 +12,7 @@ use warpui::{AppContext, SingletonEntity as _};
 
 use crate::pane_group::PaneGroup;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::terminal::{CLIAgent, TerminalView};
 use crate::workspace::tab_settings::{TabLineCount, TabPrimaryInfo, TabSecondaryInfo, TabSettings};
 
 /// The agent session name for a tab, if it has one.
@@ -28,37 +29,12 @@ use crate::workspace::tab_settings::{TabLineCount, TabPrimaryInfo, TabSecondaryI
 pub(crate) fn agent_session_title(pane_group: &PaneGroup, app: &AppContext) -> Option<String> {
     let terminal_view = pane_group.focused_session_view(app)?;
     let terminal_view = terminal_view.as_ref(app);
-    let prefer_latest_prompt =
-        *TabSettings::as_ref(app).use_latest_user_prompt_as_conversation_title_in_tab_names;
-
-    let cli_agent_session = CLIAgentSessionsModel::as_ref(app).session(terminal_view.id());
-    // A CLI agent that isn't plugin-backed never reports title updates, so its
-    // context would pin the tab to a stale name. Fall through to the
-    // conversation title in that case, matching `terminal_agent_text`.
-    let plugin_backed = cli_agent_session.is_some_and(|session| session.listener.is_some());
-    if let Some(session) = cli_agent_session.filter(|_| plugin_backed) {
-        let context = &session.session_context;
-        let cli_title = if prefer_latest_prompt {
-            context
-                .latest_user_prompt()
-                .or_else(|| context.title_like_text())
-        } else {
-            context.title_like_text()
-        };
-        if cli_title.is_some() {
-            return cli_title;
-        }
-    }
-
-    if prefer_latest_prompt {
-        terminal_view
-            .selected_conversation_latest_user_prompt_for_tab_name(app)
-            .or_else(|| terminal_view.selected_conversation_display_title(app))
-    } else {
-        terminal_view
-            .selected_conversation_display_title(app)
-            .or_else(|| terminal_view.selected_conversation_latest_user_prompt_for_tab_name(app))
-    }
+    // Resolved by exactly the same helpers the vertical tabs use, so the two
+    // surfaces cannot drift apart on what an agent is called.
+    let agent_text = terminal_agent_text(terminal_view, app);
+    let (conversation_title, cli_agent_title) =
+        preferred_agent_tab_titles(&agent_text, agent_tab_text_preference(app));
+    cli_agent_title.or(conversation_title)
 }
 
 /// The name to show on a tab: an explicit rename wins, then whatever
@@ -147,6 +123,87 @@ fn tab_info_text(pane_group: &PaneGroup, kind: TabInfoKind, app: &AppContext) ->
         TabInfoKind::Branch => terminal_view.current_git_branch(app),
     };
     text.filter(|text| !text.trim().is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentTabTextPreference {
+    ConversationTitle,
+    LatestUserPrompt,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TerminalAgentText {
+    pub(crate) conversation_display_title: Option<String>,
+    pub(crate) conversation_latest_user_prompt: Option<String>,
+    pub(crate) cli_agent_title: Option<String>,
+    pub(crate) cli_agent_latest_user_prompt: Option<String>,
+    pub(crate) is_oz_agent: bool,
+    pub(crate) cli_agent: Option<CLIAgent>,
+}
+
+pub(crate) fn agent_tab_text_preference(app: &AppContext) -> AgentTabTextPreference {
+    if *TabSettings::as_ref(app).use_latest_user_prompt_as_conversation_title_in_tab_names {
+        AgentTabTextPreference::LatestUserPrompt
+    } else {
+        AgentTabTextPreference::ConversationTitle
+    }
+}
+
+pub(crate) fn preferred_agent_tab_titles(
+    agent_text: &TerminalAgentText,
+    preference: AgentTabTextPreference,
+) -> (Option<String>, Option<String>) {
+    let conversation_title = match preference {
+        AgentTabTextPreference::ConversationTitle => agent_text
+            .conversation_display_title
+            .clone()
+            .or_else(|| agent_text.conversation_latest_user_prompt.clone()),
+        AgentTabTextPreference::LatestUserPrompt => agent_text
+            .conversation_latest_user_prompt
+            .clone()
+            .or_else(|| agent_text.conversation_display_title.clone()),
+    };
+    let cli_agent_title = match preference {
+        AgentTabTextPreference::ConversationTitle => agent_text.cli_agent_title.clone(),
+        AgentTabTextPreference::LatestUserPrompt => agent_text
+            .cli_agent_latest_user_prompt
+            .clone()
+            .or_else(|| agent_text.cli_agent_title.clone()),
+    };
+
+    (conversation_title, cli_agent_title)
+}
+
+pub(crate) fn terminal_agent_text(
+    terminal_view: &TerminalView,
+    app: &AppContext,
+) -> TerminalAgentText {
+    let cli_agent_session = CLIAgentSessionsModel::as_ref(app).session(terminal_view.id());
+    let is_plugin_backed = cli_agent_session.is_some_and(|session| session.listener.is_some());
+    let is_ambient_agent = terminal_view.is_ambient_agent_session(app);
+
+    let mut agent_text = TerminalAgentText {
+        is_oz_agent: is_ambient_agent,
+        cli_agent: cli_agent_session.map(|session| session.agent),
+        ..Default::default()
+    };
+
+    if cli_agent_session.is_some() && !is_plugin_backed {
+        return agent_text;
+    }
+
+    agent_text.conversation_display_title = terminal_view.selected_conversation_display_title(app);
+    agent_text.conversation_latest_user_prompt =
+        terminal_view.selected_conversation_latest_user_prompt_for_tab_name(app);
+    agent_text.is_oz_agent =
+        agent_text.conversation_display_title.is_some() || agent_text.is_oz_agent;
+
+    if let Some(session) = cli_agent_session {
+        agent_text.cli_agent_title = session.session_context.title_like_text();
+        agent_text.cli_agent_latest_user_prompt = session.session_context.latest_user_prompt();
+    }
+
+    agent_text
 }
 
 #[cfg(test)]
