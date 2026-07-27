@@ -472,6 +472,8 @@ settings::macros::implement_setting_for_enum!(
 pub enum TabPrimaryInfo {
     #[default]
     AgentSession,
+    /// The latest instruction the user gave the agent.
+    UserInstruction,
     Command,
     WorkingDirectory,
     Branch,
@@ -508,6 +510,9 @@ settings::macros::implement_setting_for_enum!(
 pub enum TabSecondaryInfo {
     #[default]
     Command,
+    /// The latest instruction the user gave the agent. Pairs with an
+    /// `AgentSession` primary to show "what it's called" over "what I asked".
+    UserInstruction,
     WorkingDirectory,
     Branch,
     AgentSession,
@@ -535,6 +540,7 @@ impl TabSecondaryInfo {
         let conflicts = matches!(
             (primary, self),
             (TabPrimaryInfo::AgentSession, Self::AgentSession)
+                | (TabPrimaryInfo::UserInstruction, Self::UserInstruction)
                 | (TabPrimaryInfo::Command, Self::Command)
                 | (TabPrimaryInfo::WorkingDirectory, Self::WorkingDirectory)
                 | (TabPrimaryInfo::Branch, Self::Branch)
@@ -543,7 +549,8 @@ impl TabSecondaryInfo {
             return self;
         }
         match primary {
-            TabPrimaryInfo::AgentSession => Self::Command,
+            TabPrimaryInfo::AgentSession => Self::UserInstruction,
+            TabPrimaryInfo::UserInstruction => Self::Command,
             TabPrimaryInfo::Command => Self::WorkingDirectory,
             TabPrimaryInfo::WorkingDirectory => Self::Command,
             TabPrimaryInfo::Branch => Self::Command,

@@ -48,7 +48,7 @@ use crate::window_settings::WindowSettings;
 use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::{
-    TabCloseButtonPosition, TabSettings, VerticalTabsDisplayGranularity,
+    TabCloseButtonPosition, TabPrimaryInfo, TabSettings, VerticalTabsDisplayGranularity,
     vertical_tabs_layout_active,
 };
 use crate::workspace::{
@@ -110,6 +110,12 @@ const TAB_PINNED_CONTENT_HORIZONTAL_PADDING: f32 = 26.0;
 /// Font size of a two-line tab's secondary line, matching the vertical
 /// tabs' compact subtitle.
 const TAB_SUBTITLE_FONT_SIZE: f32 = 10.;
+
+/// Widest a single-line tab may grow.
+const TAB_MAX_WIDTH: f32 = 200.;
+/// Widest a two-line tab may grow. Session names and instructions are prose,
+/// so they need noticeably more room than a shell title.
+const TAB_MAX_WIDTH_TWO_LINE: f32 = 320.;
 
 pub(crate) const TAB_PIN_VANISH_THRESHOLD: f32 = 70.0;
 
@@ -914,6 +920,9 @@ pub struct TabComponent<'a> {
     /// Smaller second line, when the tab is configured to show two lines.
     /// `None` keeps the historical single-line tab exactly as it was.
     subtitle: Option<String>,
+    /// Overrides the clip direction of the title when the project layout picks
+    /// what the line shows. `None` keeps the historical heuristic.
+    title_clips_start: Option<bool>,
 }
 
 /// Structure that holds TabComponent styles.
@@ -983,6 +992,14 @@ impl<'a> TabComponent<'a> {
         let title = crate::workspace::tab_title::tab_title(tab.pane_group.as_ref(ctx), ctx);
         let subtitle =
             crate::workspace::tab_title::tab_secondary_line(tab.pane_group.as_ref(ctx), ctx);
+        // Only a working-directory line wants its front trimmed; session names
+        // and instructions are prose and must keep their opening words.
+        let title_clips_start = FeatureFlag::Projects.is_enabled().then(|| {
+            matches!(
+                TabSettings::as_ref(ctx).tab_primary_info,
+                TabPrimaryInfo::WorkingDirectory
+            )
+        });
 
         let active_pane_is_ambient_agent_session = tab
             .pane_group
@@ -1079,6 +1096,7 @@ impl<'a> TabComponent<'a> {
             locator,
             is_in_multi_tab_selection: false,
             subtitle,
+            title_clips_start,
         }
     }
 
@@ -1602,7 +1620,24 @@ impl<'a> TabComponent<'a> {
         self.render_tab_container_internal(is_hovered, is_tab_dragging)
     }
 
+    /// Widest a tab may grow. Two-line tabs carry prose (a session name over an
+    /// instruction) rather than a short shell title, so they get more room —
+    /// otherwise both lines clip to uselessness.
+    fn max_tab_width(&self) -> f32 {
+        if self.subtitle.is_some() {
+            TAB_MAX_WIDTH_TWO_LINE
+        } else {
+            TAB_MAX_WIDTH
+        }
+    }
+
     fn should_clip_text_start(&self) -> bool {
+        // Paths read better with the front trimmed ("…/dev/mifos/app"), but
+        // prose does not: clipping the start of an agent title or instruction
+        // hides the very words that identify it.
+        if let Some(clips_start) = self.title_clips_start {
+            return clips_start;
+        }
         !self.has_custom_title && !self.has_ai_conversation_title()
     }
 
@@ -2008,6 +2043,7 @@ impl UiComponent for TabComponent<'_> {
         let tooltip_git_branch = self.tooltip_git_branch.clone();
         let tab_text_position_id = self.tab_text_position_id();
         let tooltip_mouse_state = self.tab.tooltip_mouse_state.clone();
+        let max_tab_width = self.max_tab_width();
 
         // Main tab hover (for close button, etc - no delay)
         let mut tab = Hoverable::new(tab_mouse_state, move |state| {
@@ -2200,7 +2236,7 @@ impl UiComponent for TabComponent<'_> {
         } else {
             // Use dynamic sizing when not hovering
             ConstrainedBox::new(tab.finish())
-                .with_max_width(200.)
+                .with_max_width(max_tab_width)
                 .finish()
         };
 

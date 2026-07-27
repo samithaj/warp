@@ -79,6 +79,7 @@ pub(crate) fn tab_secondary_line(pane_group: &PaneGroup, app: &AppContext) -> Op
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TabInfoKind {
     AgentSession,
+    UserInstruction,
     Command,
     WorkingDirectory,
     Branch,
@@ -88,6 +89,7 @@ impl From<TabPrimaryInfo> for TabInfoKind {
     fn from(value: TabPrimaryInfo) -> Self {
         match value {
             TabPrimaryInfo::AgentSession => Self::AgentSession,
+            TabPrimaryInfo::UserInstruction => Self::UserInstruction,
             TabPrimaryInfo::Command => Self::Command,
             TabPrimaryInfo::WorkingDirectory => Self::WorkingDirectory,
             TabPrimaryInfo::Branch => Self::Branch,
@@ -99,6 +101,7 @@ impl From<TabSecondaryInfo> for TabInfoKind {
     fn from(value: TabSecondaryInfo) -> Self {
         match value {
             TabSecondaryInfo::AgentSession => Self::AgentSession,
+            TabSecondaryInfo::UserInstruction => Self::UserInstruction,
             TabSecondaryInfo::Command => Self::Command,
             TabSecondaryInfo::WorkingDirectory => Self::WorkingDirectory,
             TabSecondaryInfo::Branch => Self::Branch,
@@ -118,6 +121,15 @@ fn tab_info_text(pane_group: &PaneGroup, kind: TabInfoKind, app: &AppContext) ->
     let text = match kind {
         // Handled above; listed for exhaustiveness.
         TabInfoKind::AgentSession => None,
+        // Deliberately independent of the session-title preference: this line
+        // is *always* the latest instruction, so it can sit beneath a renamed
+        // session rather than competing with it for the same slot.
+        TabInfoKind::UserInstruction => {
+            let agent_text = terminal_agent_text(terminal_view, app);
+            agent_text
+                .cli_agent_latest_user_prompt
+                .or(agent_text.conversation_latest_user_prompt)
+        }
         TabInfoKind::Command => terminal_view.last_completed_command_text(),
         TabInfoKind::WorkingDirectory => terminal_view.display_working_directory(app),
         TabInfoKind::Branch => terminal_view.current_git_branch(app),
