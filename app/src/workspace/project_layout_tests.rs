@@ -55,14 +55,13 @@ fn projects_are_distinct_in_first_seen_order() {
         .map(|entry| entry.display_name.clone())
         .collect();
     assert_eq!(names, vec!["orbit", "warp"]);
-    assert!(layout.has_multiple_projects());
 }
 
 #[test]
 fn other_bucket_is_named_other() {
     assert_eq!(ProjectId::Other.display_name(), "Other");
     let layout = layout_from(vec![ProjectId::Other]);
-    assert!(!layout.has_multiple_projects());
+    assert_eq!(layout.projects().len(), 1);
 }
 
 #[test]

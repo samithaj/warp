@@ -5419,11 +5419,6 @@ impl Workspace {
         }
     }
 
-    /// Computes the current project-layout projection from the open tabs.
-    pub(crate) fn project_layout(&self, ctx: &AppContext) -> ProjectLayout {
-        ProjectLayout::compute(&self.tabs, ctx)
-    }
-
     /// When project mode is active and a project is selected, the raw
     /// `Workspace::tabs` indices visible under it (in tab order). `None` means
     /// no project filtering — the feature is off or nothing is selected — and
@@ -22909,12 +22904,11 @@ impl Workspace {
         let mut prev_panel_added = false;
 
         // Project rail (Herdr-style Projects × Tasks layout) sits at the far
-        // left, as an outer sibling of the existing panels. Shown only when the
-        // feature is enabled and more than one project is open.
-        if !hide_vertical_tabs
-            && project_layout_active(app)
-            && self.project_layout(app).has_multiple_projects()
-        {
+        // left, as an outer sibling of the existing panels. Shown whenever the
+        // layout is on — including with a single project — so the rail is a
+        // stable part of the window rather than something that appears and
+        // disappears as projects are opened and closed.
+        if !hide_vertical_tabs && project_layout_active(app) {
             panels_view.add_child(self.render_project_rail(app));
             panels_view.add_child(Self::render_panel_separator(app));
         }

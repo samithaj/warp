@@ -111,11 +111,6 @@ impl ProjectLayout {
             .filter_map(|(index, id)| (id == selected).then_some(index))
             .collect()
     }
-
-    /// Whether more than one project is open (i.e. the rail is worth showing).
-    pub fn has_multiple_projects(&self) -> bool {
-        self.projects.len() > 1
-    }
 }
 
 /// The index reached by moving forward one step through `indices` from
