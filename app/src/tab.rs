@@ -107,6 +107,10 @@ const TAB_CLOSE_BUTTON_HORIZONTAL_INSET: f32 = 2.0;
 const TAB_PINNED_CONTENT_HORIZONTAL_PADDING: f32 = 26.0;
 // Width below which a pinned tab/group header drops its idle pin (shared so both
 // vanish together), early enough that the pin never overlaps the centered title/icon.
+/// Font size of a two-line tab's secondary line, matching the vertical
+/// tabs' compact subtitle.
+const TAB_SUBTITLE_FONT_SIZE: f32 = 10.;
+
 pub(crate) const TAB_PIN_VANISH_THRESHOLD: f32 = 70.0;
 
 /// Represents the user's manual tab-color selection state.
@@ -907,6 +911,9 @@ pub struct TabComponent<'a> {
     /// both the in-selection highlight and the right-click menu dispatch
     /// (multi-tab menu vs single-tab menu).
     is_in_multi_tab_selection: bool,
+    /// Smaller second line, when the tab is configured to show two lines.
+    /// `None` keeps the historical single-line tab exactly as it was.
+    subtitle: Option<String>,
 }
 
 /// Structure that holds TabComponent styles.
@@ -974,6 +981,8 @@ impl<'a> TabComponent<'a> {
     ) -> Self {
         let appearance = Appearance::as_ref(ctx);
         let title = crate::workspace::tab_title::tab_title(tab.pane_group.as_ref(ctx), ctx);
+        let subtitle =
+            crate::workspace::tab_title::tab_secondary_line(tab.pane_group.as_ref(ctx), ctx);
 
         let active_pane_is_ambient_agent_session = tab
             .pane_group
@@ -1069,6 +1078,7 @@ impl<'a> TabComponent<'a> {
             sole_grouped_member: false,
             locator,
             is_in_multi_tab_selection: false,
+            subtitle,
         }
     }
 
@@ -1268,6 +1278,32 @@ impl<'a> TabComponent<'a> {
         format!("tab_text_{}", self.tab_index)
     }
 
+    /// The smaller, muted second line of a two-line tab.
+    ///
+    /// Suppressed while renaming (the editor owns the first line) and on tabs
+    /// too narrow to fit a title, where a second line would only add another
+    /// clipped-to-nothing row.
+    fn render_tab_subtitle(&self) -> Option<Box<dyn Element>> {
+        if self.is_tab_being_renamed() {
+            return None;
+        }
+        let subtitle = self.subtitle.as_ref()?;
+        let theme = self.appearance.theme();
+        Some(
+            Text::new_inline(
+                subtitle.clone(),
+                self.styles
+                    .default
+                    .font_family_id
+                    .expect("Font family defined"),
+                TAB_SUBTITLE_FONT_SIZE,
+            )
+            .with_clip(ClipConfig::ellipsis())
+            .with_color(theme.sub_text_color(theme.background()).into())
+            .finish(),
+        )
+    }
+
     fn render_tab_content(&self) -> Box<dyn Element> {
         let styles = if self.is_active_tab() {
             self.styles.default.merge(self.styles.active)
@@ -1287,7 +1323,12 @@ impl<'a> TabComponent<'a> {
                         .set_border_width(0.),
                 )
                 .with_style(UiComponentStyles {
-                    margin: Some(Coords::default().top(if self.grouped_member {
+                    margin: Some(Coords::default().top(if self.subtitle.is_some() {
+                        // Two-line mode: the subtitle is hidden while renaming, so
+                        // the single-line editor is already centered in the taller
+                        // row. The nudges below would push it back off-center.
+                        0.
+                    } else if self.grouped_member {
                         // Reduce the top margin for grouped tabs to make it appear centered.
                         2.
                     } else if FeatureFlag::NewTabStyling.is_enabled() {
@@ -1650,18 +1691,38 @@ impl<'a> TabComponent<'a> {
         };
 
         let build_full_content = |reserve_pin_space: bool| -> Box<dyn Element> {
+            let subtitle_element = self.render_tab_subtitle();
+            // With two lines, centering would float the indicator between them;
+            // align to the top so it sits beside the title, matching the
+            // vertical tabs' compact row.
+            let cross_axis_alignment = if subtitle_element.is_some() {
+                warpui::elements::CrossAxisAlignment::Start
+            } else {
+                warpui::elements::CrossAxisAlignment::Center
+            };
             let mut flex_row = Flex::row()
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_main_axis_alignment(MainAxisAlignment::Center)
-                .with_cross_axis_alignment(warpui::elements::CrossAxisAlignment::Center);
+                .with_cross_axis_alignment(cross_axis_alignment);
             if let Some(indicator) = self.render_indicator() {
                 flex_row.add_child(indicator);
             }
+            // Keep the `SavePosition` wrapping whatever the text column is: the
+            // hover tooltip anchors to this id.
+            let text_content: Box<dyn Element> = match subtitle_element {
+                Some(subtitle) => Flex::column()
+                    .with_main_axis_size(MainAxisSize::Min)
+                    .with_cross_axis_alignment(warpui::elements::CrossAxisAlignment::Start)
+                    .with_spacing(1.)
+                    .with_child(self.render_tab_content())
+                    .with_child(subtitle)
+                    .finish(),
+                None => self.render_tab_content(),
+            };
             flex_row.add_child(
                 Shrinkable::new(
                     1.0,
-                    SavePosition::new(self.render_tab_content(), &self.tab_text_position_id())
-                        .finish(),
+                    SavePosition::new(text_content, &self.tab_text_position_id()).finish(),
                 )
                 .finish(),
             );

@@ -24,6 +24,10 @@ fn main() -> Result<()> {
     if cfg!(debug_assertions) {
         state = state.with_additional_features(warp_core::features::DEBUG_FLAGS);
     }
+    // LOCAL ONLY (do not commit): enable the Projects x Tasks layout in this
+    // personal build. OSS builds don't apply DOGFOOD_FLAGS, so the rail is
+    // otherwise unreachable. Turn it on in Settings > Appearance once running.
+    state = state.with_additional_features(&[warp_core::features::FeatureFlag::Projects]);
     ChannelState::set(state);
 
     warp::run()

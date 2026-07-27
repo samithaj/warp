@@ -412,6 +412,145 @@ pub enum VerticalTabsPrimaryInfo {
     Branch,
 }
 
+/// How many lines of information a horizontal tab shows.
+///
+/// Mirrors `VerticalTabsViewMode` for the horizontal bar. `SingleLine` is the
+/// historical look; `TwoLine` adds a smaller secondary line so a tab can show
+/// both what the agent is called and what it is doing.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "How many lines of information tabs show.",
+    rename_all = "snake_case"
+)]
+pub enum TabLineCount {
+    #[default]
+    SingleLine,
+    TwoLine,
+}
+
+settings::macros::implement_setting_for_enum!(
+    TabLineCount,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.tabs.line_count",
+    description: "How many lines of information tabs show.",
+);
+
+/// The primary (first line) information shown on a tab.
+///
+/// The horizontal counterpart of `VerticalTabsPrimaryInfo`, with the extra
+/// `AgentSession` option: the name of the agent running in the tab, such as a
+/// renamed Claude Code session.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "Primary information displayed on tabs.",
+    rename_all = "snake_case"
+)]
+pub enum TabPrimaryInfo {
+    #[default]
+    AgentSession,
+    Command,
+    WorkingDirectory,
+    Branch,
+}
+
+settings::macros::implement_setting_for_enum!(
+    TabPrimaryInfo,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.tabs.primary_info",
+    description: "The primary information displayed on tabs.",
+);
+
+/// The secondary (second line) information shown on a tab, used only when
+/// [`TabLineCount::TwoLine`] is active.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "Secondary information displayed on two-line tabs.",
+    rename_all = "snake_case"
+)]
+pub enum TabSecondaryInfo {
+    #[default]
+    Command,
+    WorkingDirectory,
+    Branch,
+    AgentSession,
+}
+
+settings::macros::implement_setting_for_enum!(
+    TabSecondaryInfo,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.tabs.secondary_info",
+    description: "The secondary information displayed on two-line tabs.",
+);
+
+impl TabSecondaryInfo {
+    /// The secondary line to actually use, given the primary line.
+    ///
+    /// Showing the same value twice is never useful, so a secondary choice that
+    /// collides with the primary falls back to a sensible alternative — the
+    /// same conflict-avoidance the vertical tabs apply via
+    /// `resolve_compact_subtitle`.
+    pub fn resolved_for(self, primary: TabPrimaryInfo) -> Self {
+        let conflicts = matches!(
+            (primary, self),
+            (TabPrimaryInfo::AgentSession, Self::AgentSession)
+                | (TabPrimaryInfo::Command, Self::Command)
+                | (TabPrimaryInfo::WorkingDirectory, Self::WorkingDirectory)
+                | (TabPrimaryInfo::Branch, Self::Branch)
+        );
+        if !conflicts {
+            return self;
+        }
+        match primary {
+            TabPrimaryInfo::AgentSession => Self::Command,
+            TabPrimaryInfo::Command => Self::WorkingDirectory,
+            TabPrimaryInfo::WorkingDirectory => Self::Command,
+            TabPrimaryInfo::Branch => Self::Command,
+        }
+    }
+}
+
 settings::macros::implement_setting_for_enum!(
     VerticalTabsPrimaryInfo,
     TabSettings,
@@ -548,16 +687,6 @@ define_settings_group!(TabSettings, settings: [
         toml_path: "appearance.vertical_tabs.use_latest_prompt_as_title",
         description: "Whether vertical tab names for agent conversations use the latest user prompt.",
     },
-    use_agent_session_name_in_tab_titles: UseAgentSessionNameInTabTitles {
-        type: bool,
-        default: true,
-        supported_platforms: SupportedPlatforms::ALL,
-        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
-        surface: settings::SettingSurfaces::GUI,
-        private: false,
-        toml_path: "appearance.tabs.use_agent_session_name",
-        description: "Name tabs after the agent session running in them (for example a renamed Claude Code session) instead of the shell title or last command.",
-    },
     vertical_tabs_display_granularity: VerticalTabsDisplayGranularity,
     vertical_tabs_tab_item_mode: VerticalTabsTabItemMode,
     vertical_tabs_view_mode: VerticalTabsViewMode,
@@ -593,6 +722,9 @@ define_settings_group!(TabSettings, settings: [
         toml_path: "appearance.vertical_tabs.show_details_on_hover",
         description: "Whether to show a details sidecar when hovering over a vertical tab.",
     },
+    tab_line_count: TabLineCount,
+    tab_primary_info: TabPrimaryInfo,
+    tab_secondary_info: TabSecondaryInfo,
     header_toolbar_chip_selection: HeaderToolbarChipSelection,
     new_tab_placement: NewTabPlacement,
     workspace_decoration_visibility: WorkspaceDecorationVisibility,

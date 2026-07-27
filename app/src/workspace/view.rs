@@ -150,9 +150,9 @@ use super::rewind_confirmation_dialog::{
     RewindConfirmationDialog, RewindConfirmationEvent, RewindDialogSource,
 };
 use super::tab_settings::{
-    HeaderToolbarChipSelection, NewTabPlacement, TabSettings, TabSettingsChangedEvent,
-    VerticalTabsDisplayGranularity, WorkspaceDecorationVisibility, project_layout_active,
-    vertical_tabs_layout_active,
+    HeaderToolbarChipSelection, NewTabPlacement, TabLineCount, TabSettings,
+    TabSettingsChangedEvent, VerticalTabsDisplayGranularity, WorkspaceDecorationVisibility,
+    project_layout_active, vertical_tabs_layout_active,
 };
 use super::util::{
     PaneViewLocator, TabMovement, TerminalSessionFallbackBehavior, WelcomeTipsViewState,
@@ -555,9 +555,18 @@ const MAX_FONT_SIZE: f32 = 25.0;
 const FONT_SIZE_INCREMENT: f32 = 1.0;
 
 pub const TAB_BAR_HEIGHT: f32 = 34.;
-/// Height for all panel headers (tab bar, warp drive, resource center, theme chooser, etc.).
-/// This ensures consistent header heights across all UI panels.
-pub const PANEL_HEADER_HEIGHT: f32 = TAB_BAR_HEIGHT;
+/// Tab bar height when tabs show a second line of information
+/// ([`TabLineCount::TwoLine`]). Tab height itself is content-driven, so this
+/// only has to give the taller pill room; the extra is the 10pt subtitle line
+/// plus its 1px spacing.
+pub const TAB_BAR_TWO_LINE_HEIGHT: f32 = 48.;
+/// Height for all panel headers (warp drive, resource center, theme chooser,
+/// etc.).
+///
+/// Deliberately its own constant rather than an alias of [`TAB_BAR_HEIGHT`]:
+/// the tab bar grows when tabs are two-line, and those panels must not grow
+/// with it.
+pub const PANEL_HEADER_HEIGHT: f32 = 34.;
 /// The hover area height for states where the tab bar is revealed on hover.
 const TAB_BAR_HOVER_HEIGHT: f32 = 12.;
 const TAB_BAR_PADDING_LEFT: f32 = 4.;
@@ -565,8 +574,23 @@ const TAB_BAR_PADDING_RIGHT: f32 = 8.;
 const TITLE_BAR_SEARCH_BAR_MAX_WIDTH: f32 = 320.;
 const TITLE_BAR_SEARCH_BAR_SLOT_PADDING: f32 = 8.;
 
-// The total height taken up by the tab bar, including its bottom border.
+// The total height taken up by the single-line tab bar, including its bottom border.
 pub const TOTAL_TAB_BAR_HEIGHT: f32 = TAB_BAR_HEIGHT + TAB_BAR_BORDER_HEIGHT;
+
+/// The tab bar's height for the configured line count.
+pub fn tab_bar_height(ctx: &AppContext) -> f32 {
+    match TabSettings::as_ref(ctx).tab_line_count {
+        TabLineCount::SingleLine => TAB_BAR_HEIGHT,
+        TabLineCount::TwoLine => TAB_BAR_TWO_LINE_HEIGHT,
+    }
+}
+
+/// The tab bar's total height including its bottom border, for the configured
+/// line count. The macOS titlebar is sized from this, which is what positions
+/// the traffic lights.
+pub fn total_tab_bar_height(ctx: &AppContext) -> f32 {
+    tab_bar_height(ctx) + TAB_BAR_BORDER_HEIGHT
+}
 
 const TAB_BAR_ICON_PADDING: f32 = 4.;
 
@@ -3801,8 +3825,15 @@ impl Workspace {
                 self.sync_window_button_visibility(ctx);
                 ctx.notify();
             }
-            TabSettingsChangedEvent::UseAgentSessionNameInTabTitles { .. } => {
-                // Tab names are derived at render time, so a repaint is enough.
+            TabSettingsChangedEvent::TabPrimaryInfo { .. }
+            | TabSettingsChangedEvent::TabSecondaryInfo { .. } => {
+                // Tab text is derived at render time, so a repaint is enough.
+                ctx.notify();
+            }
+            TabSettingsChangedEvent::TabLineCount { .. } => {
+                // Changing the line count changes the tab bar's height, which the
+                // macOS titlebar (and therefore the traffic lights) is sized from.
+                self.update_titlebar_height(ctx);
                 ctx.notify();
             }
             TabSettingsChangedEvent::UseProjectLayout { .. } => {
@@ -14327,7 +14358,7 @@ impl Workspace {
     /// Updates the titlebar height to match the scaled tab bar height.
     pub fn update_titlebar_height(&self, ctx: &mut ViewContext<Self>) {
         let zoom_factor = WindowSettings::as_ref(ctx).zoom_level.as_zoom_factor();
-        let scaled_tab_bar_height = (TOTAL_TAB_BAR_HEIGHT * zoom_factor) as f64;
+        let scaled_tab_bar_height = (total_tab_bar_height(ctx) * zoom_factor) as f64;
 
         if let Some(platform_window) = ctx.windows().platform_window(ctx.window_id()) {
             platform_window
@@ -20010,7 +20041,7 @@ impl Workspace {
                 // Insertion divider before this member when a pane drop lands
                 // here (into the group at `idx`).
                 if show_before_indicator(self.hovered_tab_index, idx, Some(group.id)) {
-                    row.add_child(self.render_tab_hover_indicator(appearance));
+                    row.add_child(self.render_tab_hover_indicator(appearance, ctx));
                 }
                 let tab = &self.tabs[idx];
                 let effective_color = tab.color();
@@ -20038,7 +20069,7 @@ impl Workspace {
                 first_index + run_len,
                 Some(group.id),
             ) {
-                row.add_child(self.render_tab_hover_indicator(appearance));
+                row.add_child(self.render_tab_hover_indicator(appearance, ctx));
             }
         }
 
@@ -20774,13 +20805,20 @@ impl Workspace {
             .finish()
     }
 
-    fn render_tab_hover_indicator(&self, appearance: &Appearance) -> Box<dyn Element> {
+    fn render_tab_hover_indicator(
+        &self,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Box<dyn Element> {
+        // Inset slightly from the bar so the indicator reads as sitting between
+        // tabs rather than butting into the border, at either line count.
+        let height = (tab_bar_height(ctx) - 2.).max(0.);
         ConstrainedBox::new(
             Rect::new()
                 .with_background(appearance.theme().accent())
                 .finish(),
         )
-        .with_height(32.)
+        .with_height(height)
         .with_width(4.)
         .finish()
     }
@@ -21122,7 +21160,7 @@ impl Workspace {
                         // Ungrouped insertion just before the group; a drop into
                         // the group highlights the group itself instead.
                         if show_before_indicator(self.hovered_tab_index, *first_index, None) {
-                            tab_bar.add_child(self.render_tab_hover_indicator(appearance));
+                            tab_bar.add_child(self.render_tab_hover_indicator(appearance, ctx));
                         }
                         // Filtered above; the group must exist in `tab_groups`.
                         let group = self.tab_groups[group_id].clone();
@@ -21143,7 +21181,7 @@ impl Workspace {
                         // only matches an ungrouped insertion.
                         if !is_transferred && show_before_indicator(self.hovered_tab_index, i, None)
                         {
-                            tab_bar.add_child(self.render_tab_hover_indicator(appearance));
+                            tab_bar.add_child(self.render_tab_hover_indicator(appearance, ctx));
                         }
                         if is_transferred {
                             tab_bar.add_child(
@@ -21169,7 +21207,7 @@ impl Workspace {
             {
                 tab_bar.add_child(self.render_ghost_tab_slot(appearance, ctx));
             } else if show_before_indicator(self.hovered_tab_index, self.tabs.len(), None) {
-                tab_bar.add_child(self.render_tab_hover_indicator(appearance));
+                tab_bar.add_child(self.render_tab_hover_indicator(appearance, ctx));
             }
 
             if ContextFlag::CreateNewSession.is_enabled() {
