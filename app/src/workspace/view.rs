@@ -3801,6 +3801,10 @@ impl Workspace {
                 self.sync_window_button_visibility(ctx);
                 ctx.notify();
             }
+            TabSettingsChangedEvent::UseAgentSessionNameInTabTitles { .. } => {
+                // Tab names are derived at render time, so a repaint is enough.
+                ctx.notify();
+            }
             TabSettingsChangedEvent::UseProjectLayout { .. } => {
                 if project_layout_active(ctx) {
                     // Seed the rail selection from the active tab so the

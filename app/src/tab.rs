@@ -973,7 +973,7 @@ impl<'a> TabComponent<'a> {
         ctx: &'a AppContext,
     ) -> Self {
         let appearance = Appearance::as_ref(ctx);
-        let title = tab.pane_group.as_ref(ctx).display_title(ctx);
+        let title = crate::workspace::tab_title::tab_title(tab.pane_group.as_ref(ctx), ctx);
 
         let active_pane_is_ambient_agent_session = tab
             .pane_group

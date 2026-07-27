@@ -22,6 +22,7 @@ pub mod rewind_confirmation_dialog;
 pub mod sync_inputs;
 pub mod tab_group;
 pub mod tab_settings;
+pub mod tab_title;
 mod toast_stack;
 pub mod util;
 pub mod view;
