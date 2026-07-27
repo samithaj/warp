@@ -148,3 +148,7 @@ fn tab_info_text(pane_group: &PaneGroup, kind: TabInfoKind, app: &AppContext) ->
     };
     text.filter(|text| !text.trim().is_empty())
 }
+
+#[cfg(test)]
+#[path = "tab_title_tests.rs"]
+mod tests;

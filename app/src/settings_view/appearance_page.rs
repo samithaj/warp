@@ -95,8 +95,8 @@ use crate::workspace::header_toolbar_editor::HeaderToolbarInlineEditor;
 use crate::workspace::tab_settings::{
     DirectoryTabColor, HideTitleBarSearchBarInVerticalTabs, PreserveActiveTabColor,
     ShowCodeReviewButton, ShowIndicatorsButton, ShowVerticalTabPanelInRestoredWindows,
-    TabCloseButtonPosition, TabSettings, TabSettingsChangedEvent,
-    UseLatestUserPromptAsConversationTitleInTabNames, UseVerticalTabs,
+    TabCloseButtonPosition, TabLineCount, TabSettings, TabSettingsChangedEvent,
+    UseLatestUserPromptAsConversationTitleInTabNames, UseProjectLayout, UseVerticalTabs,
     WorkspaceDecorationVisibility, canonical_directory_key,
 };
 use crate::{send_telemetry_from_ctx, themes};
@@ -525,6 +525,7 @@ pub enum AppearancePageAction {
     ToggleShowBlockDividers,
     ToggleCompactMode,
     ToggleProjectLayout,
+    ToggleTwoLineTabs,
     ToggleCursorBlink,
     ToggleRespectSystemTheme,
     ToggleOpenWindowsAtCustomSize,
@@ -665,6 +666,7 @@ impl TypedActionView for AppearanceSettingsPageView {
             ToggleShowBlockDividers => self.toggle_show_block_dividers(ctx),
             ToggleCompactMode => self.toggle_compact_mode(ctx),
             ToggleProjectLayout => self.toggle_project_layout(ctx),
+            ToggleTwoLineTabs => self.toggle_two_line_tabs(ctx),
             ToggleCursorBlink => self.toggle_cursor_blink(ctx),
             ToggleOpenWindowsAtCustomSize => self.toggle_open_windows_at_custom_size(ctx),
             ToggleRespectSystemTheme => self.toggle_respect_system_theme(ctx),
@@ -1551,6 +1553,11 @@ impl AppearanceSettingsPageView {
         }
         tab_settings_widgets.push(Box::new(PreserveActiveTabColorWidget::default()));
 
+        if FeatureFlag::Projects.is_enabled() {
+            tab_settings_widgets.push(Box::new(ProjectLayoutWidget::default()));
+            tab_settings_widgets.push(Box::new(TwoLineTabsWidget::default()));
+        }
+
         if FeatureFlag::VerticalTabs.is_enabled() {
             tab_settings_widgets.push(Box::new(VerticalTabsWidget::default()));
             tab_settings_widgets.push(Box::new(
@@ -2325,6 +2332,17 @@ impl AppearanceSettingsPageView {
                     .spacing_mode
                     .set_value(current_value.other_mode(), ctx)
             );
+        });
+    }
+
+    /// Toggles tabs between one and two lines of information.
+    pub fn toggle_two_line_tabs(&mut self, ctx: &mut ViewContext<Self>) {
+        TabSettings::handle(ctx).update(ctx, |tab_settings, ctx| {
+            let next = match tab_settings.tab_line_count {
+                TabLineCount::SingleLine => TabLineCount::TwoLine,
+                TabLineCount::TwoLine => TabLineCount::SingleLine,
+            };
+            report_if_error!(tab_settings.tab_line_count.set_value(next, ctx));
         });
     }
 
@@ -5000,6 +5018,97 @@ impl SettingsWidget for PreserveActiveTabColorWidget {
                 .build()
                 .on_click(move |ctx, _, _| {
                     ctx.dispatch_typed_action(AppearancePageAction::TogglePreserveActiveTabColor);
+                })
+                .finish(),
+            None,
+        )
+    }
+}
+
+#[derive(Default)]
+struct ProjectLayoutWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for ProjectLayoutWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "project layout projects rail tasks tabs repository worktree"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let tab_settings = TabSettings::as_ref(app);
+
+        render_body_item::<AppearancePageAction>(
+            "Group sessions by project".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                UseProjectLayout::storage_key(),
+                UseProjectLayout::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*tab_settings.use_project_layout)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(AppearancePageAction::ToggleProjectLayout);
+                })
+                .finish(),
+            None,
+        )
+    }
+}
+
+#[derive(Default)]
+struct TwoLineTabsWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for TwoLineTabsWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "two line tabs subtitle agent session command height"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let tab_settings = TabSettings::as_ref(app);
+        let is_two_line = matches!(tab_settings.tab_line_count, TabLineCount::TwoLine);
+
+        render_body_item::<AppearancePageAction>(
+            "Show two lines on tabs".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                TabLineCount::storage_key(),
+                TabLineCount::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(is_two_line)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(AppearancePageAction::ToggleTwoLineTabs);
                 })
                 .finish(),
             None,
