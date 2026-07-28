@@ -93,12 +93,13 @@ use warpui::elements::Percentage;
 use warpui::elements::{
     Align, Border, CacheOption, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle,
     ClippedScrollable, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Dismiss,
-    DispatchEventResult, DragAxis, Draggable, DraggableState, DropTarget, Element, Empty,
-    EventHandler, Expanded, Fill as ElementFill, Flex, Highlight, Hoverable, Icon as WarpUiIcon,
-    Image, MainAxisAlignment, MainAxisSize, MouseInBehavior, MouseStateHandle, OffsetPositioning,
-    ParentAnchor, ParentElement, ParentOffsetBounds, PositionedElementAnchor,
-    PositionedElementOffsetBounds, Radius, Rect, SavePosition, ScrollbarWidth, Shrinkable,
-    SizeConstraintCondition, SizeConstraintSwitch, Stack, Text,
+    DispatchEventResult, DragAxis, DragBarSide, Draggable, DraggableState, DropTarget, Element,
+    Empty, EventHandler, Expanded, Fill as ElementFill, Flex, Highlight, Hoverable,
+    Icon as WarpUiIcon, Image, MainAxisAlignment, MainAxisSize, MouseInBehavior, MouseStateHandle,
+    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, PositionedElementAnchor,
+    PositionedElementOffsetBounds, Radius, Rect, Resizable, ResizableStateHandle, SavePosition,
+    ScrollbarWidth, Shrinkable, SizeConstraintCondition, SizeConstraintSwitch, Stack, Text,
+    resizable_state_handle,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::geometry::vector::{Vector2F, vec2f};
@@ -570,6 +571,19 @@ pub const TAB_BAR_TWO_LINE_HEIGHT: f32 = 48.;
 /// the tab bar grows when tabs are two-line, and those panels must not grow
 /// with it.
 pub const PANEL_HEADER_HEIGHT: f32 = 34.;
+
+/// Starting width of the project rail, before the user drags it.
+const RAIL_DEFAULT_WIDTH: f32 = 168.;
+/// How narrow the rail may be dragged. Deliberately well below
+/// [`RAIL_DEFAULT_WIDTH`] — [`ResizableState::clamp_size`] applies these bounds
+/// on the first layout pass, so a minimum above the default would silently
+/// *widen* the rail instead of leaving it where it starts. Project names
+/// ellipsize and task labels wrap, so a narrow rail stays usable.
+const RAIL_MIN_WIDTH: f32 = 120.;
+/// The rail is a navigation aid, never the main event: cap it at half the
+/// window so it cannot crowd out the terminal.
+const RAIL_MAX_WIDTH_RATIO: f32 = 0.5;
+
 /// The hover area height for states where the tab bar is revealed on hover.
 const TAB_BAR_HOVER_HEIGHT: f32 = 12.;
 const TAB_BAR_PADDING_LEFT: f32 = 4.;
@@ -1067,6 +1081,10 @@ pub struct Workspace {
     /// Scroll position of the project rail. Held here rather than rebuilt each
     /// render so the scroll offset survives repaints.
     project_rail_scroll_state: ClippedScrollStateHandle,
+    /// Dragged width of the project rail. Session-lived, matching the vertical
+    /// tabs panel, which likewise owns its handle rather than registering with
+    /// [`ResizableData`] — the rail width is not part of session restoration.
+    project_rail_resizable_state: ResizableStateHandle,
     tab_rename_editor: ViewHandle<EditorView>,
     pane_rename_editor: ViewHandle<EditorView>,
     tab_group_rename_editor: ViewHandle<EditorView>,
@@ -3428,6 +3446,7 @@ impl Workspace {
             project_rail_mouse_states: RefCell::default(),
             rail_task_mouse_states: RefCell::default(),
             project_rail_scroll_state: ClippedScrollStateHandle::new(),
+            project_rail_resizable_state: resizable_state_handle(RAIL_DEFAULT_WIDTH),
             tab_rename_editor: Self::tab_rename_editor(ctx),
             pane_rename_editor: Self::pane_rename_editor(ctx),
             tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
@@ -22860,7 +22879,6 @@ impl Workspace {
     /// highlight on hover. Only shown when the feature is enabled and more than
     /// one project is open.
     fn render_project_rail(&self, ctx: &AppContext) -> Box<dyn Element> {
-        const RAIL_WIDTH: f32 = 168.;
         const ROW_CORNER_RADIUS: f32 = 6.;
         const ROW_SIDE_MARGIN: f32 = 6.;
         const PROJECT_STATUS_ICON_SIZE: f32 = 10.;
@@ -23051,7 +23069,19 @@ impl Workspace {
             .with_child(Shrinkable::new(1., scrollable_rows).finish())
             .finish();
 
-        ConstrainedBox::new(rail).with_width(RAIL_WIDTH).finish()
+        // Dragging the right edge sets the rail's width, the same way the
+        // vertical tabs panel is resized. `on_resize` -> `notify()` is
+        // load-bearing: without a repaint the drag has no visible effect.
+        Resizable::new(self.project_rail_resizable_state.clone(), rail)
+            .with_dragbar_side(DragBarSide::Right)
+            .on_resize(|ctx, _| {
+                ctx.notify();
+            })
+            .with_bounds_callback(Box::new(|window_size| {
+                let max_width = window_size.x() * RAIL_MAX_WIDTH_RATIO;
+                (RAIL_MIN_WIDTH, max_width.max(RAIL_MIN_WIDTH))
+            }))
+            .finish()
     }
 
     fn render_panels(
