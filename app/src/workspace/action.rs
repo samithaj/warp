@@ -150,6 +150,9 @@ pub enum WorkspaceAction {
     /// Selects a project in the project rail (Herdr-style Projects × Tasks
     /// layout). Activates that project's most-recently-used visible tab.
     SelectProject(ProjectId),
+    /// Activates the task clicked in the project rail, identified by its pane
+    /// group so it cannot go stale if tabs close between paint and click.
+    ActivateTaskByPaneGroupId(EntityId),
     /// Sets the manual color override for the active tab.
     ///
     /// - `Color(_)` — apply that color.
@@ -925,6 +928,7 @@ impl WorkspaceAction {
             ActivateTab(_)
             | ActivateTabByNumber(_)
             | SelectProject(_)
+            | ActivateTaskByPaneGroupId(_)
             | ActivatePrevTab
             | ActivateNextTab
             | ActivateLastTab

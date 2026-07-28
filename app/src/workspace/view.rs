@@ -91,13 +91,14 @@ use warpui::clipboard::ClipboardContent;
 #[cfg(target_family = "wasm")]
 use warpui::elements::Percentage;
 use warpui::elements::{
-    Align, Border, CacheOption, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container,
-    CornerRadius, CrossAxisAlignment, Dismiss, DispatchEventResult, DragAxis, Draggable,
-    DraggableState, DropTarget, Element, Empty, EventHandler, Expanded, Fill as ElementFill, Flex,
-    Highlight, Hoverable, Icon as WarpUiIcon, Image, MainAxisAlignment, MainAxisSize,
-    MouseInBehavior, MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement,
-    ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds, Radius, Rect,
-    SavePosition, Shrinkable, SizeConstraintCondition, SizeConstraintSwitch, Stack, Text,
+    Align, Border, CacheOption, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle,
+    ClippedScrollable, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Dismiss,
+    DispatchEventResult, DragAxis, Draggable, DraggableState, DropTarget, Element, Empty,
+    EventHandler, Expanded, Fill as ElementFill, Flex, Highlight, Hoverable, Icon as WarpUiIcon,
+    Image, MainAxisAlignment, MainAxisSize, MouseInBehavior, MouseStateHandle, OffsetPositioning,
+    ParentAnchor, ParentElement, ParentOffsetBounds, PositionedElementAnchor,
+    PositionedElementOffsetBounds, Radius, Rect, SavePosition, ScrollbarWidth, Shrinkable,
+    SizeConstraintCondition, SizeConstraintSwitch, Stack, Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::geometry::vector::{Vector2F, vec2f};
@@ -438,8 +439,10 @@ use crate::themes::theme_chooser::{ThemeChooser, ThemeChooserEvent, ThemeChooser
 use crate::themes::theme_creator_modal::{ThemeCreatorModal, ThemeCreatorModalEvent};
 use crate::themes::theme_deletion_modal::{ThemeDeletionModal, ThemeDeletionModalEvent};
 use crate::tips::{TipsEvent, TipsView};
+use crate::ui_components::agent_icon::terminal_view_agent_icon_variant;
 use crate::ui_components::avatar::{Avatar, AvatarContent, StatusElementTypes};
 use crate::ui_components::buttons::{combo_inner_button, icon_button_with_color};
+use crate::ui_components::icon_with_status::render_icon_with_status;
 use crate::ui_components::red_notification_dot::RedNotificationDot;
 use crate::ui_components::window_focus_dimming::WindowFocusDimming;
 use crate::ui_components::{blended_colors, icons};
@@ -1058,6 +1061,12 @@ pub struct Workspace {
     /// Per-project hover/click state for the project rail (created once per
     /// project and persisted across renders, per the MouseStateHandle rule).
     project_rail_mouse_states: RefCell<HashMap<ProjectId, MouseStateHandle>>,
+    /// Per-task hover/click state for the project rail's task rows, keyed by
+    /// pane group so it survives reordering.
+    rail_task_mouse_states: RefCell<HashMap<EntityId, MouseStateHandle>>,
+    /// Scroll position of the project rail. Held here rather than rebuilt each
+    /// render so the scroll offset survives repaints.
+    project_rail_scroll_state: ClippedScrollStateHandle,
     tab_rename_editor: ViewHandle<EditorView>,
     pane_rename_editor: ViewHandle<EditorView>,
     tab_group_rename_editor: ViewHandle<EditorView>,
@@ -3417,6 +3426,8 @@ impl Workspace {
             tab_groups: HashMap::new(),
             horizontal_tab_group_mouse_states: RefCell::default(),
             project_rail_mouse_states: RefCell::default(),
+            rail_task_mouse_states: RefCell::default(),
+            project_rail_scroll_state: ClippedScrollStateHandle::new(),
             tab_rename_editor: Self::tab_rename_editor(ctx),
             pane_rename_editor: Self::pane_rename_editor(ctx),
             tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
@@ -3826,7 +3837,9 @@ impl Workspace {
                 ctx.notify();
             }
             TabSettingsChangedEvent::TabPrimaryInfo { .. }
-            | TabSettingsChangedEvent::TabSecondaryInfo { .. } => {
+            | TabSettingsChangedEvent::TabSecondaryInfo { .. }
+            | TabSettingsChangedEvent::RailShowTasks { .. }
+            | TabSettingsChangedEvent::RailTaskInfo { .. } => {
                 // Tab text is derived at render time, so a repaint is enough.
                 ctx.notify();
             }
@@ -22851,6 +22864,10 @@ impl Workspace {
         const ROW_CORNER_RADIUS: f32 = 6.;
         const ROW_SIDE_MARGIN: f32 = 6.;
         const PROJECT_STATUS_ICON_SIZE: f32 = 10.;
+        const TASK_ICON_SIZE: f32 = 14.;
+        // Matches TAB_GROUP_MEMBER_INDENT, so nesting reads the same as the
+        // vertical tabs' grouped members.
+        const TASK_ROW_INDENT: f32 = 12.;
 
         let appearance = Appearance::as_ref(ctx);
         let theme = appearance.theme();
@@ -22861,19 +22878,20 @@ impl Workspace {
         let hover_bg = internal_colors::fg_overlay_1(theme);
         let layout = ProjectLayout::compute(&self.tabs, ctx);
         let selected = self.selected_project.clone();
+        let show_tasks = *TabSettings::as_ref(ctx).rail_show_tasks;
+
+        // Header stays put; only the project/task list scrolls.
+        let header = Container::new(
+            Text::new_inline("Projects".to_string(), font_family, 11.)
+                .with_color(muted_color.into())
+                .finish(),
+        )
+        .with_padding_left(12.)
+        .with_padding_top(10.)
+        .with_padding_bottom(6.)
+        .finish();
 
         let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Start);
-        column.add_child(
-            Container::new(
-                Text::new_inline("Projects".to_string(), font_family, 11.)
-                    .with_color(muted_color.into())
-                    .finish(),
-            )
-            .with_padding_left(12.)
-            .with_padding_top(10.)
-            .with_padding_bottom(6.)
-            .finish(),
-        );
 
         for entry in layout.projects() {
             let is_selected = selected.as_ref() == Some(&entry.id);
@@ -22929,11 +22947,111 @@ impl Workspace {
             })
             .finish();
             column.add_child(row);
+
+            if !show_tasks {
+                continue;
+            }
+            // One row per task, each with its own status. The project row's
+            // aggregate can only say "something here needs you"; these say
+            // which one.
+            for index in layout.visible_tab_indices(&entry.id) {
+                let Some(tab) = self.tabs.get(index) else {
+                    continue;
+                };
+                let pane_group = tab.pane_group.as_ref(ctx);
+                let pane_group_id = tab.pane_group.id();
+                let is_active = index == self.active_tab_index;
+                let task_mouse_state = self
+                    .rail_task_mouse_states
+                    .borrow_mut()
+                    .entry(pane_group_id)
+                    .or_default()
+                    .clone();
+                let task_label = crate::workspace::tab_title::rail_task_label(pane_group, ctx);
+                let task_icon = pane_group
+                    .focused_session_view(ctx)
+                    .and_then(|view| terminal_view_agent_icon_variant(view.as_ref(ctx), ctx))
+                    .map(|variant| {
+                        render_icon_with_status(
+                            variant,
+                            TASK_ICON_SIZE,
+                            0.,
+                            theme,
+                            theme.background(),
+                        )
+                    });
+                let task_row = Hoverable::new(task_mouse_state, move |state| {
+                    let mut row_content = Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                        .with_spacing(6.);
+                    if let Some(icon) = task_icon {
+                        row_content.add_child(icon);
+                    }
+                    row_content.add_child(
+                        Expanded::new(
+                            1.,
+                            // `Text::new` soft-wraps, so a long session name or
+                            // instruction spills onto another line instead of
+                            // being cut off.
+                            Text::new(task_label, font_family, 12.)
+                                .with_color(if is_active {
+                                    text_color.into()
+                                } else {
+                                    muted_color.into()
+                                })
+                                .finish(),
+                        )
+                        .finish(),
+                    );
+                    let mut container = Container::new(row_content.finish())
+                        .with_padding_left(10.)
+                        .with_padding_right(10.)
+                        .with_padding_top(4.)
+                        .with_padding_bottom(4.)
+                        .with_margin_left(ROW_SIDE_MARGIN + TASK_ROW_INDENT)
+                        .with_margin_right(ROW_SIDE_MARGIN)
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                            ROW_CORNER_RADIUS,
+                        )));
+                    if is_active {
+                        container = container.with_background(selected_bg);
+                    } else if state.is_hovered() {
+                        container = container.with_background(hover_bg);
+                    }
+                    container.finish()
+                })
+                .with_cursor(Cursor::PointingHand)
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(WorkspaceAction::ActivateTaskByPaneGroupId(
+                        pane_group_id,
+                    ));
+                })
+                .finish();
+                column.add_child(task_row);
+            }
         }
 
-        ConstrainedBox::new(column.finish())
-            .with_width(RAIL_WIDTH)
-            .finish()
+        let scrollable_rows = ClippedScrollable::vertical(
+            self.project_rail_scroll_state.clone(),
+            column.finish(),
+            ScrollbarWidth::Custom(4.),
+            theme.nonactive_ui_detail().into(),
+            theme.active_ui_detail().into(),
+            ElementFill::None,
+        )
+        .with_overlayed_scrollbar()
+        .finish();
+
+        // `MainAxisSize::Max` + the `Shrinkable` are load-bearing: a scrollable
+        // inside an unbounded column does not scroll.
+        let rail = Flex::column()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(header)
+            .with_child(Shrinkable::new(1., scrollable_rows).finish())
+            .finish();
+
+        ConstrainedBox::new(rail).with_width(RAIL_WIDTH).finish()
     }
 
     fn render_panels(
@@ -24183,6 +24301,9 @@ impl TypedActionView for Workspace {
             }
             SetActiveTabName(name) => self.set_active_tab_name(name, ctx),
             SelectProject(project) => self.select_project(project, ctx),
+            ActivateTaskByPaneGroupId(pane_group_id) => {
+                self.activate_tab_by_pane_group_id(*pane_group_id, ctx)
+            }
             SetActiveTabColor(color) => {
                 // When the active tab is in a group, redirect to the group's color.
                 // The tab color selection menu is hidden when a tab is part of a group

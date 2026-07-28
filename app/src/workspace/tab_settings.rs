@@ -490,6 +490,46 @@ settings::macros::implement_setting_for_enum!(
     description: "The primary information displayed on tabs.",
 );
 
+/// What each task row in the project rail shows.
+///
+/// Deliberately the same vocabulary as the tab-line settings so the rail is a
+/// third view of one idea rather than a competing one; it resolves through the
+/// same `tab_info_text` helper.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "Information shown on each task row in the project rail.",
+    rename_all = "snake_case"
+)]
+pub enum RailTaskInfo {
+    #[default]
+    AgentSession,
+    UserInstruction,
+    Command,
+    WorkingDirectory,
+    Branch,
+}
+
+settings::macros::implement_setting_for_enum!(
+    RailTaskInfo,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.tabs.rail_task_info",
+    description: "Information shown on each task row in the project rail.",
+);
+
 /// The secondary (second line) information shown on a tab, used only when
 /// [`TabLineCount::TwoLine`] is active.
 #[derive(
@@ -653,6 +693,17 @@ define_settings_group!(TabSettings, settings: [
         toml_path: "appearance.vertical_tabs.enabled",
         description: "Whether to display tabs vertically instead of horizontally.",
     },
+    rail_show_tasks: RailShowTasks {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.tabs.rail_show_tasks",
+        description: "List each project's tasks under it in the project rail, each with its own status.",
+        feature_flag: warp_core::features::FeatureFlag::Projects,
+    },
     use_project_layout: UseProjectLayout {
         type: bool,
         default: false,
@@ -729,6 +780,7 @@ define_settings_group!(TabSettings, settings: [
         toml_path: "appearance.vertical_tabs.show_details_on_hover",
         description: "Whether to show a details sidecar when hovering over a vertical tab.",
     },
+    rail_task_info: RailTaskInfo,
     tab_line_count: TabLineCount,
     tab_primary_info: TabPrimaryInfo,
     tab_secondary_info: TabSecondaryInfo,

@@ -13,7 +13,9 @@ use warpui::{AppContext, SingletonEntity as _};
 use crate::pane_group::PaneGroup;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::{CLIAgent, TerminalView};
-use crate::workspace::tab_settings::{TabLineCount, TabPrimaryInfo, TabSecondaryInfo, TabSettings};
+use crate::workspace::tab_settings::{
+    RailTaskInfo, TabLineCount, TabPrimaryInfo, TabSecondaryInfo, TabSettings,
+};
 
 /// The agent session name for a tab, if it has one.
 ///
@@ -107,6 +109,27 @@ impl From<TabSecondaryInfo> for TabInfoKind {
             TabSecondaryInfo::Branch => Self::Branch,
         }
     }
+}
+
+impl From<RailTaskInfo> for TabInfoKind {
+    fn from(value: RailTaskInfo) -> Self {
+        match value {
+            RailTaskInfo::AgentSession => Self::AgentSession,
+            RailTaskInfo::UserInstruction => Self::UserInstruction,
+            RailTaskInfo::Command => Self::Command,
+            RailTaskInfo::WorkingDirectory => Self::WorkingDirectory,
+            RailTaskInfo::Branch => Self::Branch,
+        }
+    }
+}
+
+/// The label for one task row in the project rail.
+///
+/// Falls back to the tab's own title when the configured source has nothing to
+/// show (no agent yet, no repo, no command run), so a row is never blank.
+pub(crate) fn rail_task_label(pane_group: &PaneGroup, app: &AppContext) -> String {
+    let kind = TabSettings::as_ref(app).rail_task_info;
+    tab_info_text(pane_group, kind.into(), app).unwrap_or_else(|| tab_title(pane_group, app))
 }
 
 /// Resolves one kind of tab text for the tab's focused session. Returns `None`
