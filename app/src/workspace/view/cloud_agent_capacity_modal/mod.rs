@@ -33,16 +33,8 @@ const MODAL_HEIGHT: f32 = 532.;
 const COMPACT_MODAL_HEIGHT: f32 = 360.;
 const HEADER_HEIGHT: f32 = 92.;
 const BUTTON_DIAMETER: f32 = 20.;
-/// Path of the billing-and-usage settings deeplink, appended to the channel's
-/// own URL scheme by [`billing_and_usage_url`].
 const BILLING_AND_USAGE_PATH: &str = "settings/billing_and_usage";
 
-/// The billing-and-usage deeplink for the running channel.
-///
-/// The scheme must come from [`ChannelState::url_scheme`] rather than a
-/// hardcoded `warp://`: only the Stable channel claims `warp://`, so a literal
-/// scheme fails to open on Preview/Dev/Local/OSS builds (macOS reports
-/// `kLSApplicationNotFoundErr`).
 fn billing_and_usage_url() -> String {
     format!(
         "{}://{}",
