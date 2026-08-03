@@ -40,6 +40,7 @@ use crate::ai::llms::LLMPreferences;
 use crate::ai::orchestration::{RemoteChildLaunchConfig, prepare_remote_child_launch};
 use crate::app_state::{AmbientAgentPaneSnapshot, LeafContents, TerminalPaneSnapshot};
 use crate::code::buffer_location::LocalOrRemotePath;
+use crate::features::FeatureFlag;
 #[cfg(feature = "local_fs")]
 use crate::pane_group::CodeSource;
 use crate::pane_group::Event::OpenConversationHistory;
@@ -144,6 +145,7 @@ impl TerminalPane {
         ctx: &mut ViewContext<PaneGroup>,
     ) -> Self {
         let pane_configuration = terminal_view.as_ref(ctx).pane_configuration().to_owned();
+        let terminal_view_id = terminal_view.id();
         let view = ctx.add_typed_action_view(|ctx| {
             let pane_id = PaneId::from_terminal_pane_ctx(ctx);
             PaneView::new(
@@ -154,6 +156,15 @@ impl TerminalPane {
                 ctx,
             )
         });
+
+        // The durable session-handle store keys in-flight CLI agent launches
+        // on this pane's restart-stable uuid; the sessions model only knows
+        // the terminal view id, so hand it the mapping.
+        if FeatureFlag::ResumeProjectTasks.is_enabled() {
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, _| {
+                sessions.register_pane_uuid(terminal_view_id, uuid.clone());
+            });
+        }
 
         Self {
             model_event_sender,
@@ -413,6 +424,10 @@ impl PaneContent for TerminalPane {
         if !matches!(detach_type, DetachType::Moved) {
             CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
                 sessions.remove_session(terminal_view_id, ctx);
+                // Pane is closing for good: drop the uuid mapping too. This
+                // clears in-memory state only — the durable handle survives,
+                // that is the dormant row the rail resumes from.
+                sessions.unregister_pane(terminal_view_id);
             });
         }
 

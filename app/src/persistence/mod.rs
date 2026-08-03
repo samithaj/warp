@@ -3,6 +3,7 @@
 cfg_if::cfg_if! {
     if #[cfg(feature = "local_fs")] {
         pub mod agent;
+        mod agent_session_handles;
         mod block_list;
         mod sqlite;
         pub mod commands;
@@ -330,6 +331,39 @@ pub struct FinishedCommandMetadata {
     pub session_id: SessionId,
 }
 
+/// Lifecycle operations on the durable CLI-agent session-handle store.
+///
+/// `agent` is `CLIAgent::to_serialized_name()`; `pane_uuid` is
+/// `terminal_panes.uuid` (stable across restarts, unlike `EntityId`);
+/// `session_id` values are validated at ingest before an op is ever built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSessionHandleOp {
+    /// An agent launched in a pane but has not revealed its session id yet.
+    StartInflight {
+        agent: String,
+        pane_uuid: Vec<u8>,
+        cwd: String,
+    },
+    /// The session id became known: promote the pane's in-flight row, or merge
+    /// into the existing task row when this is a resume of a known session.
+    Identify {
+        agent: String,
+        pane_uuid: Vec<u8>,
+        cwd: String,
+        session_id: String,
+    },
+    /// Activity on a known session; refreshes dormant-row ordering.
+    Touch { agent: String, session_id: String },
+    /// Cache the resolved display label onto the handle.
+    SetTitle {
+        agent: String,
+        session_id: String,
+        title: String,
+    },
+    /// The user explicitly discarded the task from the rail.
+    Forget { agent: String, session_id: String },
+}
+
 #[derive(Debug)]
 pub enum ModelEvent {
     SaveBlock(BlockCompleted),
@@ -427,6 +461,10 @@ pub enum ModelEvent {
     DeleteMultiAgentConversations {
         conversation_ids: Vec<String>,
     },
+    /// A durable CLI-agent session-handle lifecycle operation (project rail
+    /// task resume). Gated behind `FeatureFlag::ResumeProjectTasks` at the
+    /// call sites; the writer applies whatever it is sent.
+    AgentSessionHandle(AgentSessionHandleOp),
 
     UpsertCurrentUserInformation {
         user_information: PersistedCurrentUserInformation,
