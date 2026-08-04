@@ -169,6 +169,15 @@ pub(crate) fn stored_handle_for_tab(
     if !FeatureFlag::ResumeProjectTasks.is_enabled() {
         return None;
     }
+    // The pane must still be *in* the session's directory. A shell can `cd`
+    // away (and a restored pane reopens at its own startup directory), and an
+    // agent's resume lookup is scoped to the working directory — resuming from
+    // the wrong one fails with "No conversation found with session ID". A pane
+    // that has drifted is just a shell; the session stays dormant and keeps its
+    // own row, filed under the project it actually belongs to.
+    let pane_cwd = pane_group
+        .active_session_path(app)
+        .and_then(|path| path.to_str().map(str::to_owned));
     let has_live_agent = pane_group.focused_session_view(app).is_some_and(|view| {
         CLIAgentSessionsModel::as_ref(app)
             .session(view.id())
@@ -177,8 +186,9 @@ pub(crate) fn stored_handle_for_tab(
     if has_live_agent {
         return None;
     }
+    let pane_cwd = pane_cwd?;
     AgentSessionHandlesModel::as_ref(app)
-        .find_by_pane(|pane_uuid| {
+        .find_by_pane_and_cwd(&pane_cwd, |pane_uuid| {
             pane_group
                 .find_terminal_pane_by_session_uuid(pane_uuid)
                 .is_some()

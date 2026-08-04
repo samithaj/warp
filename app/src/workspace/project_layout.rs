@@ -123,16 +123,23 @@ impl ProjectLayout {
             if live_session_ids.contains(&(handle.agent, handle.session_id.clone())) {
                 continue;
             }
-            // The pane that ran this session is still open (commonly: the agent
-            // exited but its tab remains, or the tab was restored). That tab
-            // already displays this handle's title via `stored_handle_title`,
-            // so a dormant row would duplicate it. Matching on the persistent
-            // pane uuid keeps this exact across restarts.
+            // A tab still *hosts* this session (commonly: the agent exited but
+            // its tab remains, or the tab was restored) — that tab already
+            // shows this handle's title, so a dormant row would duplicate it.
+            //
+            // Both the persistent pane uuid and the directory must match. A
+            // pane that has since `cd`-ed away, or restored to a different
+            // startup directory, no longer hosts the session: it must not
+            // absorb the row, or the task would be filed under whichever
+            // project that pane now sits in rather than its own.
             if tabs.iter().any(|tab| {
-                tab.pane_group
-                    .as_ref(ctx)
+                let pane_group = tab.pane_group.as_ref(ctx);
+                pane_group
                     .find_terminal_pane_by_session_uuid(&handle.pane_uuid)
                     .is_some()
+                    && pane_group
+                        .active_session_path(ctx)
+                        .is_some_and(|path| path.to_str() == Some(handle.cwd.as_str()))
             }) {
                 continue;
             }

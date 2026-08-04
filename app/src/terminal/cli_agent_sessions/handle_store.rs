@@ -87,16 +87,24 @@ impl AgentSessionHandlesModel {
             .find(|handle| handle.agent == agent && handle.session_id == session_id)
     }
 
-    /// The most recently seen handle whose pane satisfies `pane_matches` —
-    /// used to tie an open (or restored) tab back to the session it ran, so
-    /// the tab can show that session's name and resume it in place.
-    pub fn find_by_pane(
+    /// The most recently seen handle that a tab still *hosts*: its pane
+    /// satisfies `pane_matches` **and** the pane is still in the session's own
+    /// directory (`pane_cwd`).
+    ///
+    /// Both conditions are required. The pane uuid alone is not enough — a
+    /// shell can `cd` away, and a restored pane reopens at its own startup
+    /// directory, so the pane that once ran a session may now be somewhere
+    /// else entirely. Resuming there fails ("No conversation found with
+    /// session ID"), because an agent's resume lookup is scoped to the working
+    /// directory. A drifted pane is just a shell; the session stays dormant.
+    pub fn find_by_pane_and_cwd(
         &self,
+        pane_cwd: &str,
         mut pane_matches: impl FnMut(&[u8]) -> bool,
     ) -> Option<&AgentSessionHandle> {
         self.handles
             .iter()
-            .find(|handle| pane_matches(&handle.pane_uuid))
+            .find(|handle| handle.cwd == pane_cwd && pane_matches(&handle.pane_uuid))
     }
 
     /// Applies the same op that was enqueued for the sqlite writer, so the

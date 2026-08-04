@@ -106,3 +106,38 @@ fn identify_records_the_pane_uuid_for_restore_matching() {
         b"pane-xyz".to_vec()
     );
 }
+
+#[test]
+fn a_pane_that_drifted_to_another_directory_no_longer_hosts_the_session() {
+    // Regression: a shell that `cd`-ed away (or restored to a different
+    // startup directory) kept claiming the session, so the rail filed the task
+    // under the wrong project and resume ran in the wrong directory —
+    // "No conversation found with session ID".
+    let mut model = AgentSessionHandlesModel::default();
+    model.apply_op(&AgentSessionHandleOp::Identify {
+        agent: "Claude".to_owned(),
+        pane_uuid: b"pane-a".to_vec(),
+        cwd: "/dev/tools/warp".to_owned(),
+        session_id: "aaaa".to_owned(),
+    });
+    let pane_is_a = |uuid: &[u8]| uuid == b"pane-a";
+
+    // Same pane, still in the session's directory: it hosts the session.
+    assert!(
+        model
+            .find_by_pane_and_cwd("/dev/tools/warp", pane_is_a)
+            .is_some()
+    );
+    // Same pane, but it has moved elsewhere: no longer hosts it.
+    assert!(
+        model
+            .find_by_pane_and_cwd("/dev/learn_llm/vllm-metal", pane_is_a)
+            .is_none()
+    );
+    // Right directory, different pane: also not a host.
+    assert!(
+        model
+            .find_by_pane_and_cwd("/dev/tools/warp", |uuid| uuid == b"pane-b")
+            .is_none()
+    );
+}

@@ -5560,18 +5560,27 @@ impl Workspace {
         else {
             return;
         };
-        // Resume in place when the pane that ran this session is still open
-        // (its agent exited, or the tab was restored): it already sits in the
-        // right directory, so a second tab for the same work would be noise.
+        // Resume in place when the pane that ran this session is still open AND
+        // still sits in the session's directory: opening a second tab for work
+        // already in front of the user would be noise.
+        //
+        // The directory check is not optional. An agent's resume lookup is
+        // scoped to the working directory, so prefilling into a pane that has
+        // `cd`-ed elsewhere (or restored to a different startup directory)
+        // fails with "No conversation found with session ID". When the pane has
+        // drifted, fall through to a new tab opened at the stored cwd.
         let owning_pane = AgentSessionHandlesModel::as_ref(ctx)
             .get(agent, &session_id)
             .and_then(|handle| {
                 let pane_uuid = handle.pane_uuid.clone();
                 self.tabs.iter().position(|tab| {
-                    tab.pane_group
-                        .as_ref(ctx)
+                    let pane_group = tab.pane_group.as_ref(ctx);
+                    pane_group
                         .find_terminal_pane_by_session_uuid(&pane_uuid)
                         .is_some()
+                        && pane_group
+                            .active_session_path(ctx)
+                            .is_some_and(|path| path.to_str() == Some(cwd.as_str()))
                 })
             });
         if let Some(tab_index) = owning_pane {
