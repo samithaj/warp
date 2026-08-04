@@ -388,6 +388,9 @@ use crate::terminal::available_shells::AvailableShells;
 use crate::terminal::block_list_viewport::InputMode;
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::{PluginModalKind, plugin_manager_for};
+use crate::terminal::cli_agent_sessions::session_scan::{
+    self, ClaudeSessionScanModel, ScannedSession,
+};
 use crate::terminal::cli_agent_sessions::{CLIAgentSessionsModel, CLIAgentSessionsModelEvent};
 use crate::terminal::enable_auto_reload_modal::{
     EnableAutoReloadModal, EnableAutoReloadModalEvent,
@@ -3003,6 +3006,16 @@ impl Workspace {
             ctx.notify();
         });
 
+        // The on-disk session scan lands asynchronously; without this the rail
+        // would keep showing the pre-scan rows until some other event repainted
+        // it. Also kicked once here so the rail is populated on the first
+        // paint after a restart, before the user touches anything.
+        if ctx.has_singleton_model::<ClaudeSessionScanModel>() {
+            ctx.observe(&ClaudeSessionScanModel::handle(ctx), |_, _, ctx| {
+                ctx.notify();
+            });
+        }
+
         let changelog_model = ChangelogModel::handle(ctx);
         ctx.subscribe_to_model(&changelog_model, |me, _, event, ctx| {
             me.handle_changelog_event(event, ctx);
@@ -3892,6 +3905,9 @@ impl Workspace {
                         .get(self.active_tab_index)
                         .map(|tab| ProjectLayout::project_of_tab_data(tab, ctx));
                     self.vertical_tabs_panel_open = false;
+                    // The rail has just become visible; populate its dormant
+                    // rows from disk rather than waiting for the first click.
+                    self.refresh_claude_session_scan(ctx);
                 } else {
                     self.selected_project = None;
                     self.vertical_tabs_panel_open = vertical_tabs_layout_active(ctx);
@@ -5554,11 +5570,68 @@ impl Workspace {
     /// tab belongs to the selected project. If the project has no open tabs, the
     /// selection is set directly.
     pub(crate) fn select_project(&mut self, project: &ProjectId, ctx: &mut ViewContext<Self>) {
+        self.refresh_claude_session_scan(ctx);
         let visible = ProjectLayout::compute(&self.tabs, ctx).visible_tab_indices(project);
         match self.mru_tab_index(&visible) {
             Some(index) => self.set_active_tab_index(index, ctx),
             None => self.selected_project = Some(project.clone()),
         }
+    }
+
+    /// The sessions the last on-disk scan found, or an empty slice when the
+    /// scan model is not registered (headless/test harnesses).
+    fn scanned_sessions(ctx: &AppContext) -> Vec<ScannedSession> {
+        if !ctx.has_singleton_model::<ClaudeSessionScanModel>() {
+            return Vec::new();
+        }
+        ClaudeSessionScanModel::as_ref(ctx).sessions().to_vec()
+    }
+
+    /// Kicks an off-thread rescan of Claude's state for every directory the
+    /// rail could show a task for: each open tab's directory plus every stored
+    /// handle's. Those are exactly the paths the projection buckets by, which
+    /// is why the scan never has to reverse a `~/.claude/projects` directory
+    /// name back into a cwd — that mapping is lossy and would guess wrong on
+    /// any path whose separators and `-` are indistinguishable after encoding.
+    ///
+    /// Called from user actions rather than a watcher or a timer, so a session
+    /// started in another terminal shows up on the next project interaction
+    /// rather than instantly. That is the deliberate cost of adding no new
+    /// background machinery.
+    fn refresh_claude_session_scan(&self, ctx: &mut ViewContext<Self>) {
+        use crate::terminal::cli_agent_sessions::handle_store::AgentSessionHandlesModel;
+
+        if !FeatureFlag::ResumeProjectTasks.is_enabled()
+            || !ctx.has_singleton_model::<ClaudeSessionScanModel>()
+        {
+            return;
+        }
+        let mut dirs: Vec<PathBuf> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let pane_group = tab.pane_group.as_ref(ctx);
+                // Falls back to the restored startup directory so a tab whose
+                // shell has not started yet (lazy startup) still contributes.
+                pane_group
+                    .active_session_path(ctx)
+                    .or_else(|| pane_group.restored_terminal_startup_directory())
+            })
+            .collect();
+        dirs.extend(
+            AgentSessionHandlesModel::as_ref(ctx)
+                .handles()
+                .iter()
+                .map(|handle| PathBuf::from(&handle.cwd)),
+        );
+        dirs.sort();
+        dirs.dedup();
+        if dirs.is_empty() {
+            return;
+        }
+        ClaudeSessionScanModel::handle(ctx).update(ctx, |model, ctx| {
+            model.refresh(dirs, ctx);
+        });
     }
 
     /// Resumes a dormant agent task from the project rail: opens a new tab at
@@ -5570,6 +5643,11 @@ impl Workspace {
     /// A new tab is always used, never an existing pane: a pane's project is
     /// derived from its cwd, so restoring into a pane of another project would
     /// silently re-bucket that tab.
+    ///
+    /// The authority split is enforced here by *lookup order*, not by a check:
+    /// the "resume in place" pane is derived from the stored handle, so a
+    /// session Warp never witnessed — which has no handle — cannot reach that
+    /// branch and always opens a fresh tab at its scanned directory.
     fn resume_dormant_agent_task(
         &mut self,
         agent: CLIAgent,
@@ -5581,11 +5659,35 @@ impl Workspace {
         if !FeatureFlag::ResumeProjectTasks.is_enabled() {
             return;
         }
-        let Some(cwd) = AgentSessionHandlesModel::as_ref(ctx)
+        let handle = AgentSessionHandlesModel::as_ref(ctx)
             .get(agent, &session_id)
-            .map(|handle| handle.cwd.clone())
-        else {
-            return;
+            .cloned();
+        let cwd = match &handle {
+            Some(handle) => handle.cwd.clone(),
+            // Unwitnessed: the scan is the only thing that knows this session
+            // exists, and all it knows is a directory — never a pane.
+            None => {
+                // The scan only ever produces Claude sessions, so another
+                // agent reaching here is a row with no source at all.
+                if agent != CLIAgent::Claude || !ctx.has_singleton_model::<ClaudeSessionScanModel>()
+                {
+                    return;
+                }
+                let Some(scanned) = ClaudeSessionScanModel::as_ref(ctx)
+                    .session(&session_id)
+                    .cloned()
+                else {
+                    return;
+                };
+                // A row can outlive the transcript it was built from, and
+                // resuming a session Claude has pruned fails outright. Cheap
+                // stat, and only on the click.
+                if !session_scan::transcript_exists(Path::new(&scanned.cwd), &session_id) {
+                    log::warn!("Scanned session transcript vanished before resume");
+                    return;
+                }
+                scanned.cwd
+            }
         };
         // Validation lives inside resume_command: an id that fails it yields
         // no command, and the click does nothing rather than guessing.
@@ -5602,20 +5704,18 @@ impl Workspace {
         // `cd`-ed elsewhere (or restored to a different startup directory)
         // fails with "No conversation found with session ID". When the pane has
         // drifted, fall through to a new tab opened at the stored cwd.
-        let owning_pane = AgentSessionHandlesModel::as_ref(ctx)
-            .get(agent, &session_id)
-            .and_then(|handle| {
-                let pane_uuid = handle.pane_uuid.clone();
-                self.tabs.iter().position(|tab| {
-                    let pane_group = tab.pane_group.as_ref(ctx);
-                    pane_group
-                        .find_terminal_pane_by_session_uuid(&pane_uuid)
-                        .is_some()
-                        && pane_group
-                            .active_session_path(ctx)
-                            .is_some_and(|path| path.to_str() == Some(cwd.as_str()))
-                })
-            });
+        let owning_pane = handle.and_then(|handle| {
+            let pane_uuid = handle.pane_uuid.clone();
+            self.tabs.iter().position(|tab| {
+                let pane_group = tab.pane_group.as_ref(ctx);
+                pane_group
+                    .find_terminal_pane_by_session_uuid(&pane_uuid)
+                    .is_some()
+                    && pane_group
+                        .active_session_path(ctx)
+                        .is_some_and(|path| path.to_str() == Some(cwd.as_str()))
+            })
+        });
         if let Some(tab_index) = owning_pane {
             self.activate_tab_internal(tab_index, ctx);
             match self
@@ -5726,6 +5826,12 @@ impl Workspace {
             if let Some(project) = project {
                 self.selected_project = Some(project);
             }
+            // Doubles as the startup kick: the first tab activation after a
+            // restore is the earliest `&mut` moment at which the tab set (and
+            // therefore the set of directories worth scanning) is known. The
+            // model's own per-directory interval keeps repeated tab switches
+            // from re-reading anything.
+            self.refresh_claude_session_scan(ctx);
         }
         if self.vertical_tabs_panel_open && vertical_tabs_layout_active(ctx) {
             self.vertical_tabs_panel.scroll_to_tab(index);
@@ -23083,14 +23189,17 @@ impl Workspace {
         let muted_color = theme.sub_text_color(theme.background());
         let selected_bg = internal_colors::fg_overlay_2(theme);
         let hover_bg = internal_colors::fg_overlay_1(theme);
-        // Dormant rows come from the durable handle store, so a project with no
-        // open tabs still appears — which is what keeps the rail populated
-        // after a restart, where `compute`'s tabs-only projection is empty.
+        // Dormant rows come from the durable handle store plus the on-disk scan
+        // of Claude's own state, so a project with no open tabs still appears —
+        // which is what keeps the rail populated after a restart, where
+        // `compute`'s tabs-only projection is empty. Both are read from cached
+        // models here; the scan itself never runs on the render path.
         let layout = if FeatureFlag::ResumeProjectTasks.is_enabled() {
             use crate::terminal::cli_agent_sessions::handle_store::AgentSessionHandlesModel;
             let live = CLIAgentSessionsModel::as_ref(ctx).live_session_ids();
             let handles = AgentSessionHandlesModel::as_ref(ctx).handles().to_vec();
-            ProjectLayout::compute_with_handles(&self.tabs, &handles, &live, ctx)
+            let scanned = Self::scanned_sessions(ctx);
+            ProjectLayout::compute_with_handles(&self.tabs, &handles, &live, &scanned, ctx)
         } else {
             ProjectLayout::compute(&self.tabs, ctx)
         };

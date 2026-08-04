@@ -1,9 +1,14 @@
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use warp_util::standardized_path::StandardizedPath;
 
 use super::super::project_key::ProjectKey;
-use super::{DormantTask, ProjectEntry, ProjectId, ProjectLayout};
+use super::{
+    DormantTask, DormantTaskOrigin, ProjectEntry, ProjectId, ProjectLayout, ScannedSession,
+    dormant_label, unwitnessed_sessions,
+};
 use crate::terminal::CLIAgent;
 
 fn git_key(path: &str) -> ProjectKey {
@@ -40,6 +45,7 @@ fn dormant(project: ProjectId, session_id: &str, label: &str) -> (ProjectId, Dor
             session_id: session_id.to_owned(),
             label: label.to_owned(),
             cwd: "/dev/example".to_owned(),
+            origin: DormantTaskOrigin::Handle,
         },
     )
 }
@@ -129,4 +135,79 @@ fn compute_alone_never_yields_dormant_rows() {
     let orbit = ProjectId::Key(git_key("/repos/orbit/.git"));
     let layout = layout_from(vec![orbit.clone()]);
     assert!(layout.dormant_tasks_for_project(&orbit).is_empty());
+}
+
+fn scanned(session_id: &str, label: Option<&str>, modified_secs: u64) -> ScannedSession {
+    ScannedSession {
+        session_id: session_id.to_owned(),
+        cwd: "/repos/orbit".to_owned(),
+        label: label.map(str::to_owned),
+        modified: SystemTime::UNIX_EPOCH + Duration::from_secs(modified_secs),
+    }
+}
+
+#[test]
+fn unwitnessed_rows_exclude_live_and_handle_bound_sessions() {
+    let sessions = [
+        scanned("aaaa", Some("Witnessed"), 100),
+        scanned("bbbb", Some("Unwitnessed"), 200),
+        scanned("cccc", Some("Running right now"), 300),
+    ];
+    let bound: HashSet<&str> = ["aaaa"].into_iter().collect();
+    let live: HashSet<(CLIAgent, String)> = [(CLIAgent::Claude, "cccc".to_owned())]
+        .into_iter()
+        .collect();
+
+    let rows = unwitnessed_sessions(&sessions, &bound, &live);
+
+    // Filtered here, before the rail's row cap, so a burst of running or
+    // already-witnessed sessions cannot bury the resumable ones.
+    assert_eq!(
+        rows.iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bbbb"]
+    );
+}
+
+#[test]
+fn unwitnessed_rows_are_newest_first() {
+    // mtime is the only recency signal an unwitnessed session has.
+    let sessions = [
+        scanned("old", Some("Old"), 100),
+        scanned("newest", Some("Newest"), 900),
+        scanned("middle", Some("Middle"), 500),
+    ];
+    let rows = unwitnessed_sessions(&sessions, &HashSet::new(), &HashSet::new());
+    assert_eq!(
+        rows.iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["newest", "middle", "old"]
+    );
+}
+
+#[test]
+fn scanned_names_beat_the_cached_handle_title() {
+    // `/rename` lands in the transcript after the handle was written, so disk
+    // is the fresher of the two names.
+    assert_eq!(
+        dormant_label(
+            Some("Renamed on disk"),
+            Some("Stale cache"),
+            CLIAgent::Claude,
+            "aaaa"
+        ),
+        "Renamed on disk"
+    );
+    // Without a scan result the cached title still stands.
+    assert_eq!(
+        dormant_label(None, Some("Stale cache"), CLIAgent::Claude, "aaaa"),
+        "Stale cache"
+    );
+    // And with neither, the floor is an id — never a path.
+    assert_eq!(
+        dormant_label(None, None, CLIAgent::Claude, "61f785ca-1c31-4671"),
+        format!("{} · 61f785ca", CLIAgent::Claude.display_name())
+    );
 }

@@ -19,6 +19,7 @@ use super::project_key::ProjectKey;
 use crate::tab::TabData;
 use crate::terminal::CLIAgent;
 use crate::terminal::cli_agent_sessions::handle_store::AgentSessionHandle;
+use crate::terminal::cli_agent_sessions::session_scan::ScannedSession;
 
 /// Identifies a project bucket in the sidebar. `Other` collects tabs with no
 /// detectable repo/directory (for example a bare home-directory session).
@@ -45,18 +46,37 @@ pub struct ProjectEntry {
     pub display_name: String,
 }
 
-/// A dormant task row: a stored agent-session handle with no open tab. The
-/// rail renders these under a project's live tasks; clicking one resumes the
-/// session in a fresh tab at its own directory.
+/// Where a dormant row came from, and therefore what may be done with it.
+///
+/// This is the rail-side face of the authority split documented on
+/// [`session_scan`](crate::terminal::cli_agent_sessions::session_scan): only a
+/// witnessed session has a pane, so only a witnessed session can be resumed in
+/// the pane that ran it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DormantTaskOrigin {
+    /// Warp spawned and witnessed this session, so the durable handle store
+    /// holds its pane uuid and owns its pane binding.
+    Handle,
+    /// Found by scanning Claude Code's own transcripts. Warp never saw it run;
+    /// it has no pane, no tab and no handle, and resumes only in a fresh tab
+    /// at its directory.
+    Scanned,
+}
+
+/// A dormant task row: a resumable session with no open tab, either from the
+/// stored agent-session handles or discovered on disk. The rail renders these
+/// under a project's live tasks; clicking one resumes the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DormantTask {
     pub agent: CLIAgent,
     pub session_id: String,
-    /// Resolved display label: the cached conversation title, or the
+    /// Resolved display label: the conversation title (scanned from the
+    /// transcript when available, else the cached one), or the
     /// `Agent · shortid` floor. Never a path — replacing path-derived labels
     /// is the point of the rail.
     pub label: String,
     pub cwd: String,
+    pub origin: DormantTaskOrigin,
 }
 
 /// A pure projection of the workspace's tabs into projects.
@@ -102,10 +122,20 @@ impl ProjectLayout {
         }
     }
 
-    /// Like [`Self::compute`], but additionally buckets stored session handles
-    /// into their projects — including projects with **no open tabs**, which is
-    /// what keeps the rail populated after a restart. Handles whose session is
-    /// live (`live_session_ids`) are suppressed: the live row wins.
+    /// Like [`Self::compute`], but additionally buckets resumable sessions into
+    /// their projects — including projects with **no open tabs**, which is what
+    /// keeps the rail populated after a restart. Sessions that are live
+    /// (`live_session_ids`) are suppressed: the live row wins.
+    ///
+    /// Two sources feed this, per the authority split on
+    /// [`session_scan`](crate::terminal::cli_agent_sessions::session_scan):
+    /// `handles` (witnessed sessions, which own their pane binding) and
+    /// `scanned` (whatever Claude recorded on disk, which owns names and the
+    /// existence of sessions Warp never saw). Scanned rows are appended after
+    /// the handle rows so a project's own history cannot displace what Warp
+    /// itself ran, and live/handle-bound ids are filtered out of the scanned
+    /// set **before** the rail applies its row cap, so running sessions cannot
+    /// hide resumable ones.
     ///
     /// The cwd → project resolution is memoised per distinct cwd within this
     /// single pass; nothing is persisted (repo detection may reclassify a path
@@ -114,12 +144,25 @@ impl ProjectLayout {
         tabs: &[TabData],
         handles: &[AgentSessionHandle],
         live_session_ids: &HashSet<(CLIAgent, String)>,
+        scanned: &[ScannedSession],
         ctx: &AppContext,
     ) -> Self {
         let mut layout = Self::compute(tabs, ctx);
 
+        // Join key is the session UUID. A repo's worktrees bucket to one
+        // project but have distinct cwds, so the same session can be reached
+        // from more than one scanned directory; first one wins.
+        let mut scanned_by_id: HashMap<&str, &ScannedSession> = HashMap::new();
+        for session in scanned {
+            scanned_by_id
+                .entry(session.session_id.as_str())
+                .or_insert(session);
+        }
+
         let mut project_by_cwd: HashMap<&str, ProjectId> = HashMap::new();
+        let mut bound_session_ids: HashSet<&str> = HashSet::new();
         for handle in handles {
+            bound_session_ids.insert(handle.session_id.as_str());
             if live_session_ids.contains(&(handle.agent, handle.session_id.clone())) {
                 continue;
             }
@@ -162,11 +205,53 @@ impl ProjectLayout {
                 DormantTask {
                     agent: handle.agent,
                     session_id: handle.session_id.clone(),
-                    label: handle.title.clone().unwrap_or_else(|| {
-                        let short: String = handle.session_id.chars().take(8).collect();
-                        format!("{} · {short}", handle.agent.display_name())
-                    }),
+                    label: dormant_label(
+                        scanned_by_id
+                            .get(handle.session_id.as_str())
+                            .and_then(|session| session.label.as_deref()),
+                        handle.title.as_deref(),
+                        handle.agent,
+                        &handle.session_id,
+                    ),
                     cwd: handle.cwd.clone(),
+                    origin: DormantTaskOrigin::Handle,
+                },
+            ));
+        }
+
+        for session in unwitnessed_sessions(scanned, &bound_session_ids, live_session_ids) {
+            let project = project_by_cwd
+                .entry(session.cwd.as_str())
+                .or_insert_with(|| {
+                    ProjectKey::for_path(
+                        &LocalOrRemotePath::Local(PathBuf::from(&session.cwd)),
+                        ctx,
+                    )
+                    .map(ProjectId::Key)
+                    .unwrap_or(ProjectId::Other)
+                })
+                .clone();
+            if !layout.projects.iter().any(|entry| entry.id == project) {
+                layout.projects.push(ProjectEntry {
+                    display_name: project.display_name(),
+                    id: project.clone(),
+                });
+            }
+            layout.dormant.push((
+                project,
+                DormantTask {
+                    // The scan reads Claude Code's transcript layout, so every
+                    // row it produces is a Claude session by construction.
+                    agent: CLIAgent::Claude,
+                    session_id: session.session_id.clone(),
+                    label: dormant_label(
+                        session.label.as_deref(),
+                        None,
+                        CLIAgent::Claude,
+                        &session.session_id,
+                    ),
+                    cwd: session.cwd.clone(),
+                    origin: DormantTaskOrigin::Scanned,
                 },
             ));
         }
@@ -214,6 +299,56 @@ impl ProjectLayout {
             .filter_map(|(index, id)| (id == selected).then_some(index))
             .collect()
     }
+}
+
+/// The scanned sessions that earn a row of their own: everything the handle
+/// store does not already cover, and nothing that is currently running.
+///
+/// The filtering happens **here**, before the rail applies its own row cap, so
+/// running and already-witnessed sessions cannot consume the cap and hide
+/// resumable ones behind it.
+///
+/// Newest first, by transcript mtime — the only recency signal an unwitnessed
+/// session has, since Warp has no `last_seen_at` for one. Handle rows keep
+/// their own store order and are not re-sorted into this: the two clocks mean
+/// different things (when Warp last saw it, versus when Claude last wrote it)
+/// and interleaving them would order rows by neither.
+fn unwitnessed_sessions<'a>(
+    scanned: &'a [ScannedSession],
+    bound_session_ids: &HashSet<&str>,
+    live_session_ids: &HashSet<(CLIAgent, String)>,
+) -> Vec<&'a ScannedSession> {
+    let mut unwitnessed: Vec<&ScannedSession> = scanned
+        .iter()
+        .filter(|session| {
+            !bound_session_ids.contains(session.session_id.as_str())
+                && !live_session_ids.contains(&(CLIAgent::Claude, session.session_id.clone()))
+        })
+        .collect();
+    unwitnessed.sort_by(|left, right| right.modified.cmp(&left.modified));
+    unwitnessed
+}
+
+/// The label for one dormant row.
+///
+/// The scanned name wins over the cached one even for a witnessed session: the
+/// handle's title was cached when Warp last looked, but `/rename` lands in the
+/// transcript afterwards, so disk is the fresher of the two. The floor is
+/// `Agent · shortid` — never a path, since replacing path-derived labels is
+/// the point of the rail.
+fn dormant_label(
+    scanned_label: Option<&str>,
+    cached_title: Option<&str>,
+    agent: CLIAgent,
+    session_id: &str,
+) -> String {
+    scanned_label
+        .or(cached_title)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let short: String = session_id.chars().take(8).collect();
+            format!("{} · {short}", agent.display_name())
+        })
 }
 
 /// The index reached by moving forward one step through `indices` from
