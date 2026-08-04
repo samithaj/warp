@@ -104,7 +104,9 @@ four other call sites pass `false`. New tabs, splits, and panes with no local sh
 
 | Site | Action | Why |
 |---|---|---|
-| `TerminalPane::focus` (survey site 1) | **start** | Restoration calls `activate_tab_internal` (`workspace/view.rs:4098`) → `focus_active_tab` → `PaneGroup::focus` → `TerminalPane::focus`. The saved active tab therefore starts exactly one shell, with no special case |
+| `Workspace::focus_active_tab` | **start** | A tab became the active tab. Restoration's single activation (`workspace/view.rs:4098` → `activate_tab_internal`) goes through here, so the front tab starts exactly one shell with no special case |
+| `PaneGroup::focus_pane` | **start** | Focus moved to a pane *by id* — clicking a split, and every id-based focus helper. Splits the user has not touched stay deferred until clicked |
+| `TerminalPane::focus` (survey site 1) | **skip** | Looks like the right trigger and is not — see §6c |
 | `PaneGroup::send_sync_event_to_session` (survey §4b) | **start** | Synchronized input is opt-in *user input*; silently dropping keystrokes would be wrong. Bounded by how many panes the user chose to sync |
 | `send_prompt_change_bindkey_to_all_sessions` (site 2) | **skip** | A settings push, not input. Starting 50 shells to deliver a bindkey defeats the feature entirely |
 | `close_pane_with_confirmation` (site 4) | **skip** | A pane with no shell trivially has no long-running command to confirm. Block cleanup goes through `delete_blocks`, which uses `self.uuid` and never touches the manager |
@@ -116,6 +118,26 @@ caller reaches it through `Workspace::active_tab_pane_group`, i.e. the focused t
 has already started. The single exception, `active_session_ps1_grid_info`
 (`workspace/view.rs:18796`), walks *all* tabs as a read-only `find_map` fallback and correctly skips
 a pane with no prompt grid yet. Starting shells there would be precisely wrong.
+
+### 6c. The trigger that looked right and wasn't
+
+The first implementation put the start on `TerminalPane::focus`, reasoning that focusing a pane is
+what "opening a tab" means. **Measured: 46 of 48 restored tabs still spawned a shell** — against a
+baseline of 50, essentially no change.
+
+`PaneGroup::new_internal` focuses every pane group *as it constructs it*, behind
+`DragTabsToWindows` — which lives in `RELEASE_FLAGS`, so it is on everywhere. Restoring 49 tabs
+constructs 49 pane groups, each of which focuses itself, each of which started its shell. Deferral
+was working exactly as designed and then immediately undone, one tab at a time.
+
+The fix is to hang the start off paths that only run when a user opens something (§6a). Neither is
+reachable from `new_internal`, which calls `PaneGroup::focus` directly.
+
+Worth recording because **no static check could have caught this**: it compiled, passed clippy, read
+correctly, and matched the survey. The call graph was right — `focus` really is reached on tab
+activation. What was wrong was the assumption that it is reached *only* then. Only the shell count
+found it, which is the argument for measuring rather than reasoning about a feature whose entire
+purpose is a runtime resource count.
 
 ### 6b. The label fix deferral forced
 
