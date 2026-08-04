@@ -1204,12 +1204,7 @@ impl PaneGroup {
         // (Contrast the settings broadcast in
         // `send_prompt_change_bindkey_to_all_sessions`, which must NOT start
         // panes — one setting change would otherwise spawn every shell.)
-        if let Some(manager) = self
-            .terminal_session_by_id(terminal_pane_id)
-            .map(|session| session.terminal_manager(ctx))
-        {
-            manager.update(ctx, |manager, ctx| manager.ensure_shell_started(ctx));
-        }
+        self.ensure_session_started(terminal_pane_id.into(), ctx);
         if let Some(pane_view) = self.terminal_view_from_pane_id(terminal_pane_id, ctx) {
             pane_view.update(ctx, |terminal_view, ctx| {
                 terminal_view.receive_sync_input_event(sync_event, ctx);
@@ -7558,6 +7553,11 @@ impl PaneGroup {
             focus_state.set_focused_pane(id, ctx);
         });
 
+        // The user moved focus to this pane, so if its shell was deferred at
+        // restore, this is when it starts. Cheap and idempotent for every
+        // other pane.
+        self.ensure_session_started(id, ctx);
+
         ctx.emit(Event::PaneTitleUpdated);
         // Update the active session if the newly focused pane is a terminal pane.
         if let Some(terminal_pane_id) = id.as_terminal_pane_id() {
@@ -7600,6 +7600,28 @@ impl PaneGroup {
         }
         focused
     }
+    /// Starts `pane_id`'s shell if it was deferred at restore.
+    ///
+    /// No-op for a pane that was never deferred, for one already started, and
+    /// for panes with no local shell of their own.
+    pub(crate) fn ensure_session_started(&self, pane_id: PaneId, ctx: &mut ViewContext<Self>) {
+        let manager = self
+            .downcast_pane_by_id::<TerminalPane>(pane_id)
+            .map(|session| session.terminal_manager(ctx));
+        if let Some(manager) = manager {
+            manager.update(ctx, |manager, ctx| manager.ensure_shell_started(ctx));
+        }
+    }
+
+    /// Starts the shell of whichever pane currently holds focus in this group.
+    ///
+    /// This is the tab-level entry point: activating a tab focuses it, and the
+    /// pane that ends up focused is the one the user is looking at. Split panes
+    /// they have not touched stay deferred until clicked.
+    pub(crate) fn ensure_focused_session_started(&self, ctx: &mut ViewContext<Self>) {
+        self.ensure_session_started(self.focused_pane_id(ctx), ctx);
+    }
+
     fn focus_pane_and_record_in_history(
         &mut self,
         id: PaneId,
