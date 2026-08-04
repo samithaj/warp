@@ -105,6 +105,10 @@ fn inherit_share_cascades_ambient_source_for_cloud_orchestrator() {
 /// that window — seconds long when many tabs restore at once — would otherwise
 /// save `None` and permanently lose the pane's directory and shell: the next
 /// restore opens somewhere else, and saves that as the new truth.
+///
+/// `FeatureFlag::LazyShellStartup` turns that window from "seconds" into
+/// "forever" for a tab the user never opens, so the first case below is the
+/// one every deferred pane takes on every save.
 #[test]
 fn a_field_the_shell_has_not_answered_yet_keeps_its_restored_value() {
     // Shell has not reported: fall back to what we were restored with.
