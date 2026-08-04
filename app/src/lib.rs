@@ -2131,6 +2131,13 @@ pub(crate) fn initialize_app(
             &agent_session_handle_records,
         )
     });
+    // Cache of Claude Code's own on-disk sessions. Complements the handle
+    // mirror above: that one knows only sessions Warp witnessed, this one
+    // knows everything Claude recorded in a project's directory. Starts empty
+    // and is filled by the rail's off-thread scan.
+    ctx.add_singleton_model(|_| {
+        crate::terminal::cli_agent_sessions::session_scan::ClaudeSessionScanModel::default()
+    });
     // ActiveAgentViewsModel is used to track active agent conversations and notify listeners when they change.
     ctx.add_singleton_model(|_| ActiveAgentViewsModel::new());
     ctx.add_singleton_model(AgentNotificationsModel::new);

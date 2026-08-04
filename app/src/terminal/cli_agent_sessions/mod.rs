@@ -3,6 +3,10 @@ pub mod handle_store;
 pub mod listener;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod plugin_manager;
+/// Discovery of sessions Warp never witnessed, from Claude's own on-disk
+/// state. Unconditional (unlike `transcript_naming`) so the rail's projection
+/// needs no `cfg`; the filesystem work inside it is what is gated.
+pub mod session_scan;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod transcript_naming;
 
