@@ -141,21 +141,25 @@ pub(crate) fn rail_task_label(pane_group: &PaneGroup, app: &AppContext) -> Strin
 /// Once an agent exits, `CLIAgentSessionsModel` drops its live session, so
 /// [`agent_session_title`] goes `None` and the row would fall back to the
 /// truncated cwd — the original "six rows all reading `..repos/poa-agent`"
-/// problem. The handle outlives the session, so the name does too: match the
-/// tab's directory against the most recently seen handle for it.
+/// problem. The handle outlives the session, so the name does too.
 ///
-/// Directory matching (rather than session id) is deliberate: the live session
-/// — and with it the id — is exactly what has gone away by this point.
-fn stored_handle_title(pane_group: &PaneGroup, app: &AppContext) -> Option<String> {
+/// Matched on the pane's persistent uuid rather than its directory: the uuid
+/// survives a restart (it is what `terminal_panes.uuid` stores), so a restored
+/// tab is still recognised as the one that ran the session — and two sessions
+/// in the same directory can't borrow each other's name. `ProjectLayout` uses
+/// the same match to suppress the duplicate dormant row for this tab.
+pub(crate) fn stored_handle_title(pane_group: &PaneGroup, app: &AppContext) -> Option<String> {
     if !FeatureFlag::ResumeProjectTasks.is_enabled() {
         return None;
     }
-    let cwd = pane_group.active_session_path(app)?;
-    let cwd = cwd.to_str()?;
     AgentSessionHandlesModel::as_ref(app)
         .handles()
         .iter()
-        .find(|handle| handle.cwd == cwd)
+        .find(|handle| {
+            pane_group
+                .find_terminal_pane_by_session_uuid(&handle.pane_uuid)
+                .is_some()
+        })
         .and_then(|handle| handle.title.clone())
 }
 

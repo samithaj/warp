@@ -123,6 +123,19 @@ impl ProjectLayout {
             if live_session_ids.contains(&(handle.agent, handle.session_id.clone())) {
                 continue;
             }
+            // The pane that ran this session is still open (commonly: the agent
+            // exited but its tab remains, or the tab was restored). That tab
+            // already displays this handle's title via `stored_handle_title`,
+            // so a dormant row would duplicate it. Matching on the persistent
+            // pane uuid keeps this exact across restarts.
+            if tabs.iter().any(|tab| {
+                tab.pane_group
+                    .as_ref(ctx)
+                    .find_terminal_pane_by_session_uuid(&handle.pane_uuid)
+                    .is_some()
+            }) {
+                continue;
+            }
             let project = project_by_cwd
                 .entry(handle.cwd.as_str())
                 .or_insert_with(|| {

@@ -24,6 +24,11 @@ pub struct AgentSessionHandle {
     pub session_id: String,
     /// Canonical working directory; the project bucket derives from this.
     pub cwd: String,
+    /// `terminal_panes.uuid` of the pane that last ran this session. Stable
+    /// across restarts, so it is how a restored tab is matched back to the
+    /// session it ran — both to name the tab and to suppress a duplicate
+    /// dormant row for it.
+    pub pane_uuid: Vec<u8>,
     /// Cached display label (naming-cascade tier 0). `None` until the
     /// transcript resolver has produced one.
     pub title: Option<String>,
@@ -62,6 +67,7 @@ impl AgentSessionHandlesModel {
                     agent,
                     session_id,
                     cwd: record.cwd.clone(),
+                    pane_uuid: record.pane_uuid.clone(),
                     title: record.title.clone(),
                     last_seen_at: record.last_seen_at,
                 })
@@ -98,7 +104,7 @@ impl AgentSessionHandlesModel {
                 agent,
                 cwd,
                 session_id,
-                pane_uuid: _,
+                pane_uuid,
             } => {
                 let agent = CLIAgent::from_serialized_name(agent);
                 self.handles
@@ -109,6 +115,7 @@ impl AgentSessionHandlesModel {
                         agent,
                         session_id: session_id.clone(),
                         cwd: cwd.clone(),
+                        pane_uuid: pane_uuid.clone(),
                         title: None,
                         last_seen_at: Utc::now().naive_utc(),
                     },

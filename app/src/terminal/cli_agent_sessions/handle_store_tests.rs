@@ -89,3 +89,20 @@ fn hydration_skips_unidentified_and_unknown_agent_rows() {
     assert_eq!(model.handles().len(), 1);
     assert_eq!(model.handles()[0].session_id, "aaaa");
 }
+
+#[test]
+fn identify_records_the_pane_uuid_for_restore_matching() {
+    let mut model = AgentSessionHandlesModel::default();
+    model.apply_op(&AgentSessionHandleOp::Identify {
+        agent: "Claude".to_owned(),
+        pane_uuid: b"pane-xyz".to_vec(),
+        cwd: "/dev/one".to_owned(),
+        session_id: "aaaa".to_owned(),
+    });
+    // The pane uuid is what a restored tab is matched on, so it must survive
+    // into the mirror rather than being dropped with the op.
+    assert_eq!(
+        model.get(CLIAgent::Claude, "aaaa").unwrap().pane_uuid,
+        b"pane-xyz".to_vec()
+    );
+}
