@@ -172,7 +172,39 @@ counts are descendants of the app's `terminal-server`, not global `pgrep zsh` �
 
 **The shell count discriminates three ways, so don't read "low number = success":** ~49 means
 deferral did not take; **0 means the initially-active tab never started** — a dead front tab, §6a
-broken; 1 is correct.
+broken; 1 is correct. And 0 with **zero `Creating terminal model with N restored blocks` lines** in
+the log means neither: that log fires *before* the deferral branch, so its absence means restoration
+never ran at all. Check it before concluding anything about deferral.
+
+### 8a. The e2e run is blocked on macOS security prompts, not on this change
+
+`script/install-warposs-dev` re-signs the bundle, and `security find-identity -p codesigning`
+reports **0 valid identities** on this machine, so it falls back to `--sign -` (ad-hoc). An ad-hoc
+signature is content-derived: every reinstall is a brand-new identity to macOS, so neither the TCC
+grant nor the Keychain ACL carries over. Two synchronous blocking calls during startup then wait on
+a human:
+
+| Where | Stack | Prompt |
+|---|---|---|
+| `warp::run_internal` → `warp_assets::Assets::get` → `rust_embed_utils::read_file_from_fs` → `open()` | blocked in `libsystem_kernel` | Documents-folder access. Debug builds read assets from `app/assets` — under `~/Documents`, which is TCC-protected — instead of embedding them |
+| `initialize_app` → `TemplatableMCPServerManager::new` → `mcp::oauth::load_credentials_from_secure_storage` → `SecKeychainFindGenericPassword` → `mach_msg` | blocked in `libsystem_kernel` | Keychain authorization for the stored MCP OAuth credentials |
+
+Symptom is identical in both cases and easy to misread as a deadlock in app code: **no window, 0%
+CPU, ~36 MB RSS, and the log stopping mid-startup.** `sample <pid>` is what distinguishes them —
+both leaves are kernel syscalls inside Security/`open`, not a `FairMutex`.
+
+Neither is reachable from this change: the app never gets as far as session restoration. The fix is
+a click (Allow), or a stable signing identity so the grants persist — see the ad-hoc warning now
+printed by `script/install-warposs-dev`.
+
+Launching the binary from a shell instead of via `open` clears the *first* prompt (TCC attribution
+is inherited from the parent) but not the second — the Keychain ACL is keyed on the code identity
+itself. Also note the data profile follows the **bundle id**, so
+`target/debug/.../WarpOss.app` and `/Applications/WarpOssDev.app` read different profiles; only the
+latter holds the 49 restored tabs.
+
+**Status: the table above is specified but not yet observed.** Do not record this feature as
+verified end-to-end until it has been.
 
 There is **no `FIRST_FRAME_DRAWN` instrumentation** in this tree — v2's verification section named a
 marker that does not exist. The shell count is the better metric anyway: it measures the *cause* of
