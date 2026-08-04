@@ -238,10 +238,30 @@ fn tab_info_text(pane_group: &PaneGroup, kind: TabInfoKind, app: &AppContext) ->
                 .or(agent_text.conversation_latest_user_prompt)
         }
         TabInfoKind::Command => terminal_view.last_completed_command_text(),
-        TabInfoKind::WorkingDirectory => terminal_view.display_working_directory(app),
+        TabInfoKind::WorkingDirectory => terminal_view
+            .display_working_directory(app)
+            .or_else(|| restored_working_directory(pane_group, app)),
         TabInfoKind::Branch => terminal_view.current_git_branch(app),
     };
     text.filter(|text| !text.trim().is_empty())
+}
+
+/// The directory a pane was restored into, formatted the way a live one is.
+///
+/// `display_working_directory` reads a prompt chip or `pwd()`, and both only
+/// exist once the shell has started and reported in. A tab whose shell is
+/// deferred until it is opened therefore has no live answer at all, and without
+/// this it would fall all the way back to the shell name — ~50 tabs reading
+/// "zsh" instead of their folders. The directory is known from restoration, so
+/// use it. This mirrors `PaneGroup::session_path`, which does the same for
+/// project attribution.
+fn restored_working_directory(pane_group: &PaneGroup, app: &AppContext) -> Option<String> {
+    let path = pane_group.active_session_path(app)?;
+    let home_dir = dirs::home_dir().map(|home| home.to_string_lossy().into_owned());
+    Some(
+        warp_util::path::user_friendly_path(&path.to_string_lossy(), home_dir.as_deref())
+            .to_string(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

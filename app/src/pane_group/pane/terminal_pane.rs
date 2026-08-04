@@ -244,6 +244,16 @@ impl TerminalPane {
         self.view.as_ref(ctx).child_data(ctx).clone()
     }
 
+    /// Starts this pane's shell if it was created with startup deferred.
+    ///
+    /// Safe and cheap to call on any path that needs a live session — the
+    /// manager drops the request once the shell is on its way, so callers do
+    /// not have to know whether this pane was deferred.
+    pub(in crate::pane_group) fn ensure_shell_started(&self, ctx: &mut ViewContext<PaneGroup>) {
+        self.terminal_manager(ctx)
+            .update(ctx, |manager, ctx| manager.ensure_shell_started(ctx));
+    }
+
     /// Instructs the SQLite thread to delete blocks for this session.
     pub(in crate::pane_group) fn delete_blocks(&self, ctx: &AppContext) {
         if !AppExecutionMode::as_ref(ctx).can_save_session() {
@@ -618,6 +628,10 @@ impl PaneContent for TerminalPane {
     }
 
     fn focus(&self, ctx: &mut ViewContext<PaneGroup>) {
+        // Opening a tab is what a restored pane has been waiting for: this is
+        // where a deferred shell actually starts. No-op for panes that were
+        // never deferred, and for ones already started.
+        self.ensure_shell_started(ctx);
         self.terminal_view(ctx)
             .update(ctx, |view, ctx| view.redetermine_global_focus(ctx));
     }
