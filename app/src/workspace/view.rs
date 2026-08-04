@@ -755,6 +755,15 @@ enum TabConfigsMenuOpenSource {
     Pointer,
 }
 
+/// Why a tab is being activated. Restore-time activation is mechanical --
+/// every tab passes through it while the window is rebuilt -- so it must
+/// not carry user-activation side effects like starting a deferred shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TabActivationSource {
+    User,
+    Restore,
+}
+
 /// This enumerates the different kinds of banners we show to the user.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceBanner {
@@ -4095,7 +4104,12 @@ impl Workspace {
                     self.left_panel_open = restored_left_panel_open;
                 }
 
-                self.activate_tab_internal(active_tab_index, ctx);
+                // Of all the activations a restore performs, this is the one
+                // that means "this tab is what the user will see", so it keeps
+                // user semantics and starts the tab's deferred shell. The
+                // per-tab activations inside `add_tab_with_pane_layout` above
+                // are the mechanical ones and stay deferred.
+                self.activate_tab_internal_from(active_tab_index, TabActivationSource::User, ctx);
                 self.check_and_trigger_onboarding(ctx);
             }
             NewWorkspaceSource::FromTemplate { window_template } => {
@@ -5405,7 +5419,26 @@ impl Workspace {
 
     /// This function is meant to be used by other actions to perform the logic to update the
     /// view's state. It's not meant to be invoked directly by an action.
+    ///
+    /// Activations reached this way are attributed to the user; see
+    /// [`Self::activate_tab_internal_from`] for the restore-time variant.
     pub fn activate_tab_internal(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
+        self.activate_tab_internal_from(index, TabActivationSource::User, ctx);
+    }
+
+    /// [`Self::activate_tab_internal`] with explicit provenance.
+    ///
+    /// Everything here -- the active tab index, the MRU order, the window
+    /// title, closing the palette and the agent management view -- runs for
+    /// both sources, because window restore genuinely depends on each tab
+    /// passing through activation. Only the side effects that mean "the user
+    /// chose this tab" are conditioned on `source`.
+    pub(crate) fn activate_tab_internal_from(
+        &mut self,
+        index: usize,
+        source: TabActivationSource,
+        ctx: &mut ViewContext<Self>,
+    ) {
         if index < self.tab_count() {
             // If the command palette is open when the tab is switched using a keybinding,
             // we want to close the palette so that we don't get into a state where the palette
@@ -5420,7 +5453,7 @@ impl Workspace {
             }
 
             self.set_active_tab_index(index, ctx);
-            self.focus_active_tab(ctx);
+            self.focus_active_tab_from(source, ctx);
             self.update_window_title(ctx);
         }
     }
@@ -13012,7 +13045,22 @@ impl Workspace {
         self.tabs.insert(insert_idx, TabData::new(new_pane_group));
         self.tab_mru_order
             .push(self.tabs[insert_idx].pane_group.id());
-        self.activate_tab_internal(insert_idx, ctx);
+        // Window restore adds every saved tab through here, so each one is
+        // genuinely activated in turn; those activations are mechanical, not a
+        // user picking a tab, and must not start deferred shells.
+        //
+        // `is_restoration` stands in for "this is window restore": every other
+        // caller passing a `PanesLayout::Snapshot` builds a synthetic
+        // non-terminal leaf (settings, get-started, cloud notebook, cloud
+        // workflow, local file notebook), which owns no shell at all, so
+        // classifying those as `Restore` is behavior-neutral rather than merely
+        // harmless.
+        let activation_source = if is_restoration {
+            TabActivationSource::Restore
+        } else {
+            TabActivationSource::User
+        };
+        self.activate_tab_internal_from(insert_idx, activation_source, ctx);
 
         // Inherit the active tab's group membership (skipped for top-level tabs).
         if let Some(group_id) = inherited_group_id {
@@ -19725,14 +19773,37 @@ impl Workspace {
             || self.changelog_model.as_ref(ctx).is_check_pending()
     }
 
+    /// Focuses the active tab on behalf of the user; see
+    /// [`Self::focus_active_tab_from`] for the restore-time variant.
     pub(crate) fn focus_active_tab(&mut self, ctx: &mut ViewContext<Self>) {
+        self.focus_active_tab_from(TabActivationSource::User, ctx);
+    }
+
+    /// [`Self::focus_active_tab`] with explicit provenance.
+    ///
+    /// The focus itself is unconditional -- restore relies on it to leave each
+    /// rebuilt tab in a consistent focus state. Only the deferred-shell start
+    /// is gated.
+    pub(crate) fn focus_active_tab_from(
+        &mut self,
+        source: TabActivationSource,
+        ctx: &mut ViewContext<Self>,
+    ) {
         self.active_tab_pane_group().update(ctx, |tab, ctx| {
             tab.focus(ctx);
             // Activating a tab is the moment a restored tab's deferred shell
             // starts. Deliberately here rather than inside `PaneGroup::focus`,
             // which pane-group construction also calls -- see the note on
             // `TerminalPane::focus`.
-            tab.ensure_focused_session_started(ctx);
+            //
+            // Restore-time activations are excluded: rebuilding a window walks
+            // every saved tab through activation, so starting a shell here
+            // would start all of them (measured: 46 of 48 restored tabs
+            // spawned a shell where only the visible one should have).
+            match source {
+                TabActivationSource::User => tab.ensure_focused_session_started(ctx),
+                TabActivationSource::Restore => {}
+            }
         })
     }
 
