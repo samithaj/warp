@@ -19834,6 +19834,11 @@ impl Workspace {
     pub(crate) fn focus_active_tab(&mut self, ctx: &mut ViewContext<Self>) {
         self.active_tab_pane_group().update(ctx, |tab, ctx| {
             tab.focus(ctx);
+            // Activating a tab is the moment a restored tab's deferred shell
+            // starts. Deliberately here rather than inside `PaneGroup::focus`,
+            // which pane-group construction also calls -- see the note on
+            // `TerminalPane::focus`.
+            tab.ensure_focused_session_started(ctx);
         })
     }
 
