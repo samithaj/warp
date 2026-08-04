@@ -135,29 +135,33 @@ pub(crate) fn rail_task_label(pane_group: &PaneGroup, app: &AppContext) -> Strin
         .unwrap_or_else(|| tab_title(pane_group, app))
 }
 
-/// The cached conversation title from the durable session-handle store, for a
-/// tab whose agent has already exited.
+/// The cached conversation title from the durable session-handle store.
 ///
-/// Once an agent exits, `CLIAgentSessionsModel` drops its live session, so
-/// [`agent_session_title`] goes `None` and the row would fall back to the
-/// truncated cwd — the original "six rows all reading `..repos/poa-agent`"
-/// problem. The handle outlives the session, so the name does too.
-///
-/// Matched on the pane's persistent uuid rather than its directory: the uuid
-/// survives a restart (it is what `terminal_panes.uuid` stores), so a restored
-/// tab is still recognised as the one that ran the session — and two sessions
-/// in the same directory can't borrow each other's name. `ProjectLayout` uses
-/// the same match to suppress the duplicate dormant row for this tab.
+/// This is the only name a CLI-agent task has in the rail. It covers both
+/// states: while the agent runs (Warp has no live channel for a CLI agent's
+/// conversation name) and after it exits (`CLIAgentSessionsModel` drops the
+/// session, so [`agent_session_title`] goes `None`). Without it the row falls
+/// back to the truncated cwd — the original "six rows all reading
+/// `..repos/poa-agent`" problem. The handle outlives the session, so the name
+/// does too, including a Claude Code `/rename`, which lands in the transcript
+/// the resolver reads.
 pub(crate) fn stored_handle_title(pane_group: &PaneGroup, app: &AppContext) -> Option<String> {
-    stored_handle_for_tab(pane_group, app).and_then(|(_, _, title)| title)
+    // Deliberately NOT gated on the agent having exited. Warp has no live
+    // channel carrying a CLI agent's conversation name — `cli_agent_title`
+    // resolves to `session_context.summary`, which is a permission blurb, not
+    // a name — so a *running* session has no name to show either, and gating
+    // this on "no live agent" sent running sessions back to the truncated cwd.
+    // The stored title is the only name either state has.
+    stored_handle_lookup(pane_group, app).and_then(|handle| handle.2)
 }
 
 /// The stored session handle belonging to this tab's pane, as
-/// `(agent, session_id, cached title)`.
+/// `(agent, session_id, cached title)`, **only when the tab has no running
+/// agent** — a live session must never be offered as resumable.
 ///
-/// Returns `Some` only when the tab has **no running agent**: a tab whose
-/// agent is still live is shown (and named) from the live session instead, and
-/// must not offer to resume a session that is already running.
+/// Naming uses [`stored_handle_lookup`] instead, which has no such guard: see
+/// the note on [`stored_handle_title`] for why a running session still needs
+/// the stored name.
 ///
 /// This is what makes a tab whose agent has exited resumable *in place* — the
 /// pane is already sitting in the right directory, so the rail prefills the
@@ -166,18 +170,6 @@ pub(crate) fn stored_handle_for_tab(
     pane_group: &PaneGroup,
     app: &AppContext,
 ) -> Option<(CLIAgent, String, Option<String>)> {
-    if !FeatureFlag::ResumeProjectTasks.is_enabled() {
-        return None;
-    }
-    // The pane must still be *in* the session's directory. A shell can `cd`
-    // away (and a restored pane reopens at its own startup directory), and an
-    // agent's resume lookup is scoped to the working directory — resuming from
-    // the wrong one fails with "No conversation found with session ID". A pane
-    // that has drifted is just a shell; the session stays dormant and keeps its
-    // own row, filed under the project it actually belongs to.
-    let pane_cwd = pane_group
-        .active_session_path(app)
-        .and_then(|path| path.to_str().map(str::to_owned));
     let has_live_agent = pane_group.focused_session_view(app).is_some_and(|view| {
         CLIAgentSessionsModel::as_ref(app)
             .session(view.id())
@@ -186,7 +178,29 @@ pub(crate) fn stored_handle_for_tab(
     if has_live_agent {
         return None;
     }
-    let pane_cwd = pane_cwd?;
+    stored_handle_lookup(pane_group, app)
+}
+
+/// The stored session handle this tab's pane hosts, regardless of whether an
+/// agent is currently running in it.
+///
+/// Matched on the pane's persistent uuid **and** its current directory. The
+/// uuid survives a restart (it is what `terminal_panes.uuid` stores), so a
+/// restored tab is still recognised as the one that ran the session; the
+/// directory check stops a pane that has since `cd`-ed away — or restored to a
+/// different startup directory — from claiming a session it no longer hosts,
+/// which would file the task under the wrong project and resume in the wrong
+/// place.
+fn stored_handle_lookup(
+    pane_group: &PaneGroup,
+    app: &AppContext,
+) -> Option<(CLIAgent, String, Option<String>)> {
+    if !FeatureFlag::ResumeProjectTasks.is_enabled() {
+        return None;
+    }
+    let pane_cwd = pane_group
+        .active_session_path(app)
+        .and_then(|path| path.to_str().map(str::to_owned))?;
     AgentSessionHandlesModel::as_ref(app)
         .find_by_pane_and_cwd(&pane_cwd, |pane_uuid| {
             pane_group
