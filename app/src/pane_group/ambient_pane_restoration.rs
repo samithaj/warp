@@ -112,6 +112,7 @@ impl PaneGroup {
                         Uuid::new_v4().as_bytes().to_vec(),
                         // Ambient panes have no shell of their own to seed from.
                         None,
+                        None,
                         terminal_manager,
                         view,
                         self.model_event_sender.clone(),
@@ -159,6 +160,7 @@ impl PaneGroup {
             Self::create_ambient_agent_terminal(resources, view_size, ctx);
         let new_pane = TerminalPane::new(
             Uuid::new_v4().as_bytes().to_vec(),
+            None,
             None,
             terminal_manager,
             view,

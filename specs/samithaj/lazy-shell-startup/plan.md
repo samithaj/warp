@@ -78,10 +78,22 @@ A deferred pane has no live view to ask. Saving one would therefore write a **de
 and a restore → quit → restore cycle would silently lose shell choice, cwd, input config, profile,
 or conversation metadata — permanently, since each cycle re-saves the loss.
 
-**Required contract:** a deferred pane re-snapshots **losslessly**. The simplest sound approach is to
-retain the original `TerminalPaneSnapshot` it was restored from and return it verbatim while
-untouched, switching to the live path the moment it starts. This must be settled *before* any flag
-flip, and is the one item most likely to cause silent data loss if deferred.
+**Required contract:** a deferred pane re-snapshots **losslessly**.
+
+**Status: implemented for the fields that can already be lost today.** `TerminalPane` now retains
+the `TerminalPaneSnapshot` it was restored from, and `snapshot()` falls back per field through
+`preserved_on_save` for `cwd` and `shell_launch_data` — the two whose live answers only exist once
+the shell has reported.
+
+This was not hypothetical: with many tabs restoring, quitting during the startup window already
+persisted `None` for both, so the pane reopened in the default directory with the default shell and
+saved that loss as the new truth. Fixed independently of deferral, and it is the same machinery
+deferral needs.
+
+Remaining for deferral: the other snapshot fields (`is_read_only`, `input_config`,
+`llm_model_override`, `active_profile_id`, conversation ids) come from models that exist without a
+shell, so they are safe today — but a pane with **no view at all** would need the same treatment.
+Decide when the deferred representation exists (§4).
 
 ## 7. What was wrong in v1
 

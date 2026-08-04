@@ -93,6 +93,18 @@ pub struct TerminalPane {
     /// in, kept so the rail can bucket the pane correctly on the first frame.
     startup_directory: Option<PathBuf>,
 
+    /// The snapshot this pane was restored from, if it was restored.
+    ///
+    /// `snapshot()` reads everything from the live [`TerminalView`], but some
+    /// of those answers only exist once the shell has started and reported in.
+    /// Saving during that window — a quit shortly after launch, which with
+    /// many tabs is seconds long — would persist `None` for `cwd` and
+    /// `shell_launch_data` and permanently lose them: the next restore opens
+    /// in the default directory with the default shell, and re-saves that
+    /// loss. Keeping what we were restored with lets `snapshot()` fall back
+    /// per field rather than writing a hole.
+    restored_snapshot: Option<Box<TerminalPaneSnapshot>>,
+
     pane_configuration: ModelHandle<PaneConfiguration>,
 
     /// Defining `terminal_manager` before `view` means that `terminal_manager`
@@ -147,10 +159,24 @@ pub(in crate::pane_group) fn inherit_share_for_local_child(
     IsSharedSessionCreator::Yes { source }
 }
 
+/// Chooses what to persist for a snapshot field that the live [`TerminalView`]
+/// can only answer once its shell has started.
+///
+/// The live answer always wins when there is one. Otherwise we re-persist what
+/// the pane was restored with, because writing `None` here is not "unknown" —
+/// it is destructive. `cwd` and `shell_launch_data` are what the *next* restore
+/// uses to place the pane, so a hole means the pane silently reopens in the
+/// default directory with the default shell, and that loss is then saved as the
+/// new truth on the following quit.
+fn preserved_on_save<T>(live: Option<T>, restored: Option<T>) -> Option<T> {
+    live.or(restored)
+}
+
 impl TerminalPane {
     pub(in crate::pane_group) fn new(
         uuid: Vec<u8>,
         startup_directory: Option<PathBuf>,
+        restored_snapshot: Option<Box<TerminalPaneSnapshot>>,
         terminal_manager: ModelHandle<Box<dyn TerminalManager>>,
         terminal_view: ViewHandle<TerminalView>,
         model_event_sender: Option<SyncSender<ModelEvent>>,
@@ -182,6 +208,7 @@ impl TerminalPane {
             model_event_sender,
             uuid,
             startup_directory,
+            restored_snapshot,
             pane_configuration,
             view,
         }
@@ -560,12 +587,23 @@ impl PaneContent for TerminalPane {
                         .active_conversation_id()
                 });
 
+            // Fall back to what we were restored with for the two fields that
+            // only become answerable once the shell has started. Losing either
+            // is permanent: the next restore would open in the wrong directory
+            // with the wrong shell, then save that as the new truth.
+            let restored = self.restored_snapshot.as_deref();
             LeafContents::Terminal(TerminalPaneSnapshot {
                 uuid: self.uuid.clone(),
-                cwd: view.pwd_if_local(app),
+                cwd: preserved_on_save(
+                    view.pwd_if_local(app),
+                    restored.and_then(|snapshot| snapshot.cwd.clone()),
+                ),
                 is_active,
                 is_read_only: view.model.lock().is_read_only(),
-                shell_launch_data: view.shell_launch_data_if_local(app),
+                shell_launch_data: preserved_on_save(
+                    view.shell_launch_data_if_local(app),
+                    restored.and_then(|snapshot| snapshot.shell_launch_data.clone()),
+                ),
                 input_config: Some(current_input_config),
                 llm_model_override,
                 active_profile_id,

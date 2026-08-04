@@ -1419,6 +1419,7 @@ impl PaneGroup {
                 let pane_data = TerminalPane::new(
                     uuid.as_bytes().to_vec(),
                     Some(cwd.clone()).filter(|path| path.exists()),
+                    None,
                     terminal_manager,
                     view,
                     model_event_sender,
@@ -1612,6 +1613,9 @@ impl PaneGroup {
                 Ok((PaneData::new(pane_id), focus))
             }
             LeafContents::Terminal(terminal_snapshot) => {
+                // Kept so `snapshot()` can fall back per field while the shell
+                // has yet to report its cwd and launch data.
+                let restored_snapshot = Some(Box::new(terminal_snapshot.clone()));
                 let uuid = PaneUuid(terminal_snapshot.uuid.clone());
                 let block_list = block_lists.get(&uuid);
 
@@ -1691,6 +1695,7 @@ impl PaneGroup {
                 let pane_data = TerminalPane::new(
                     uuid.0,
                     startup_directory,
+                    restored_snapshot,
                     terminal_manager,
                     terminal_view,
                     model_event_sender,
@@ -1932,6 +1937,7 @@ impl PaneGroup {
 
                 let pane_data = TerminalPane::new(
                     snapshot.uuid,
+                    None,
                     None,
                     terminal_manager,
                     terminal_view,
@@ -3223,6 +3229,7 @@ impl PaneGroup {
         let pane_data = TerminalPane::new(
             uuid,
             startup_directory,
+            None,
             terminal_manager,
             view,
             model_event_sender,
@@ -3371,6 +3378,7 @@ impl PaneGroup {
         let pane_data = TerminalPane::new(
             uuid.as_bytes().to_vec(),
             startup_directory,
+            None,
             terminal_manager,
             view,
             model_event_sender,
@@ -4144,6 +4152,7 @@ impl PaneGroup {
         });
         let pane_data = TerminalPane::new(
             uuid.as_bytes().to_vec(),
+            None,
             None,
             terminal_manager,
             view,
@@ -5351,6 +5360,7 @@ impl PaneGroup {
         let pane_data = TerminalPane::new(
             Uuid::new_v4().as_bytes().to_vec(),
             None,
+            None,
             terminal_manager,
             terminal_view,
             self.model_event_sender.clone(),
@@ -6344,6 +6354,7 @@ impl PaneGroup {
         let pane_data = TerminalPane::new(
             uuid.as_bytes().to_vec(),
             None,
+            None,
             terminal_manager,
             terminal_view,
             self.model_event_sender.clone(),
@@ -6427,6 +6438,7 @@ impl PaneGroup {
 
         let pane_data = TerminalPane::new(
             uuid.as_bytes().to_vec(),
+            None,
             None,
             terminal_manager,
             view,
@@ -6547,6 +6559,7 @@ impl PaneGroup {
 
         let pane_data = TerminalPane::new(
             uuid.as_bytes().to_vec(),
+            None,
             None,
             terminal_manager,
             view.clone(),
@@ -7926,6 +7939,7 @@ impl PaneGroup {
 
         TerminalPane::new(
             uuid.into_bytes().to_vec(),
+            None,
             None,
             terminal_manager,
             terminal_view,
