@@ -156,9 +156,11 @@ reached from a unit test without spawning a real PTY on the eager side. The only
 assertions moved to the e2e run below, where they are directly observable. `preserved_on_save`
 (§4) *is* unit-tested, and its first case is the one every deferred pane takes on every save.
 
-**End to end**, in `WarpOss Dev` (its own `~/.warp-oss-dev/` profile, ~49 restored tabs). Shell
-counts are descendants of the app's `terminal-server`, not global `pgrep zsh` — the machine has
-~110 zsh processes belonging to other apps.
+**End to end**, in `WarpOss Dev` (its own profile, 49 restored tabs). Run
+`./script/count-session-shells [bundle]`, which walks the process tree down from *that bundle's*
+`terminal-server` — global `pgrep zsh` is useless here, since the machine runs ~110 zsh processes
+belonging to other apps and two Warp builds are usually up at once. Take the reading 30s+ after the
+window paints; the tree is still being built before that.
 
 | Check | Expected |
 |---|---|
