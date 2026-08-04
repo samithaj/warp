@@ -149,18 +149,47 @@ pub(crate) fn rail_task_label(pane_group: &PaneGroup, app: &AppContext) -> Strin
 /// in the same directory can't borrow each other's name. `ProjectLayout` uses
 /// the same match to suppress the duplicate dormant row for this tab.
 pub(crate) fn stored_handle_title(pane_group: &PaneGroup, app: &AppContext) -> Option<String> {
+    stored_handle_for_tab(pane_group, app).and_then(|(_, _, title)| title)
+}
+
+/// The stored session handle belonging to this tab's pane, as
+/// `(agent, session_id, cached title)`.
+///
+/// Returns `Some` only when the tab has **no running agent**: a tab whose
+/// agent is still live is shown (and named) from the live session instead, and
+/// must not offer to resume a session that is already running.
+///
+/// This is what makes a tab whose agent has exited resumable *in place* — the
+/// pane is already sitting in the right directory, so the rail prefills the
+/// resume command there rather than opening a second tab for the same work.
+pub(crate) fn stored_handle_for_tab(
+    pane_group: &PaneGroup,
+    app: &AppContext,
+) -> Option<(CLIAgent, String, Option<String>)> {
     if !FeatureFlag::ResumeProjectTasks.is_enabled() {
         return None;
     }
+    let has_live_agent = pane_group.focused_session_view(app).is_some_and(|view| {
+        CLIAgentSessionsModel::as_ref(app)
+            .session(view.id())
+            .is_some()
+    });
+    if has_live_agent {
+        return None;
+    }
     AgentSessionHandlesModel::as_ref(app)
-        .handles()
-        .iter()
-        .find(|handle| {
+        .find_by_pane(|pane_uuid| {
             pane_group
-                .find_terminal_pane_by_session_uuid(&handle.pane_uuid)
+                .find_terminal_pane_by_session_uuid(pane_uuid)
                 .is_some()
         })
-        .and_then(|handle| handle.title.clone())
+        .map(|handle| {
+            (
+                handle.agent,
+                handle.session_id.clone(),
+                handle.title.clone(),
+            )
+        })
 }
 
 /// Resolves one kind of tab text for the tab's focused session. Returns `None`

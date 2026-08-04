@@ -5560,6 +5560,35 @@ impl Workspace {
         else {
             return;
         };
+        // Resume in place when the pane that ran this session is still open
+        // (its agent exited, or the tab was restored): it already sits in the
+        // right directory, so a second tab for the same work would be noise.
+        let owning_pane = AgentSessionHandlesModel::as_ref(ctx)
+            .get(agent, &session_id)
+            .and_then(|handle| {
+                let pane_uuid = handle.pane_uuid.clone();
+                self.tabs.iter().position(|tab| {
+                    tab.pane_group
+                        .as_ref(ctx)
+                        .find_terminal_pane_by_session_uuid(&pane_uuid)
+                        .is_some()
+                })
+            });
+        if let Some(tab_index) = owning_pane {
+            self.activate_tab_internal(tab_index, ctx);
+            match self
+                .active_tab_pane_group()
+                .as_ref(ctx)
+                .active_session_view(ctx)
+            {
+                Some(terminal_view) => terminal_view.update(ctx, |terminal, ctx| {
+                    terminal.set_pending_command(&command, ctx);
+                }),
+                None => log::warn!("No terminal view to prefill when resuming in place"),
+            }
+            return;
+        }
+
         // The cwd is load-bearing: the agent's own resume lookup is scoped to
         // the directory the session ran in. If it is gone (deleted worktree),
         // surface that instead of resuming somewhere wrong.
@@ -23071,6 +23100,11 @@ impl Workspace {
                     .or_default()
                     .clone();
                 let task_label = crate::workspace::tab_title::rail_task_label(pane_group, ctx);
+                // A tab whose agent has exited but whose session is stored is
+                // resumable in place; clicking it prefills the resume command
+                // rather than merely focusing a dead shell.
+                let resumable = crate::workspace::tab_title::stored_handle_for_tab(pane_group, ctx)
+                    .map(|(agent, session_id, _)| (agent, session_id));
                 let task_icon = pane_group
                     .focused_session_view(ctx)
                     .and_then(|view| terminal_view_agent_icon_variant(view.as_ref(ctx), ctx))
@@ -23124,10 +23158,18 @@ impl Workspace {
                     container.finish()
                 })
                 .with_cursor(Cursor::PointingHand)
-                .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(WorkspaceAction::ActivateTaskByPaneGroupId(
+                .on_click(move |ctx, _, _| match &resumable {
+                    // The tab's agent has exited but its session is stored:
+                    // clicking resumes it right here, in the pane that ran it.
+                    Some((agent, session_id)) => {
+                        ctx.dispatch_typed_action(WorkspaceAction::ResumeDormantAgentTask {
+                            agent: *agent,
+                            session_id: session_id.clone(),
+                        })
+                    }
+                    None => ctx.dispatch_typed_action(WorkspaceAction::ActivateTaskByPaneGroupId(
                         pane_group_id,
-                    ));
+                    )),
                 })
                 .finish();
                 column.add_child(task_row);

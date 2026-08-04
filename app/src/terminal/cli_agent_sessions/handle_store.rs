@@ -87,6 +87,18 @@ impl AgentSessionHandlesModel {
             .find(|handle| handle.agent == agent && handle.session_id == session_id)
     }
 
+    /// The most recently seen handle whose pane satisfies `pane_matches` —
+    /// used to tie an open (or restored) tab back to the session it ran, so
+    /// the tab can show that session's name and resume it in place.
+    pub fn find_by_pane(
+        &self,
+        mut pane_matches: impl FnMut(&[u8]) -> bool,
+    ) -> Option<&AgentSessionHandle> {
+        self.handles
+            .iter()
+            .find(|handle| pane_matches(&handle.pane_uuid))
+    }
+
     /// Applies the same op that was enqueued for the sqlite writer, so the
     /// mirror and the table cannot drift within a run.
     pub fn apply(&mut self, op: &AgentSessionHandleOp, ctx: &mut ModelContext<Self>) {
