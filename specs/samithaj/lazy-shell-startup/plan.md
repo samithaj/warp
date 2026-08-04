@@ -1,6 +1,7 @@
 # Plan: don't start a restored tab's shell until it is opened
 
-**Status:** spec — not started. Written after observing the problem in a real build.
+**Status:** v2 — discovery + contracts. **Not ready to implement**; see §8 for what still has to be
+decided first. v1 was rejected in review and its central architectural premise was wrong (§7).
 **Related:** [`../resume-project-task/plan.md`](../resume-project-task/plan.md) (the project rail
 that made this visible), [#9416](https://github.com/warpdotdev/warp/issues/9416) (session/PTY
 ownership, adjacent).
@@ -9,115 +10,145 @@ ownership, adjacent).
 
 ## 1. The problem, observed
 
-Restoring a window with ~50 tabs spawns ~50 shells at once. Symptoms, all from one cause:
+Restoring a window with ~50 tabs spawns ~50 shells at once. Symptoms, all one cause:
 
 - Startup is visibly laggy; panes show *"Seems like your shell is taking a while to start…"*.
-- The project rail churns: every tab appears under **Other**, then re-sorts into its real project
-  over several seconds as each shell reports a directory. It reads as the rail grouping things late.
-- Work is wasted: most restored tabs are never touched in a session, yet each pays a full shell
-  startup — for a user with a heavy `zsh`/`starship`/`pyenv` profile that is seconds of CPU each.
+- Work is wasted: most restored tabs are never touched, yet each pays a full shell startup — with a
+  heavy `zsh`/`starship`/`pyenv` profile that is seconds of CPU each.
 
-The rail-churn half is **already fixed** (`4354e20ca`): a pane now retains the startup directory it
-was restored with, so `PaneGroup::session_path` can answer before the shell does. That fix is also a
-**prerequisite for this one** — with lazy startup a tab has no live shell at all, so without the
-persisted directory every untouched tab would sit in `Other` permanently.
-
-What remains is the actual cost: spawning PTYs nobody asked for.
+A second symptom — the project rail filing every tab under **Other** and then re-sorting as shells
+reported in — is **already fixed** (`4354e20ca`): a pane retains the directory it was restored with,
+so `PaneGroup::session_path` can answer before the shell does. That fix is also a **prerequisite**
+here: with deferral a tab has no live shell at all, so without the persisted directory every
+untouched tab would sit in `Other` permanently.
 
 ## 2. Goal
 
 A restored tab does not spawn its shell until the user opens it. The rail, the tab bar, and session
-restoration behave exactly as they do now.
+restoration behave exactly as they do now — including across a second save/restore cycle.
 
 ## 3. Non-goals
 
-- Keeping shells *alive* across relaunch ([#9416](https://github.com/warpdotdev/warp/issues/9416)) —
-  the opposite problem, and a much larger one.
-- Changing behaviour for newly-created tabs; a tab the user just opened should start immediately.
-- Lazy-loading block history. Restored blocks already render without a live shell; only the PTY is
-  deferred.
+- Keeping shells *alive* across relaunch ([#9416](https://github.com/warpdotdev/warp/issues/9416)).
+- Changing behaviour for newly-created tabs.
+- Lazy-loading block history. Restored blocks already render from persistence; only the PTY defers.
 
 ---
 
-## 4. What makes this non-trivial
+## 4. Where the manager actually lives (corrected)
 
-`PaneGroup::create_session` builds the `TerminalView` **and** the `TerminalManager` together
-(`app/src/pane_group/mod.rs:5956`), and the restore path calls it for every leaf
-(`:1671`). `TerminalPane` then holds `terminal_manager` as a non-optional field, with a comment
-noting the declaration order matters for drop ordering:
+`TerminalPane` does **not** own the terminal manager. Its fields are `model_event_sender`, `uuid`,
+`startup_directory`, `pane_configuration`, and `view: ViewHandle<TerminalPaneView>`
+(`app/src/pane_group/pane/terminal_pane.rs:79-101`).
 
-```rust
-/// Defining `terminal_manager` before `view` means that `terminal_manager`
-/// gets dropped first (guaranteed by the language), which halts the event
-/// loop and avoids possible deadlocks during session cleanup.
-```
+The manager is **`PaneStack` associated data for the backing pane view**, passed into `PaneView::new`
+(`:150`). The comment inside `TerminalPane` that mentions declaring `terminal_manager` before `view`
+describes that ownership relationship — it is not a field. Any design that "adds a state enum to
+`TerminalPane`" is therefore addressing the wrong object.
 
-So "no shell yet" is not currently representable. The work is introducing that state and auditing
-who assumes it cannot happen.
+**Consequence:** the deferred state has to be expressed in the pane-view/`PaneStack` associated-data
+model, either as an optional manager slot or as a distinct deferred backing view that is swapped for
+a live one on first start — while preserving the real drop relationship (manager torn down before
+the view, so the event loop halts before cleanup).
 
-**Survey first.** Before designing, count the callers that reach a `TerminalManager` from a pane and
-classify each as (a) fine with "not started yet", (b) needs to trigger startup, (c) genuinely
-requires a running shell. That survey determines whether this is a week or a month.
+## 5. There is no "surface without PTY" seam today
 
----
+`create_session` (`app/src/pane_group/mod.rs:5988`) hands restored blocks and restoration state
+straight into `LocalTtyTerminalManager::create_model` (`:6043`), which returns the surface **and**
+the manager together. Remote and mock managers follow the same shape (`:6010`, `:6076`).
 
-## 5. Sketch of an approach
+So constructing a normal-looking restored surface *without* scheduling shell startup does not exist
+as a code path. Introducing that split — and making the later attach idempotent — is the core of the
+work, not a mechanical follow-on. v1's claim that everything after a survey is "mechanical" was
+wrong.
 
-Model the pane's session as a state rather than a value:
+## 6. Snapshotting a pane that never started (blocker)
 
-```
-SessionState::Deferred { startup_directory, shell_launch_data, … }   // restored, not spawned
-SessionState::Live(ModelHandle<Box<dyn TerminalManager>>)
-```
+`TerminalPane::snapshot` (`:471`) derives **every** field from the live view:
 
-- **Deferred → Live** on first activation, plus anything that genuinely needs a shell (running a
-  command, resuming an agent task, splitting the pane).
-- The restored **block list still renders** in the deferred state — that is what makes the tab look
-  normal, and it already comes from persistence rather than the PTY.
-- Keep drop-order safety: the manager stays declared before the view; `Deferred` simply has none.
+| Snapshot field | Source |
+|---|---|
+| `cwd` | `view.pwd_if_local(app)` |
+| `is_read_only` | `view.model.lock().is_read_only()` |
+| `shell_launch_data` | `view.shell_launch_data_if_local(app)` |
+| `input_config` | `view.input_config(...)` |
+| `is_active`, `llm_model_override`, `active_profile_id`, conversation ids | live view / models |
 
-### Where the directory comes from
+A deferred pane has no live view to ask. Saving one would therefore write a **degraded** snapshot,
+and a restore → quit → restore cycle would silently lose shell choice, cwd, input config, profile,
+or conversation metadata — permanently, since each cycle re-saves the loss.
 
-Already solved. `TerminalPane::startup_directory` (`4354e20ca`) holds the restored cwd, and
-`session_path` falls back to it, so project bucketing works with zero shells running.
+**Required contract:** a deferred pane re-snapshots **losslessly**. The simplest sound approach is to
+retain the original `TerminalPaneSnapshot` it was restored from and return it verbatim while
+untouched, switching to the live path the moment it starts. This must be settled *before* any flag
+flip, and is the one item most likely to cause silent data loss if deferred.
 
----
+## 7. What was wrong in v1
 
-## 6. Risks
+Recorded so the error isn't repeated:
+
+1. **False premise.** v1 asserted `TerminalPane` holds a non-optional manager and proposed putting a
+   `SessionState` enum there. It holds no manager (§4). A doc comment was misread as a field.
+2. **"Activation as the only trigger" is not a safe first step.** Restoration builds every tab and
+   then activates the saved one through the workspace path (`app/src/workspace/view.rs:4007`,
+   `:5408`), and other operations address background panes directly — notably synchronized/broadcast
+   input. Deferral cannot ship with triggers unresolved.
+3. **Snapshot losslessness was filed as "open question 5"**, i.e. optional. It is a blocker (§6).
+4. **"Mechanical after the survey"** understated the lifecycle split (§5).
+
+## 8. Contracts that must be decided before implementation
+
+Each needs a written answer, not a TODO:
+
+1. **Exactly-once start of the initially active pane.** Restoration activates the saved active tab;
+   that path must start exactly one shell, and must not double-start if activation fires twice.
+2. **Per-operation behaviour against a deferred pane** — for each of: pane focus, tab activation,
+   text input, synchronized/broadcast input, split, agent resume, "run command in tab", search
+   across tabs. Each either **starts** the pane, **rejects**, or **queues**. Broadcast input is the
+   sharp case: it addresses background panes by design, so either it starts every deferred pane
+   (defeating the feature) or it must skip/queue them, which is a visible behaviour change.
+3. **Input contract.** Queued, start-on-input, or unsupported. Queuing implies buffering before a
+   PTY exists.
+4. **Lossless re-snapshot** (§6).
+5. **Close before start.** Closing an untouched deferred pane must never spawn it, and must still
+   clean up persisted block lists correctly.
+6. **Partial-start failure.** If startup fails midway (shell missing, directory gone), what state is
+   the pane left in, and is it retryable?
+7. **Opt-in or default?** A setting, or automatic above N restored tabs. Default-on is a behaviour
+   change to session restoration.
+8. **Visual state.** What a deferred tab shows before it starts — restored blocks with no prompt,
+   presumably — so it isn't mistaken for a hung shell.
+
+## 9. Acceptance tests (deterministic, required)
+
+- Inactive restored panes spawn **zero** PTYs.
+- The initially active restored pane spawns **exactly one**.
+- First activation is **idempotent** — activating twice starts once.
+- Background/broadcast input follows the contract chosen in §8.2, asserted explicitly.
+- Closing an untouched pane **never** spawns it.
+- **Second save/restore preserves every snapshot field** for a pane that was never started (§6).
+
+## 10. Risks
 
 | Risk | Note |
 |---|---|
-| Wide blast radius | Every `terminal_manager` caller is a potential assumption of liveness. The survey in §4 is the gate on scoping this at all. |
-| Silent behaviour change | A tab that used to have a live shell now may not. Anything reading shell state (env vars, cwd tracking, shell integration) needs an explicit answer. |
-| Agent sessions | A restored tab that had a CLI agent must not appear "running". It does not today either — the agent is gone — but the deferred state must not be confused with it. |
-| Session sharing / cloud panes | These have no local shell already and must keep working unchanged; they pass `None` for the startup directory today. |
-| Drop ordering | The existing comment on `TerminalPane` is a real hazard, not decoration. Preserve it. |
+| Silent snapshot degradation | §6. The worst failure mode: invisible, and compounds each cycle |
+| Broadcast/synchronized input | §8.2. Either defeats the feature or changes behaviour |
+| Drop ordering | Manager must still tear down before the view; the relationship is in `PaneStack`, not `TerminalPane` |
+| Liveness assumptions | Every caller reaching a manager through a pane is a potential assumption; needs enumeration |
+| Cloud/shared-session/ambient panes | Already have no local shell and pass `None` for startup directory; must stay unchanged |
 
----
+## 11. Sequencing
 
-## 7. Open questions
+1. **Enumerate** every caller that reaches a `TerminalManager` through a pane, and classify each as
+   fine-without / must-start / requires-live. Output is a list and a scope decision.
+2. **Answer §8** in writing. Steps 1 and 2 gate everything else.
+3. Introduce the deferred representation in the pane-view/`PaneStack` model with **no behaviour
+   change** (always starts eagerly; the state simply exists).
+4. Add the lossless snapshot path (§6) and its test — before any deferral is enabled.
+5. Flip restoration to deferred behind a feature flag, with the §8.2 triggers implemented.
+6. Measure startup time and CPU with ~50 restored tabs, before and after.
 
-1. **What triggers startup besides activation?** Command palette "run in tab", agent resume,
-   split-pane, search across tabs, `broadcast to all panes` — each needs a decision.
-2. **Does anything enumerate live shells** (session sharing, telemetry, the terminal server) and
-   would a deferred pane break its accounting?
-3. **Is deferral opt-in?** A setting, or on by default above N restored tabs? Defaulting on for
-   everyone is a behaviour change to session restoration.
-4. **What does the tab look like before it starts?** Restored blocks, presumably, with no prompt —
-   needs a design answer so it is not mistaken for a hung shell.
-5. **Interaction with `restore_session`** — does the snapshot need to record that a pane was never
-   started, or is that purely runtime state?
-
----
-
-## 8. Suggested sequencing
-
-1. **Survey** (§4) — enumerate and classify every `terminal_manager` reach-through. Output is a list,
-   and a go/no-go on scope.
-2. Introduce the deferred state with **no behaviour change** (everything starts eagerly, the state
-   simply exists and is always `Live`).
-3. Flip restoration to `Deferred` behind a feature flag, with activation as the only trigger.
-4. Add the remaining triggers found in step 1.
-5. Measure: startup time and CPU with ~50 restored tabs, before and after.
-
-Step 1 is the real decision point. Everything after it is mechanical but broad.
+Steps 1–2 are the real decision point. This spec deliberately does **not** propose a state machine
+until they are done, because v1 shows what happens when the design is drawn before the ownership
+model is confirmed.
