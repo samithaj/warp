@@ -1,8 +1,20 @@
 # Plan v4: resume a coding-agent task from the project rail
 
-**Status:** Phases A + B implemented behind `FeatureFlag::ResumeProjectTasks` (2026-08-04) —
-handles table + write path + `resume_command` + validation + ai-title resolver + startup dump, all
-tested. Phase C (rail UI) awaits mocks sign-off; Phase D not started.
+**Status:** Phases A + B + C implemented behind `FeatureFlag::ResumeProjectTasks` (2026-08-04) and
+**validated end to end in a real build**: an agent session's conversation name survives the agent
+exiting and a full app quit/relaunch, its project is derived from the session's own cwd, and
+clicking the row resumes it. Phase D (Agent Mode project filter) not started; Cursor support and
+the preview-before-resume step (D11) still open.
+
+Three defects only a real build exposed, each now fixed and regression-tested:
+1. `ResumeProjectTasks` sat in `DOGFOOD_FLAGS`, which OSS builds deliberately skip — nothing was
+   ever written. Added to the local opt-in in `app/src/bin/oss.rs` alongside `Projects`.
+2. Matching a tab to its session by directory let two sessions in one repo borrow each other's
+   names, and duplicated a restored tab with its own handle. Now matched on `terminal_panes.uuid`.
+3. Pane uuid **alone** was still wrong: a shell that has `cd`-ed away — or a restored pane reopening
+   at its own startup directory — kept claiming the session, so the task was filed under the wrong
+   project and resume ran in the wrong directory (`No conversation found with session ID`). A tab
+   now hosts a session only when both its pane uuid *and* its current directory match.
 **Supersedes:** plan v3 in full. History: [`REVISION-01`](./REVISION-01.md) (v1→v2),
 [`REVISION-02`](./REVISION-02.md) (v2→v3). Research: [`brainstorm.md`](./brainstorm.md).
 Row design detail: [`DESIGN-rail-rows.md`](./DESIGN-rail-rows.md). Mock: `rail-mock.html`.
