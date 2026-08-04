@@ -4335,6 +4335,22 @@ impl PaneGroup {
             })
     }
 
+    /// The directory a terminal pane in this group was restored into, without
+    /// going through focus state.
+    ///
+    /// `active_session_path` resolves through `active_session_id`, which comes
+    /// from the pane group's focus state — but a background tab restored under
+    /// `FeatureFlag::LazyShellStartup` may never have been focused, so that
+    /// state has nothing useful to resolve and the caller gets `None`. This
+    /// instead looks at the group's terminal pane(s) directly, so it answers
+    /// the same regardless of focus history. A group with multiple terminal
+    /// panes (a split) just takes the first one — good enough for a label.
+    pub(crate) fn restored_terminal_startup_directory(&self) -> Option<PathBuf> {
+        self.panes_of::<TerminalPane>()
+            .find_map(TerminalPane::startup_directory)
+            .cloned()
+    }
+
     fn content_by_pane_index(&self, index: usize) -> Option<&dyn AnyPaneContent> {
         self.content_by_pane_id(self.pane_id_by_index(index)?)
     }
