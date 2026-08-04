@@ -12,6 +12,7 @@ use warpui::{AppContext, SingletonEntity as _};
 
 use crate::pane_group::PaneGroup;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::terminal::cli_agent_sessions::handle_store::AgentSessionHandlesModel;
 use crate::terminal::{CLIAgent, TerminalView};
 use crate::workspace::tab_settings::{
     RailTaskInfo, TabLineCount, TabPrimaryInfo, TabSecondaryInfo, TabSettings,
@@ -129,7 +130,33 @@ impl From<RailTaskInfo> for TabInfoKind {
 /// show (no agent yet, no repo, no command run), so a row is never blank.
 pub(crate) fn rail_task_label(pane_group: &PaneGroup, app: &AppContext) -> String {
     let kind = TabSettings::as_ref(app).rail_task_info;
-    tab_info_text(pane_group, kind.into(), app).unwrap_or_else(|| tab_title(pane_group, app))
+    tab_info_text(pane_group, kind.into(), app)
+        .or_else(|| stored_handle_title(pane_group, app))
+        .unwrap_or_else(|| tab_title(pane_group, app))
+}
+
+/// The cached conversation title from the durable session-handle store, for a
+/// tab whose agent has already exited.
+///
+/// Once an agent exits, `CLIAgentSessionsModel` drops its live session, so
+/// [`agent_session_title`] goes `None` and the row would fall back to the
+/// truncated cwd — the original "six rows all reading `..repos/poa-agent`"
+/// problem. The handle outlives the session, so the name does too: match the
+/// tab's directory against the most recently seen handle for it.
+///
+/// Directory matching (rather than session id) is deliberate: the live session
+/// — and with it the id — is exactly what has gone away by this point.
+fn stored_handle_title(pane_group: &PaneGroup, app: &AppContext) -> Option<String> {
+    if !FeatureFlag::ResumeProjectTasks.is_enabled() {
+        return None;
+    }
+    let cwd = pane_group.active_session_path(app)?;
+    let cwd = cwd.to_str()?;
+    AgentSessionHandlesModel::as_ref(app)
+        .handles()
+        .iter()
+        .find(|handle| handle.cwd == cwd)
+        .and_then(|handle| handle.title.clone())
 }
 
 /// Resolves one kind of tab text for the tab's focused session. Returns `None`
