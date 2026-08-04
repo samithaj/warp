@@ -434,7 +434,7 @@ use crate::terminal::view::{
     SyncInputType, TerminalAction,
 };
 use crate::terminal::warpify::settings::WarpifySettings;
-use crate::terminal::{self, BlockListSettings, SizeInfo, TerminalModel, TerminalView};
+use crate::terminal::{self, BlockListSettings, CLIAgent, SizeInfo, TerminalModel, TerminalView};
 use crate::themes::theme::{AnsiColorIdentifier, RespectSystemTheme, ThemeKind};
 use crate::themes::theme_chooser::{ThemeChooser, ThemeChooserEvent, ThemeChooserMode};
 use crate::themes::theme_creator_modal::{ThemeCreatorModal, ThemeCreatorModalEvent};
@@ -443,7 +443,7 @@ use crate::tips::{TipsEvent, TipsView};
 use crate::ui_components::agent_icon::terminal_view_agent_icon_variant;
 use crate::ui_components::avatar::{Avatar, AvatarContent, StatusElementTypes};
 use crate::ui_components::buttons::{combo_inner_button, icon_button_with_color};
-use crate::ui_components::icon_with_status::render_icon_with_status;
+use crate::ui_components::icon_with_status::{IconWithStatusVariant, render_icon_with_status};
 use crate::ui_components::red_notification_dot::RedNotificationDot;
 use crate::ui_components::window_focus_dimming::WindowFocusDimming;
 use crate::ui_components::{blended_colors, icons};
@@ -1078,6 +1078,9 @@ pub struct Workspace {
     /// Per-task hover/click state for the project rail's task rows, keyed by
     /// pane group so it survives reordering.
     rail_task_mouse_states: RefCell<HashMap<EntityId, MouseStateHandle>>,
+    /// Hover/click state for the rail's dormant task rows, keyed by task
+    /// identity (agent + session id) — a dormant task has no pane group.
+    rail_dormant_mouse_states: RefCell<HashMap<(CLIAgent, String), MouseStateHandle>>,
     /// Scroll position of the project rail. Held here rather than rebuilt each
     /// render so the scroll offset survives repaints.
     project_rail_scroll_state: ClippedScrollStateHandle,
@@ -3445,6 +3448,7 @@ impl Workspace {
             horizontal_tab_group_mouse_states: RefCell::default(),
             project_rail_mouse_states: RefCell::default(),
             rail_task_mouse_states: RefCell::default(),
+            rail_dormant_mouse_states: RefCell::default(),
             project_rail_scroll_state: ClippedScrollStateHandle::new(),
             project_rail_resizable_state: resizable_state_handle(RAIL_DEFAULT_WIDTH),
             tab_rename_editor: Self::tab_rename_editor(ctx),
@@ -5521,6 +5525,74 @@ impl Workspace {
         match self.mru_tab_index(&visible) {
             Some(index) => self.set_active_tab_index(index, ctx),
             None => self.selected_project = Some(project.clone()),
+        }
+    }
+
+    /// Resumes a dormant agent task from the project rail: opens a new tab at
+    /// the handle's stored cwd with the agent's resume command **prefilled,
+    /// never executed** — the user reviews the exact command and submits it
+    /// themselves. The new tab becomes active, and the active∈selected
+    /// invariant re-points the rail at the task's project.
+    ///
+    /// A new tab is always used, never an existing pane: a pane's project is
+    /// derived from its cwd, so restoring into a pane of another project would
+    /// silently re-bucket that tab.
+    fn resume_dormant_agent_task(
+        &mut self,
+        agent: CLIAgent,
+        session_id: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        use crate::terminal::cli_agent_sessions::handle_store::AgentSessionHandlesModel;
+
+        if !FeatureFlag::ResumeProjectTasks.is_enabled() {
+            return;
+        }
+        let Some(cwd) = AgentSessionHandlesModel::as_ref(ctx)
+            .get(agent, &session_id)
+            .map(|handle| handle.cwd.clone())
+        else {
+            return;
+        };
+        // Validation lives inside resume_command: an id that fails it yields
+        // no command, and the click does nothing rather than guessing.
+        let Some(command) = crate::terminal::cli_agent_resume::resume_command(agent, &session_id)
+        else {
+            return;
+        };
+        // The cwd is load-bearing: the agent's own resume lookup is scoped to
+        // the directory the session ran in. If it is gone (deleted worktree),
+        // surface that instead of resuming somewhere wrong.
+        let directory = PathBuf::from(&cwd);
+        if !directory.is_dir() {
+            let window_id = ctx.window_id();
+            WorkspaceToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                let toast =
+                    DismissibleToast::error(format!("Can't resume here — {cwd} no longer exists."));
+                toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+            });
+            return;
+        }
+
+        self.add_tab_with_pane_layout(
+            PanesLayout::SingleTerminal(Box::new(NewTerminalOptions {
+                initial_directory: Some(directory),
+                hide_homepage: true,
+                ..Default::default()
+            })),
+            Arc::new(HashMap::new()),
+            None, /*custom_tab_title*/
+            ctx,
+        );
+        match self
+            .active_tab_pane_group()
+            .as_ref(ctx)
+            .active_session_view(ctx)
+        {
+            Some(terminal_view) => terminal_view.update(ctx, |terminal, ctx| {
+                terminal.set_pending_command(&command, ctx);
+            }),
+            None => log::warn!("No terminal view to prefill after resuming a dormant agent task"),
         }
     }
 
@@ -22886,6 +22958,9 @@ impl Workspace {
         // Matches TAB_GROUP_MEMBER_INDENT, so nesting reads the same as the
         // vertical tabs' grouped members.
         const TASK_ROW_INDENT: f32 = 12.;
+        /// Dormant rows per project. The rail is a navigation aid: past tasks
+        /// must never push a project's live tasks out of view.
+        const MAX_DORMANT_TASK_ROWS: usize = 5;
 
         let appearance = Appearance::as_ref(ctx);
         let theme = appearance.theme();
@@ -22894,7 +22969,17 @@ impl Workspace {
         let muted_color = theme.sub_text_color(theme.background());
         let selected_bg = internal_colors::fg_overlay_2(theme);
         let hover_bg = internal_colors::fg_overlay_1(theme);
-        let layout = ProjectLayout::compute(&self.tabs, ctx);
+        // Dormant rows come from the durable handle store, so a project with no
+        // open tabs still appears — which is what keeps the rail populated
+        // after a restart, where `compute`'s tabs-only projection is empty.
+        let layout = if FeatureFlag::ResumeProjectTasks.is_enabled() {
+            use crate::terminal::cli_agent_sessions::handle_store::AgentSessionHandlesModel;
+            let live = CLIAgentSessionsModel::as_ref(ctx).live_session_ids();
+            let handles = AgentSessionHandlesModel::as_ref(ctx).handles().to_vec();
+            ProjectLayout::compute_with_handles(&self.tabs, &handles, &live, ctx)
+        } else {
+            ProjectLayout::compute(&self.tabs, ctx)
+        };
         let selected = self.selected_project.clone();
         let show_tasks = *TabSettings::as_ref(ctx).rail_show_tasks;
 
@@ -23046,6 +23131,77 @@ impl Workspace {
                 })
                 .finish();
                 column.add_child(task_row);
+            }
+
+            // Dormant tasks: sessions with no open tab, listed after the live
+            // ones. Same row shape — "live" is a property of the row, not a
+            // separate section — distinguished only by a muted label and a
+            // status-less icon. Capped so they can never bury live tasks.
+            for task in layout
+                .dormant_tasks_for_project(&entry.id)
+                .into_iter()
+                .take(MAX_DORMANT_TASK_ROWS)
+            {
+                let key = (task.agent, task.session_id.clone());
+                let dormant_mouse_state = self
+                    .rail_dormant_mouse_states
+                    .borrow_mut()
+                    .entry(key.clone())
+                    .or_default()
+                    .clone();
+                let label = task.label.clone();
+                let icon = render_icon_with_status(
+                    IconWithStatusVariant::CLIAgent {
+                        agent: task.agent,
+                        // No status: the session is not running.
+                        status: None,
+                        is_ambient: false,
+                    },
+                    TASK_ICON_SIZE,
+                    0.,
+                    theme,
+                    theme.background(),
+                );
+                let (agent, session_id) = key;
+                let dormant_row = Hoverable::new(dormant_mouse_state, move |state| {
+                    let mut row_content = Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                        .with_spacing(6.);
+                    row_content.add_child(icon);
+                    row_content.add_child(
+                        Expanded::new(
+                            1.,
+                            Text::new(label, font_family, 12.)
+                                .with_color(muted_color.into())
+                                .finish(),
+                        )
+                        .finish(),
+                    );
+                    let mut container = Container::new(row_content.finish())
+                        .with_padding_left(10.)
+                        .with_padding_right(10.)
+                        .with_padding_top(4.)
+                        .with_padding_bottom(4.)
+                        .with_margin_left(ROW_SIDE_MARGIN + TASK_ROW_INDENT)
+                        .with_margin_right(ROW_SIDE_MARGIN)
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                            ROW_CORNER_RADIUS,
+                        )));
+                    // Never `selected_bg`: a dormant row can never be active.
+                    if state.is_hovered() {
+                        container = container.with_background(hover_bg);
+                    }
+                    container.finish()
+                })
+                .with_cursor(Cursor::PointingHand)
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(WorkspaceAction::ResumeDormantAgentTask {
+                        agent,
+                        session_id: session_id.clone(),
+                    });
+                })
+                .finish();
+                column.add_child(dormant_row);
             }
         }
 
@@ -24333,6 +24489,9 @@ impl TypedActionView for Workspace {
             SelectProject(project) => self.select_project(project, ctx),
             ActivateTaskByPaneGroupId(pane_group_id) => {
                 self.activate_tab_by_pane_group_id(*pane_group_id, ctx)
+            }
+            ResumeDormantAgentTask { agent, session_id } => {
+                self.resume_dormant_agent_task(*agent, session_id.clone(), ctx)
             }
             SetActiveTabColor(color) => {
                 // When the active tab is in a group, redirect to the group's color.

@@ -1,4 +1,5 @@
 pub mod event;
+pub mod handle_store;
 pub mod listener;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod plugin_manager;
@@ -367,6 +368,19 @@ impl CLIAgentSessionsModel {
         self.sessions.get(&terminal_view_id)
     }
 
+    /// The `(agent, session_id)` of every live tracked session. The rail uses
+    /// this to suppress a dormant handle whose session is currently running —
+    /// the live row wins.
+    pub fn live_session_ids(&self) -> HashSet<(CLIAgent, String)> {
+        self.sessions
+            .values()
+            .filter_map(|session| {
+                let session_id = session.session_context.session_id.clone()?;
+                Some((session.agent, session_id))
+            })
+            .collect()
+    }
+
     /// Returns `true` if the rich input editor is currently open for this terminal.
     pub fn is_input_open(&self, terminal_view_id: EntityId) -> bool {
         self.sessions
@@ -592,12 +606,16 @@ impl CLIAgentSessionsModel {
         }
     }
 
-    /// Ships a handle-store op to the persistence writer. Feature-gated here
-    /// so no call site can forget the flag.
+    /// Ships a handle-store op to the persistence writer and mirrors it into
+    /// the in-memory read model so the rail updates without a DB round-trip.
+    /// Feature-gated here so no call site can forget the flag.
     fn send_handle_op(&self, op: AgentSessionHandleOp, ctx: &mut ModelContext<Self>) {
         if !FeatureFlag::ResumeProjectTasks.is_enabled() {
             return;
         }
+        handle_store::AgentSessionHandlesModel::handle(ctx).update(ctx, |mirror, ctx| {
+            mirror.apply(&op, ctx);
+        });
         let Some(sender) = GlobalResourceHandlesProvider::as_ref(ctx)
             .get()
             .model_event_sender

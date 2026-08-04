@@ -153,6 +153,15 @@ pub enum WorkspaceAction {
     /// Activates the task clicked in the project rail, identified by its pane
     /// group so it cannot go stale if tabs close between paint and click.
     ActivateTaskByPaneGroupId(EntityId),
+    /// Resumes a dormant agent task from the project rail: opens a tab at the
+    /// handle's stored cwd with the agent's resume command prefilled — never
+    /// executed. Identified by task identity (agent + session id), so the
+    /// action cannot go stale if the handle list reorders between paint and
+    /// click.
+    ResumeDormantAgentTask {
+        agent: crate::terminal::CLIAgent,
+        session_id: String,
+    },
     /// Sets the manual color override for the active tab.
     ///
     /// - `Color(_)` — apply that color.
@@ -925,6 +934,8 @@ impl WorkspaceAction {
             ContinueConversationLocally { .. } => true,
             #[cfg(not(target_family = "wasm"))]
             ContinueThirdPartyConversationLocally { .. } => true,
+            // Opens a new tab, which changes the restorable window layout.
+            ResumeDormantAgentTask { .. } => true,
             ActivateTab(_)
             | ActivateTabByNumber(_)
             | SelectProject(_)

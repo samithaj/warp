@@ -289,6 +289,9 @@ pub struct PersistedData {
     pub codebase_indices: Vec<CodeWorkspaceMetadata>,
     pub workspace_language_servers: HashMap<PathBuf, HashMap<LSPServerType, EnablementState>>,
     pub multi_agent_conversations: Vec<AgentConversation>,
+    /// Durable CLI-agent session handles, hydrating the in-memory mirror the
+    /// project rail reads (`AgentSessionHandlesModel`).
+    pub agent_session_handles: Vec<model::AgentSessionHandleRecord>,
     pub projects: Vec<Project>,
     pub project_rules: Vec<ProjectRulePath>,
     pub ignored_suggestions: Vec<(String, SuggestionType)>,

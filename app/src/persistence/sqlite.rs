@@ -2569,6 +2569,7 @@ fn read_sqlite_data(
             codebase_indices: get_all_codebase_index_metadata(conn)?,
             workspace_language_servers: Default::default(),
             multi_agent_conversations: Default::default(),
+            agent_session_handles: Default::default(),
             projects: Default::default(),
             project_rules: Default::default(),
             ignored_suggestions: Default::default(),
@@ -2959,6 +2960,11 @@ fn read_sqlite_data(
     // per-conversation via `read_agent_conversation_by_id`.
     let (multi_agent_conversations, conversation_summary_backfills) =
         read_agent_conversation_metadata(conn)?;
+    let agent_session_handles = if FeatureFlag::ResumeProjectTasks.is_enabled() {
+        super::agent_session_handles::load_all(conn)?
+    } else {
+        Vec::new()
+    };
     let projects = get_all_projects(conn)?;
     let project_rules = get_all_project_rules(conn)?;
     let ignored_suggestions = get_all_ignored_suggestions(conn)?;
@@ -2980,6 +2986,7 @@ fn read_sqlite_data(
         codebase_indices,
         workspace_language_servers,
         multi_agent_conversations,
+        agent_session_handles,
         projects,
         project_rules,
         ignored_suggestions,
