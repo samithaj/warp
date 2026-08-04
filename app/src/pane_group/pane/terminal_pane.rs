@@ -1,6 +1,7 @@
 //! Implementation of terminal panes.
 #[cfg(not(target_family = "wasm"))]
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc::SyncSender;
 
 #[cfg(not(target_family = "wasm"))]
@@ -82,6 +83,16 @@ pub struct TerminalPane {
     /// Used to uniquely identify the pane, even across separate runs of the app.
     uuid: Vec<u8>,
 
+    /// The directory this pane's shell was launched in, when known.
+    ///
+    /// A pane's project is normally read from its live shell, but that answer
+    /// only exists once the shell has emitted its first block. On a restore
+    /// with many tabs every pane is directionless until its shell answers, so
+    /// the rail files them all under "Other" and then visibly re-sorts them as
+    /// each one starts. This is the same directory the shell was told to open
+    /// in, kept so the rail can bucket the pane correctly on the first frame.
+    startup_directory: Option<PathBuf>,
+
     pane_configuration: ModelHandle<PaneConfiguration>,
 
     /// Defining `terminal_manager` before `view` means that `terminal_manager`
@@ -139,6 +150,7 @@ pub(in crate::pane_group) fn inherit_share_for_local_child(
 impl TerminalPane {
     pub(in crate::pane_group) fn new(
         uuid: Vec<u8>,
+        startup_directory: Option<PathBuf>,
         terminal_manager: ModelHandle<Box<dyn TerminalManager>>,
         terminal_view: ViewHandle<TerminalView>,
         model_event_sender: Option<SyncSender<ModelEvent>>,
@@ -169,9 +181,16 @@ impl TerminalPane {
         Self {
             model_event_sender,
             uuid,
+            startup_directory,
             pane_configuration,
             view,
         }
+    }
+
+    /// The directory this pane's shell was launched in, if known. Used as the
+    /// project fallback while the shell has yet to report a working directory.
+    pub(in crate::pane_group) fn startup_directory(&self) -> Option<&PathBuf> {
+        self.startup_directory.as_ref()
     }
 
     /// The [`PaneView<TerminalView>`] for this pane.
