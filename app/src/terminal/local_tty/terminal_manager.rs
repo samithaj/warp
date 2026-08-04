@@ -260,9 +260,8 @@ where
     ///
     /// Idempotent by construction: the payload is moved out with
     /// [`Option::take`], so a second call finds `None` and returns. That
-    /// matters because several independent paths call this — focusing the
-    /// pane, reading the active session's model, synchronized input — and any
-    /// of them may be the first.
+    /// matters because the callers are independent — focusing the pane and
+    /// synchronized input — and either may be the first.
     pub(crate) fn ensure_shell_started(
         &mut self,
         ctx: &mut ModelContext<Box<dyn TerminalManagerTrait>>,
