@@ -10,6 +10,7 @@
 use warp_core::features::FeatureFlag;
 use warpui::{AppContext, SingletonEntity as _};
 
+use crate::ai::blocklist::history_model::BlocklistAIHistoryModel;
 use crate::pane_group::PaneGroup;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::cli_agent_sessions::handle_store::AgentSessionHandlesModel;
@@ -47,7 +48,9 @@ pub(crate) fn agent_session_title(pane_group: &PaneGroup, app: &AppContext) -> O
 /// where the Projects × Tasks layout renders tasks, and naming a task after its
 /// agent is only meaningful there.
 pub(crate) fn tab_title(pane_group: &PaneGroup, app: &AppContext) -> String {
-    if let Some(custom_title) = pane_group.custom_title(app) {
+    // A blank custom title is not a rename, it is a tab with nothing to say:
+    // let the resolution below name it rather than honouring the blank.
+    if let Some(custom_title) = pane_group.custom_title(app).and_then(non_blank) {
         return custom_title;
     }
     if FeatureFlag::Projects.is_enabled() {
@@ -124,15 +127,70 @@ impl From<RailTaskInfo> for TabInfoKind {
     }
 }
 
+/// The last-resort name for a live tab, when even the shell has nothing to say.
+pub(crate) const SHELL_LABEL_FLOOR: &str = "Shell";
+
 /// The label for one task row in the project rail.
 ///
-/// Falls back to the tab's own title when the configured source has nothing to
-/// show (no agent yet, no repo, no command run), so a row is never blank.
+/// Gathers the row's four possible names and hands them to
+/// [`resolve_rail_task_label`], which owns the order and the never-blank
+/// guarantee.
+///
+/// The shell name is read last and lazily: it takes a short terminal-model
+/// lock, which must not happen for every row of every frame. (No caller on the
+/// rail's render path holds that lock, so taking it here is safe.)
 pub(crate) fn rail_task_label(pane_group: &PaneGroup, app: &AppContext) -> String {
     let kind = TabSettings::as_ref(app).rail_task_info;
-    tab_info_text(pane_group, kind.into(), app)
-        .or_else(|| stored_handle_title(pane_group, app))
-        .unwrap_or_else(|| tab_title(pane_group, app))
+    resolve_rail_task_label(
+        tab_info_text(pane_group, kind.into(), app),
+        || stored_handle_title(pane_group, app),
+        || tab_title(pane_group, app),
+        || {
+            pane_group
+                .focused_session_view(app)
+                .map(|view| view.as_ref(app).terminal_title_from_shell())
+        },
+    )
+}
+
+/// The rail's label-resolution order, as a pure function of its four sources.
+///
+/// Every source can legitimately answer with a blank string — an agent that
+/// reported an empty title, a cached handle title stored before the name
+/// arrived, a [`PaneGroup::display_title`] whose `title` is
+/// `unwrap_or_default()` over a focused pane content the tab does not have yet
+/// (a file or code pane is constructed with an empty title; a lazily-started
+/// shell has no content at all) — and "the source had a value" must never be
+/// allowed to mean "the row draws blank". So every step passes through
+/// [`non_blank`], and the chain bottoms out in a constant rather than in
+/// whatever the last source happened to hold. That is what makes
+/// never-blank structural: no combination of inputs can return an empty label.
+///
+/// Sources after the first are `FnOnce` so nothing below the winner is ever
+/// computed.
+pub(crate) fn resolve_rail_task_label(
+    configured: Option<String>,
+    stored_title: impl FnOnce() -> Option<String>,
+    tab_title: impl FnOnce() -> String,
+    shell_name: impl FnOnce() -> Option<String>,
+) -> String {
+    configured
+        .and_then(non_blank)
+        .or_else(|| stored_title().and_then(non_blank))
+        .or_else(|| non_blank(tab_title()))
+        .or_else(|| shell_name().and_then(non_blank))
+        .unwrap_or_else(|| SHELL_LABEL_FLOOR.to_owned())
+}
+
+/// A label that is safe to render: trimmed, and `None` when nothing is left.
+///
+/// The single gate every tab and rail label passes through, so "not blank" is
+/// enforced in one place instead of at each of the half-dozen sites that can
+/// produce one.
+pub(crate) fn non_blank(text: impl Into<String>) -> Option<String> {
+    let text = text.into();
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 /// The cached conversation title from the durable session-handle store.
@@ -145,6 +203,11 @@ pub(crate) fn rail_task_label(pane_group: &PaneGroup, app: &AppContext) -> Strin
 /// `..repos/poa-agent`" problem. The handle outlives the session, so the name
 /// does too, including a Claude Code `/rename`, which lands in the transcript
 /// the resolver reads.
+///
+/// Filtered through [`non_blank`]: the store keeps whatever title a plugin
+/// event carried (`AgentSessionHandleOp::SetTitle` writes it verbatim), so an
+/// agent that reported an empty name would otherwise name the row nothing at
+/// all.
 pub(crate) fn stored_handle_title(pane_group: &PaneGroup, app: &AppContext) -> Option<String> {
     // Deliberately NOT gated on the agent having exited. Warp has no live
     // channel carrying a CLI agent's conversation name — `cli_agent_title`
@@ -152,7 +215,9 @@ pub(crate) fn stored_handle_title(pane_group: &PaneGroup, app: &AppContext) -> O
     // a name — so a *running* session has no name to show either, and gating
     // this on "no live agent" sent running sessions back to the truncated cwd.
     // The stored title is the only name either state has.
-    stored_handle_lookup(pane_group, app).and_then(|handle| handle.2)
+    stored_handle_lookup(pane_group, app)
+        .and_then(|handle| handle.2)
+        .and_then(non_blank)
 }
 
 /// The stored session handle belonging to this tab's pane, as
@@ -179,6 +244,46 @@ pub(crate) fn stored_handle_for_tab(
         return None;
     }
     stored_handle_lookup(pane_group, app)
+}
+
+/// Whether anything agent-related is, or has been, attached to this tab.
+///
+/// Answers the rail's "is this just a shell?" question, and deliberately
+/// answers it from the same three sources this module already resolves names
+/// from, so a row can never be named after an agent it is then filtered out for
+/// not having:
+///
+/// 1. a live CLI agent session in the focused pane,
+/// 2. a Warp Agent Mode conversation on it (empty and entirely-passive
+///    conversations do not count — nobody has asked it anything), and
+/// 3. a stored session handle bound to the pane, which is what an agent that
+///    has since exited leaves behind.
+///
+/// Case 2 is checked against the same conversation the rail's triage reads
+/// (`Workspace::tab_conversation_status`), with the same empty/passive filter,
+/// rather than only the naming path's chrome title. That equivalence is what
+/// makes the filter safe: **a row that shows an agent status can never be
+/// hidden**, so no agent waiting on the user can be filtered out of the rail.
+///
+/// Scanned sessions need no case of their own: by the authority split on
+/// [`session_scan`](crate::terminal::cli_agent_sessions::session_scan) they
+/// have no pane at all, so they can never belong to a live tab — they render as
+/// dormant rows, which the filter never sees.
+pub(crate) fn pane_has_agent(pane_group: &PaneGroup, app: &AppContext) -> bool {
+    let Some(terminal_view) = pane_group.focused_session_view(app) else {
+        // No terminal session in the focused pane (a file, notebook or code
+        // pane): not an agent, and not a shell to be hidden either.
+        return false;
+    };
+    let agent_text = terminal_agent_text(terminal_view.as_ref(app), app);
+    agent_text.cli_agent.is_some()
+        || agent_text.is_oz_agent
+        || BlocklistAIHistoryModel::as_ref(app)
+            .active_conversation(terminal_view.id())
+            .is_some_and(|conversation| {
+                !conversation.is_empty() && !conversation.is_entirely_passive()
+            })
+        || stored_handle_lookup(pane_group, app).is_some()
 }
 
 /// The stored session handle this tab's pane hosts, regardless of whether an
@@ -221,7 +326,12 @@ fn stored_handle_lookup(
 /// letting the caller fall back.
 fn tab_info_text(pane_group: &PaneGroup, kind: TabInfoKind, app: &AppContext) -> Option<String> {
     if matches!(kind, TabInfoKind::AgentSession) {
-        return agent_session_title(pane_group, app);
+        // Filtered like every other kind below. This branch used to return
+        // before reaching that filter, and an agent title of `Some("")` — which
+        // a conversation title resolves to whenever its root task, initial
+        // query and fallback title are all empty strings — became a rail row
+        // with no text in it.
+        return agent_session_title(pane_group, app).and_then(non_blank);
     }
     let terminal_view = pane_group.focused_session_view(app)?;
     let terminal_view = terminal_view.as_ref(app);
@@ -243,7 +353,7 @@ fn tab_info_text(pane_group: &PaneGroup, kind: TabInfoKind, app: &AppContext) ->
             .or_else(|| restored_working_directory(pane_group)),
         TabInfoKind::Branch => terminal_view.current_git_branch(app),
     };
-    text.filter(|text| !text.trim().is_empty())
+    text.and_then(non_blank)
 }
 
 /// The directory a pane was restored into, formatted the way a live one is.

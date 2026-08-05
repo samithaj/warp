@@ -76,7 +76,10 @@ mod about_page;
 mod admin_actions;
 mod agent_assisted_environment_modal;
 mod ai_page;
-mod appearance_page;
+// `pub(crate)` so surfaces outside Settings can dispatch one of its toggles
+// rather than writing the setting a second way: the project rail's header
+// filter button routes through `AppearancePageAction`.
+pub(crate) mod appearance_page;
 mod billing_and_usage;
 mod billing_and_usage_dispatch;
 mod billing_and_usage_page;
@@ -462,6 +465,7 @@ pub mod flags {
     pub const RESTORE_SESSION_CONTEXT_FLAG: &str = "Restore_Sessions";
     pub const HONOR_PS1_CONTEXT_FLAG: &str = "Honor_PS1";
     pub const PROJECT_LAYOUT_CONTEXT_FLAG: &str = "Project_Layout";
+    pub const RAIL_HIDE_SHELLS_WITHOUT_AGENTS_FLAG: &str = "Rail_Hide_Shells_Without_Agents";
     pub const GIT_PROMPT_CONTEXT_FLAG: &str = "Git_Prompt";
     pub const AUTOCOMPLETE_SYMBOLS_CONTEXT_FLAG: &str = "Autocomplete_Symbols";
     pub const QUAKE_MODE_ENABLED_CONTEXT_FLAG: &str = "Quake_Mode_Editor";

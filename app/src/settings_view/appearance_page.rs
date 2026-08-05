@@ -93,11 +93,12 @@ use crate::window_settings::{
 use crate::workspace::WorkspaceAction;
 use crate::workspace::header_toolbar_editor::HeaderToolbarInlineEditor;
 use crate::workspace::tab_settings::{
-    DirectoryTabColor, HideTitleBarSearchBarInVerticalTabs, PreserveActiveTabColor, RailShowTasks,
-    RailTaskInfo, ShowCodeReviewButton, ShowIndicatorsButton,
-    ShowVerticalTabPanelInRestoredWindows, TabCloseButtonPosition, TabLineCount, TabSettings,
-    TabSettingsChangedEvent, UseLatestUserPromptAsConversationTitleInTabNames, UseProjectLayout,
-    UseVerticalTabs, WorkspaceDecorationVisibility, canonical_directory_key,
+    DirectoryTabColor, HideTitleBarSearchBarInVerticalTabs, PreserveActiveTabColor,
+    RailHideShellsWithoutAgents, RailShowTasks, RailTaskInfo, ShowCodeReviewButton,
+    ShowIndicatorsButton, ShowVerticalTabPanelInRestoredWindows, TabCloseButtonPosition,
+    TabLineCount, TabSettings, TabSettingsChangedEvent,
+    UseLatestUserPromptAsConversationTitleInTabNames, UseProjectLayout, UseVerticalTabs,
+    WorkspaceDecorationVisibility, canonical_directory_key,
 };
 use crate::{send_telemetry_from_ctx, themes};
 
@@ -140,6 +141,35 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
             )),
             context,
             flags::PROJECT_LAYOUT_CONTEXT_FLAG,
+        ),
+        // A pair rather than a single command, because the setting is a state:
+        // the palette then reads "Enable …" or "Disable …" depending on which
+        // way it currently points, instead of an ambiguous "Toggle …".
+        //
+        // Built with `custom` so the predicates can carry a *second*
+        // condition — the project layout being on, which is the rail's own
+        // gate. Both entries are otherwise offered to users who have no rail
+        // to apply them to. (`PROJECT_LAYOUT_CONTEXT_FLAG` tracks the setting,
+        // which is the closest thing in the keymap context to
+        // `project_layout_active`; the feature flag behind it cannot be turned
+        // on from here anyway.)
+        ToggleSettingActionPair::custom(
+            SettingActionPairDescriptions::new(
+                "Enable hiding shells without agents in the project rail",
+                "Disable hiding shells without agents in the project rail",
+            ),
+            builder(SettingsAction::AppearancePageToggle(
+                AppearancePageAction::ToggleRailHideShellsWithoutAgents,
+            )),
+            SettingActionPairContexts::new(
+                context.to_owned()
+                    & id!(flags::PROJECT_LAYOUT_CONTEXT_FLAG)
+                    & !id!(flags::RAIL_HIDE_SHELLS_WITHOUT_AGENTS_FLAG),
+                context.to_owned()
+                    & id!(flags::PROJECT_LAYOUT_CONTEXT_FLAG)
+                    & id!(flags::RAIL_HIDE_SHELLS_WITHOUT_AGENTS_FLAG),
+            ),
+            None,
         ),
         ToggleSettingActionPair::new(
             "compact mode",
@@ -527,6 +557,7 @@ pub enum AppearancePageAction {
     ToggleProjectLayout,
     ToggleTwoLineTabs,
     ToggleRailShowTasks,
+    ToggleRailHideShellsWithoutAgents,
     SetRailTaskInfo(RailTaskInfo),
     ToggleCursorBlink,
     ToggleRespectSystemTheme,
@@ -671,6 +702,7 @@ impl TypedActionView for AppearanceSettingsPageView {
             ToggleProjectLayout => self.toggle_project_layout(ctx),
             ToggleTwoLineTabs => self.toggle_two_line_tabs(ctx),
             ToggleRailShowTasks => self.toggle_rail_show_tasks(ctx),
+            ToggleRailHideShellsWithoutAgents => self.toggle_rail_hide_shells_without_agents(ctx),
             SetRailTaskInfo(value) => self.set_rail_task_info(value, ctx),
             ToggleCursorBlink => self.toggle_cursor_blink(ctx),
             ToggleOpenWindowsAtCustomSize => self.toggle_open_windows_at_custom_size(ctx),
@@ -1593,6 +1625,7 @@ impl AppearanceSettingsPageView {
             tab_settings_widgets.push(Box::new(ProjectLayoutWidget::default()));
             tab_settings_widgets.push(Box::new(TwoLineTabsWidget::default()));
             tab_settings_widgets.push(Box::new(RailShowTasksWidget::default()));
+            tab_settings_widgets.push(Box::new(RailHideShellsWithoutAgentsWidget::default()));
             tab_settings_widgets.push(Box::new(RailTaskInfoWidget::default()));
         }
 
@@ -2388,6 +2421,22 @@ impl AppearanceSettingsPageView {
         TabSettings::handle(ctx).update(ctx, |tab_settings, ctx| {
             let current_value = *tab_settings.rail_show_tasks;
             report_if_error!(tab_settings.rail_show_tasks.set_value(!current_value, ctx));
+        });
+    }
+
+    /// Toggles hiding the project rail's rows for tabs that are plain shells.
+    ///
+    /// The single writer of this setting: the rail header's filter button and
+    /// the command palette's enable/disable pair both dispatch here rather than
+    /// each toggling the setting themselves.
+    pub fn toggle_rail_hide_shells_without_agents(&mut self, ctx: &mut ViewContext<Self>) {
+        TabSettings::handle(ctx).update(ctx, |tab_settings, ctx| {
+            let current_value = *tab_settings.rail_hide_shells_without_agents;
+            report_if_error!(
+                tab_settings
+                    .rail_hide_shells_without_agents
+                    .set_value(!current_value, ctx)
+            );
         });
     }
 
@@ -5218,6 +5267,53 @@ impl SettingsWidget for RailShowTasksWidget {
                 .build()
                 .on_click(move |ctx, _, _| {
                     ctx.dispatch_typed_action(AppearancePageAction::ToggleRailShowTasks);
+                })
+                .finish(),
+            None,
+        )
+    }
+}
+
+#[derive(Default)]
+struct RailHideShellsWithoutAgentsWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for RailHideShellsWithoutAgentsWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "project rail hide shells without agents filter noise zsh"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let tab_settings = TabSettings::as_ref(app);
+
+        render_body_item::<AppearancePageAction>(
+            "Hide shells without agents in the project rail".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                RailHideShellsWithoutAgents::storage_key(),
+                RailHideShellsWithoutAgents::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*tab_settings.rail_hide_shells_without_agents)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(
+                        AppearancePageAction::ToggleRailHideShellsWithoutAgents,
+                    );
                 })
                 .finish(),
             None,

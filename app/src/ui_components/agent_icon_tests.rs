@@ -92,6 +92,10 @@ enum CanonicalRunState {
     LocalClaudePluginBlocked,
     /// Local Claude CLI session detected via command matching only (no listener, no rich status).
     LocalClaudeCommandDetected,
+    /// Local Codex CLI session with a listener but no rich status (the OSC 9 fallback, which
+    /// emits only opaque `Stop`). Distinct from [`Self::LocalClaudeCommandDetected`] because it
+    /// has a listener — the pair pins the gate to `supports_rich_status`, not to the listener.
+    LocalCodexOsc9Fallback,
 }
 
 impl CanonicalRunState {
@@ -107,6 +111,7 @@ impl CanonicalRunState {
             LocalClaudePluginInProgress,
             LocalClaudePluginBlocked,
             LocalClaudeCommandDetected,
+            LocalCodexOsc9Fallback,
         ]
     }
 
@@ -160,10 +165,18 @@ impl CanonicalRunState {
                 }),
                 is_ambient: false,
             }),
+            // No rich status, so no Blocked/Success — but a live session means a running
+            // agent, which must read differently from a plain shell.
             LocalClaudeCommandDetected => Some(AgentIconFields {
                 is_cli: true,
                 cli_agent: Some(CLIAgent::Claude),
-                status: None,
+                status: Some(ConversationStatus::InProgress),
+                is_ambient: false,
+            }),
+            LocalCodexOsc9Fallback => Some(AgentIconFields {
+                is_cli: true,
+                cli_agent: Some(CLIAgent::Codex),
+                status: Some(ConversationStatus::InProgress),
                 is_ambient: false,
             }),
         }
@@ -255,6 +268,19 @@ impl CanonicalRunState {
                 selected_conversation_status: None,
                 has_selected_conversation: false,
             },
+            LocalCodexOsc9Fallback => TerminalIconInputs {
+                is_ambient: false,
+                cli_session: Some(CLISessionInputs {
+                    agent: CLIAgent::Codex,
+                    // A listener exists, but OSC 9 carries no rich status.
+                    has_listener: true,
+                    status: ConversationStatus::Success,
+                    supports_rich_status: false,
+                }),
+                selected_third_party_cli_agent: None,
+                selected_conversation_status: None,
+                has_selected_conversation: false,
+            },
         }
     }
 
@@ -274,7 +300,8 @@ impl CanonicalRunState {
             | LocalOzInProgress
             | LocalClaudePluginInProgress
             | LocalClaudePluginBlocked
-            | LocalClaudeCommandDetected => None,
+            | LocalClaudeCommandDetected
+            | LocalCodexOsc9Fallback => None,
         }
     }
 }
@@ -452,4 +479,68 @@ fn non_ambient_entry_uses_display_harness() {
     cloud_agent_by_task_id.identity.ambient_agent_task_id =
         Some("00000000-0000-0000-0000-000000000001".parse().unwrap());
     assert!(cloud_agent_by_task_id.is_cloud_agent_run());
+}
+
+/// Spec §8: a row without rich status must not pretend to have one. Whatever the
+/// session's own `status` field happens to say, a non-rich session may only ever render
+/// the neutral running badge — never Blocked (which would drive a false "waiting on you"
+/// escalation) and never Success.
+#[test]
+fn agent_icon_without_rich_status_never_shows_blocked_or_success() {
+    let misleading = [
+        ConversationStatus::Blocked {
+            blocked_action: "Wants to run bash: rm -rf /".to_string(),
+        },
+        ConversationStatus::Success,
+        ConversationStatus::Error,
+        ConversationStatus::WaitingForEvents,
+    ];
+
+    for claimed in misleading {
+        // Both non-rich shapes: command-detected (no listener) and OSC 9 (listener).
+        for has_listener in [false, true] {
+            let inputs = TerminalIconInputs {
+                is_ambient: false,
+                cli_session: Some(CLISessionInputs {
+                    agent: CLIAgent::Claude,
+                    has_listener,
+                    status: claimed.clone(),
+                    supports_rich_status: false,
+                }),
+                selected_third_party_cli_agent: None,
+                selected_conversation_status: None,
+                has_selected_conversation: false,
+            };
+            let fields = agent_icon_variant_from_terminal_inputs(&inputs)
+                .as_ref()
+                .and_then(AgentIconFields::from_variant)
+                .expect("a known CLI agent must always render an icon");
+
+            assert_eq!(
+                fields.status,
+                Some(ConversationStatus::InProgress),
+                "non-rich session (has_listener={has_listener}) leaked {claimed:?}"
+            );
+        }
+    }
+}
+
+/// The neutral running badge is what separates a plugin-less agent from a plain shell:
+/// the shell renders no icon at all, the agent renders a branded circle that is visibly
+/// running.
+#[test]
+fn agent_icon_command_detected_session_is_distinguishable_from_plain_shell() {
+    let plain = agent_icon_variant_from_terminal_inputs(
+        &CanonicalRunState::PlainTerminal.terminal_inputs(),
+    );
+    assert!(plain.is_none(), "a plain shell must render no agent icon");
+
+    let detected = agent_icon_variant_from_terminal_inputs(
+        &CanonicalRunState::LocalClaudeCommandDetected.terminal_inputs(),
+    )
+    .as_ref()
+    .and_then(AgentIconFields::from_variant)
+    .expect("a command-detected agent must render an icon");
+    assert_eq!(detected.status, Some(ConversationStatus::InProgress));
+    assert_eq!(detected.cli_agent, Some(CLIAgent::Claude));
 }

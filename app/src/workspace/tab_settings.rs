@@ -5,6 +5,8 @@ use settings::macros::define_settings_group;
 use settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
 use warp_core::ui::theme::AnsiColorIdentifier;
 
+use super::project_priorities::ProjectPriorities;
+
 #[derive(
     Default,
     Debug,
@@ -228,6 +230,18 @@ impl DirectoryTabColors {
         Self(map)
     }
 }
+
+settings::macros::implement_setting_for_enum!(
+    ProjectPriorities,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Never,
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.project_layout.project_priorities",
+    description: "Ordered list of prioritized projects, highest priority first.",
+    feature_flag: warp_core::features::FeatureFlag::Projects,
+);
 
 /// Canonicalizes `path` into the string key used in [`DirectoryTabColors`].
 pub fn canonical_directory_key(path: &Path) -> String {
@@ -704,6 +718,17 @@ define_settings_group!(TabSettings, settings: [
         description: "List each project's tasks under it in the project rail, each with its own status.",
         feature_flag: warp_core::features::FeatureFlag::Projects,
     },
+    rail_hide_shells_without_agents: RailHideShellsWithoutAgents {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.tabs.rail_hide_shells_without_agents",
+        description: "Hide project rail rows for tabs that are plain shells, with no agent session now or before. The active tab always stays visible.",
+        feature_flag: warp_core::features::FeatureFlag::Projects,
+    },
     use_project_layout: UseProjectLayout {
         type: bool,
         default: false,
@@ -789,6 +814,7 @@ define_settings_group!(TabSettings, settings: [
     workspace_decoration_visibility: WorkspaceDecorationVisibility,
     close_button_position: TabCloseButtonPosition,
     directory_tab_colors: DirectoryTabColors,
+    project_priorities: ProjectPriorities,
 ]);
 
 /// Whether the vertical-tabs sidebar layout is active.

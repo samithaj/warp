@@ -336,6 +336,11 @@ fn unwitnessed_sessions<'a>(
 /// transcript afterwards, so disk is the fresher of the two. The floor is
 /// `Agent · shortid` — never a path, since replacing path-derived labels is
 /// the point of the rail.
+///
+/// Both candidates are trimmed and dropped when blank. The handle store writes
+/// whatever title a plugin event carried
+/// (`AgentSessionHandleOp::SetTitle` sets it verbatim), so an empty one has to
+/// fall through to the floor rather than name the row nothing at all.
 fn dormant_label(
     scanned_label: Option<&str>,
     cached_title: Option<&str>,
@@ -343,12 +348,19 @@ fn dormant_label(
     session_id: &str,
 ) -> String {
     scanned_label
-        .or(cached_title)
-        .map(str::to_owned)
+        .and_then(non_blank)
+        .or_else(|| cached_title.and_then(non_blank))
         .unwrap_or_else(|| {
             let short: String = session_id.chars().take(8).collect();
             format!("{} · {short}", agent.display_name())
         })
+}
+
+/// A candidate label with its surrounding whitespace removed, or `None` when
+/// nothing is left of it.
+fn non_blank(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 /// The index reached by moving forward one step through `indices` from
