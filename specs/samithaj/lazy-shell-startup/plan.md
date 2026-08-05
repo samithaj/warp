@@ -227,8 +227,11 @@ itself. Also note the data profile follows the **bundle id**, so
 `target/debug/.../WarpOss.app` and `/Applications/WarpOssDev.app` read different profiles; only the
 latter holds the 49 restored tabs.
 
-**Status: the table above is specified but not yet observed.** Do not record this feature as
-verified end-to-end until it has been.
+**Status: OBSERVED, 2026-08-05.** After the TCC/Keychain grants were given, a 48-model restore
+measured `shells=1` at t+30s and t+60s (stable), against the eager baseline of 49-50. Note the fix
+that made this true was NOT the original trigger placement: two earlier attempts each measured 46 —
+see §6c. Remaining interactive checks (click-to-start +1, idempotent second click, settings
+broadcast starting none) are pending user confirmation in the running build.
 
 There is **no `FIRST_FRAME_DRAWN` instrumentation** in this tree — v2's verification section named a
 marker that does not exist. The shell count is the better metric anyway: it measures the *cause* of
