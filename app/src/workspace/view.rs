@@ -48,6 +48,7 @@ use anyhow::Context as _;
 #[cfg(target_os = "macos")]
 use anyhow::Result;
 use autoupdate::AutoupdateStage;
+use chrono::{DateTime, Utc};
 #[cfg(target_os = "macos")]
 use command::blocking::Command;
 use futures::Future;
@@ -320,6 +321,9 @@ use crate::resource_center::{
 };
 use crate::reward_view::{RewardEvent, RewardKind, RewardView};
 use crate::root_view::{NewWorkspaceSource, OpenLaunchConfigArg, quake_mode_window_id};
+use crate::search::command_palette::agent_sessions::{
+    self, AgentSessionCandidate, CandidateOrigin,
+};
 use crate::search::command_palette::view::{
     Event as CommandPaletteEvent, NavigationMode, View as CommandPalette,
 };
@@ -523,7 +527,7 @@ use crate::workspace::rail_shells::{
 };
 use crate::workspace::rail_triage::{
     self, ProjectTriage, RailChip, RailTask, RailUrgency, TaskTriage, chip_counts,
-    next_chip_target, rail_task_order,
+    next_chip_target, rail_header_controls, rail_task_order,
 };
 use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
@@ -732,6 +736,10 @@ pub(crate) const TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME: &str = "workspace:toggle_
 /// binding's action, so its tooltip can show whatever shortcut the user has
 /// assigned).
 pub(crate) const NEW_PROJECT_BINDING_NAME: &str = "workspace:new_project";
+/// Opens the session-search popup (the rail header's magnifier dispatches this
+/// same binding's action, so its tooltip shows whatever shortcut the user has
+/// assigned).
+pub(crate) const SESSION_SEARCH_BINDING_NAME: &str = "workspace:open_session_search";
 
 // Editable left panel toolbelt keybindings.
 pub(crate) const LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME: &str =
@@ -1194,6 +1202,11 @@ pub struct Workspace {
     changelog_model: ModelHandle<ChangelogModel>,
     palette: ViewHandle<CommandPalette>,
     ctrl_tab_palette: ViewHandle<CommandPalette>,
+    /// The session-search popup. A third palette instance rather than a mode of
+    /// the main one, because its mixer holds a single source whose contents are
+    /// a snapshot taken on open — resetting the main palette's mixer to that and
+    /// back would race with whatever it was already showing.
+    session_search_palette: ViewHandle<CommandPalette>,
     mouse_states: WorkspaceMouseStates,
     settings_pane: ViewHandle<SettingsView>,
     import_modal: ViewHandle<ImportModal>,
@@ -3036,6 +3049,18 @@ impl Workspace {
             me.handle_palette_event(event, ctx);
         });
 
+        // `SessionSearch` and not `CtrlTab`: this popup is driven by typing, and
+        // the ctrl-tab mode hides the search bar. It renders like `Normal` for
+        // exactly that reason, and differs only in what the mode switches on —
+        // the debounced transcript-content search, its footer, and the
+        // suppressed "no results" placeholder, none of which the two ordinary
+        // palettes should carry.
+        let session_search_palette = ctx
+            .add_typed_action_view(|ctx| CommandPalette::new(NavigationMode::SessionSearch, ctx));
+        ctx.subscribe_to_view(&session_search_palette, |me, _, event, ctx| {
+            me.handle_palette_event(event, ctx);
+        });
+
         let auth_manager = AuthManager::handle(ctx);
         ctx.subscribe_to_model(&auth_manager, Self::handle_auth_manager_event);
 
@@ -3565,6 +3590,7 @@ impl Workspace {
             welcome_tips_view,
             palette,
             ctrl_tab_palette,
+            session_search_palette,
             mouse_states: Default::default(),
             previous_theme: None,
             settings_pane,
@@ -12673,6 +12699,7 @@ impl Workspace {
             },
             CtrlTabBehavior::CycleMostRecentSession | CtrlTabBehavior::CycleMostRecentTab => {
                 self.current_workspace_state.is_palette_open = false;
+                self.current_workspace_state.is_session_search_palette_open = false;
                 let palette_was_open = self.current_workspace_state.is_ctrl_tab_palette_open;
                 if !palette_was_open {
                     self.open_palette_action(
@@ -15306,6 +15333,207 @@ impl Workspace {
         ctx.notify();
     }
 
+    /// Opens the session-search popup over a snapshot of every CLI-agent
+    /// session Warp can name.
+    fn open_session_search_palette(&mut self, ctx: &mut ViewContext<Self>) {
+        // A session started in another terminal only exists on disk, and the
+        // scan is only kicked by user actions. Opening the popup is exactly
+        // such an action; the results land for the next open if the scan is
+        // still running, which is the same deal the rail makes.
+        self.refresh_claude_session_scan(ctx);
+
+        let candidates = self.agent_session_candidates(ctx);
+        // The same list, handed to the content search as its corpus: a popup
+        // that can name a session should be able to look inside it. Set here,
+        // once per open, for the same reason the candidates are — walking the
+        // tabs and resolving a project per directory is far too much to redo
+        // between keystrokes.
+        self.set_transcript_digest_corpus(&candidates, ctx);
+
+        self.session_search_palette.update(ctx, |view, ctx| {
+            view.reset(ctx);
+        });
+
+        let mixer = self
+            .session_search_palette
+            .as_ref(ctx)
+            .search_bar
+            .as_ref(ctx)
+            .mixer()
+            .clone();
+        let data_source_store = self
+            .session_search_palette
+            .as_ref(ctx)
+            .data_source_store
+            .clone();
+        data_source_store.update(ctx, |store, ctx| {
+            store.reset_session_search_mixer(mixer, candidates, ctx);
+        });
+
+        self.session_search_palette.update(ctx, |view, ctx| {
+            // Set the offset BEFORE the filter: the source is synchronous, so
+            // results arrive during `set_active_query_filter` and the offset has
+            // to already be stored when the selection is first placed.
+            //
+            // The offset is 1 because the top row is the section separator, and
+            // `SelectionUpdate::Top` — unlike Up/Down — does not skip
+            // non-interactable items. Without it, Enter on a freshly opened
+            // popup accepts a header and silently does nothing.
+            view.set_initial_selection_offset(1, ctx);
+            view.set_active_query_filter(QueryFilter::AgentSessions, ctx);
+        });
+
+        ctx.notify();
+    }
+
+    /// Hands the transcript digest the sessions it may look inside.
+    ///
+    /// The corpus is the popup's own candidate list, minus nothing: the digest
+    /// drops the agents it cannot read (only Claude keeps a per-cwd transcript
+    /// store) rather than having that rule restated at every call site.
+    /// Replacing it also drops whatever the previous popup published, so a
+    /// reopened popup cannot show hits from a corpus it no longer offers.
+    fn set_transcript_digest_corpus(
+        &self,
+        candidates: &[AgentSessionCandidate],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        use crate::terminal::cli_agent_sessions::transcript_digest::{
+            DigestTarget, TranscriptDigestModel,
+        };
+
+        if !ctx.has_singleton_model::<TranscriptDigestModel>() {
+            return;
+        }
+        let corpus: Vec<DigestTarget> = candidates
+            .iter()
+            .map(|candidate| DigestTarget {
+                agent: candidate.agent,
+                session_id: candidate.session_id.clone(),
+                project_name: candidate.project_name.clone(),
+                task_name: candidate.task_name.clone(),
+                cwd: candidate.cwd.clone(),
+            })
+            .collect();
+        TranscriptDigestModel::handle(ctx).update(ctx, |digest, ctx| {
+            digest.set_corpus(corpus, ctx);
+        });
+    }
+
+    /// Every CLI-agent session the popup can offer, from all three sources:
+    /// the sessions running in open tabs, the durable handle store, and the
+    /// on-disk scan.
+    ///
+    /// Assembled once per open rather than per keystroke — it walks every tab
+    /// and resolves a project for every distinct directory, which is far too
+    /// much to redo between characters.
+    fn agent_session_candidates(&self, ctx: &AppContext) -> Vec<AgentSessionCandidate> {
+        use crate::terminal::cli_agent_sessions::handle_store::AgentSessionHandlesModel;
+
+        if !FeatureFlag::ResumeProjectTasks.is_enabled() {
+            return Vec::new();
+        }
+
+        // `ProjectKey::for_path` can hit repo detection, and a machine with a
+        // few hundred scanned sessions has far fewer distinct directories than
+        // sessions — so resolve each directory once, as `compute_with_handles`
+        // does for the rail.
+        let mut project_name_by_cwd: HashMap<String, String> = HashMap::new();
+        let mut project_name_for_cwd = |cwd: &str| -> String {
+            project_name_by_cwd
+                .entry(cwd.to_owned())
+                .or_insert_with(|| {
+                    ProjectKey::for_path(&LocalOrRemotePath::Local(PathBuf::from(cwd)), ctx)
+                        .map(ProjectId::Key)
+                        .unwrap_or(ProjectId::Other)
+                        .display_name()
+                })
+                .clone()
+        };
+
+        // The scan owns names (a `/rename` lands in the transcript, not in the
+        // cached handle title), so its labels are joined in by session id.
+        let scanned = Self::scanned_sessions(ctx);
+        let scanned_by_id: HashMap<&str, &ScannedSession> = scanned
+            .iter()
+            .map(|session| (session.session_id.as_str(), session))
+            .collect();
+
+        let mut live = Vec::new();
+        for tab in &self.tabs {
+            let pane_group = tab.pane_group.as_ref(ctx);
+            let Some(terminal_view) = pane_group.focused_session_view(ctx) else {
+                continue;
+            };
+            let Some(session) = CLIAgentSessionsModel::as_ref(ctx).session(terminal_view.id())
+            else {
+                continue;
+            };
+            let Some(session_id) = session.session_context.session_id.clone() else {
+                // Still starting up: no id yet means nothing to resume to.
+                continue;
+            };
+            let cwd = pane_group
+                .active_session_path(ctx)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            live.push(AgentSessionCandidate {
+                agent: session.agent,
+                session_id,
+                project_name: project_name_for_cwd(&cwd),
+                // The rail's own label resolution, so a session is called the
+                // same thing in the rail and in the popup.
+                task_name: crate::workspace::tab_title::rail_task_label(pane_group, ctx),
+                cwd,
+                origin: CandidateOrigin::Live,
+                last_active: None,
+            });
+        }
+
+        let handles = AgentSessionHandlesModel::as_ref(ctx)
+            .handles()
+            .iter()
+            .map(|handle| AgentSessionCandidate {
+                agent: handle.agent,
+                session_id: handle.session_id.clone(),
+                project_name: project_name_for_cwd(&handle.cwd),
+                task_name: project_layout::dormant_label(
+                    scanned_by_id
+                        .get(handle.session_id.as_str())
+                        .and_then(|session| session.label.as_deref()),
+                    handle.title.as_deref(),
+                    handle.agent,
+                    &handle.session_id,
+                ),
+                cwd: handle.cwd.clone(),
+                origin: CandidateOrigin::Handle,
+                last_active: Some(handle.last_seen_at.and_utc()),
+            })
+            .collect();
+
+        let scanned = scanned
+            .iter()
+            .map(|session| AgentSessionCandidate {
+                // The scan reads Claude Code's transcript layout, so every
+                // session it produces is a Claude session by construction.
+                agent: CLIAgent::Claude,
+                session_id: session.session_id.clone(),
+                project_name: project_name_for_cwd(&session.cwd),
+                task_name: project_layout::dormant_label(
+                    session.label.as_deref(),
+                    None,
+                    CLIAgent::Claude,
+                    &session.session_id,
+                ),
+                cwd: session.cwd.clone(),
+                origin: CandidateOrigin::Scanned,
+                last_active: Some(DateTime::<Utc>::from(session.modified)),
+            })
+            .collect();
+
+        agent_sessions::candidate::merge(live, handles, scanned)
+    }
+
     fn open_ctrl_tab_palette(
         &mut self,
         query_filter: QueryFilter,
@@ -15430,6 +15658,7 @@ impl Workspace {
     ) {
         self.current_workspace_state.is_palette_open = false;
         self.current_workspace_state.is_ctrl_tab_palette_open = false;
+        self.current_workspace_state.is_session_search_palette_open = false;
         self.tab_bar_pinned_by_popup = false;
         self.sync_window_button_visibility(ctx);
         if focus_active_tab
@@ -15521,6 +15750,8 @@ impl Workspace {
         }
         if matches!(source, PaletteSource::CtrlTab { .. }) {
             self.current_workspace_state.is_ctrl_tab_palette_open = true;
+        } else if matches!(mode, PaletteMode::SessionSearch) {
+            self.current_workspace_state.is_session_search_palette_open = true;
         } else {
             self.current_workspace_state.is_palette_open = true;
         }
@@ -15542,9 +15773,23 @@ impl Workspace {
             PaletteMode::WarpDrive => self.open_warp_drive_palette(ctx),
             PaletteMode::Files => self.open_files_palette(ctx),
             PaletteMode::Conversations => self.open_conversations_palette(ctx),
+            PaletteMode::SessionSearch => self.open_session_search_palette(ctx),
         }
 
-        ctx.focus(&self.palette);
+        // Focus has to follow the palette that is actually rendered. Ctrl+Tab
+        // tolerates focusing the main palette because it takes no typed input,
+        // but the session-search popup is driven entirely by typing: focusing
+        // the wrong instance leaves it on screen swallowing nothing while every
+        // keystroke goes to an off-screen palette.
+        match mode {
+            PaletteMode::SessionSearch => ctx.focus(&self.session_search_palette),
+            PaletteMode::Command
+            | PaletteMode::Navigation
+            | PaletteMode::LaunchConfig
+            | PaletteMode::WarpDrive
+            | PaletteMode::Files
+            | PaletteMode::Conversations => ctx.focus(&self.palette),
+        }
 
         send_telemetry_from_ctx!(TelemetryEvent::PaletteSearchOpened { mode, source }, ctx);
 
@@ -15588,11 +15833,18 @@ impl Workspace {
             .current_workspace_state
             .is_any_non_palette_modal_open(ctx)
         {
-            let is_palette_mode_already_open =
+            // The session-search popup lives in its own palette instance, so
+            // "already open" is its own flag rather than the main palette's
+            // active filter — which never becomes `AgentSessions`.
+            let is_palette_mode_already_open = if matches!(palette_mode, PaletteMode::SessionSearch)
+            {
+                self.current_workspace_state.is_session_search_palette_open
+            } else {
                 self.palette.as_ref(ctx).is_mode_enabled(palette_mode, ctx)
                     && ((matches!(source, PaletteSource::CtrlTab { .. })
                         && self.current_workspace_state.is_ctrl_tab_palette_open)
-                        || self.current_workspace_state.is_palette_open);
+                        || self.current_workspace_state.is_palette_open)
+            };
             if is_palette_mode_already_open {
                 self.close_palette(true, None, ctx);
             } else {
@@ -15898,6 +16150,7 @@ impl Workspace {
     pub fn is_palette_open(&self) -> bool {
         self.current_workspace_state.is_palette_open
             || self.current_workspace_state.is_ctrl_tab_palette_open
+            || self.current_workspace_state.is_session_search_palette_open
     }
 
     pub fn is_workflow_modal_open(&self) -> bool {
@@ -19623,6 +19876,7 @@ impl Workspace {
         // in case it was used to open the theme chooser.
         self.current_workspace_state.is_palette_open = false;
         self.current_workspace_state.is_ctrl_tab_palette_open = false;
+        self.current_workspace_state.is_session_search_palette_open = false;
         self.previous_workspace_state = Some(self.current_workspace_state);
         self.current_workspace_state.is_ai_assistant_panel_open = false;
         self.current_workspace_state.is_theme_chooser_open = true;
@@ -23852,15 +24106,41 @@ impl Workspace {
             ));
         }
 
+        let tab_settings = TabSettings::as_ref(ctx);
+        // The two controls disagree about `rail_show_tasks` on purpose; the
+        // reason lives with the decision, in `rail_header_controls`.
+        let controls = rail_header_controls(
+            FeatureFlag::ResumeProjectTasks.is_enabled(),
+            *tab_settings.rail_show_tasks,
+        );
+
+        if controls.session_search {
+            header_row.add_child(
+                self.render_tab_bar_icon_button(
+                    appearance,
+                    icons::Icon::Search,
+                    &self.mouse_states.rail_session_search_button,
+                    WorkspaceAction::TogglePalette {
+                        mode: PaletteMode::SessionSearch,
+                        source: PaletteSource::RailHeader,
+                    },
+                    "Find a session".to_string(),
+                    keybinding_name_to_display_string(SESSION_SEARCH_BINDING_NAME, ctx),
+                    false,
+                    false,
+                )
+                .finish(),
+            );
+        }
+
         // The shell filter, next to the chips whose counts it explains. Filled
         // funnel while filtering, hollow while not, so the rail says at a
         // glance whether it is showing everything — a rail that quietly hides
         // rows with no visible sign is worse than a noisy one. Hidden along
         // with the task rows themselves: with nothing listed there is nothing
         // to filter.
-        let tab_settings = TabSettings::as_ref(ctx);
         let hide_shells = *tab_settings.rail_hide_shells_without_agents;
-        if *tab_settings.rail_show_tasks {
+        if controls.shell_filter {
             header_row.add_child(
                 self.render_tab_bar_icon_button(
                     appearance,
@@ -29040,6 +29320,13 @@ impl View for Workspace {
 
         if self.current_workspace_state.is_ctrl_tab_palette_open {
             stack.add_child(ChildView::new(&self.ctrl_tab_palette).finish());
+        }
+
+        // An overlay child like the main palette, not a plain child like
+        // ctrl-tab's: the overlay path is what carries the `Dismiss` focus trap
+        // and click-outside-to-close that a typed-into popup needs.
+        if self.current_workspace_state.is_session_search_palette_open {
+            stack.add_overlay_child(ChildView::new(&self.session_search_palette).finish());
         }
 
         if self.current_workspace_state.is_require_login_modal_open {

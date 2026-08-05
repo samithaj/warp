@@ -221,7 +221,10 @@ fn title_text(record: &Value) -> Option<String> {
 /// wrappers (`<command-name>…`, `<local-command-stdout>…`), and the
 /// `Caveat:` preamble it prepends to replayed context. All three are
 /// interstitial — there is always a real prompt after them.
-fn real_user_prompt_text(record: &Value) -> Option<String> {
+/// Visible to the crate because the transcript-content digest behind session
+/// search extracts the same text from the same records: what the user actually
+/// typed, with sidechain replays and injected wrappers already rejected.
+pub(crate) fn real_user_prompt_text(record: &Value) -> Option<String> {
     if record.get("isSidechain").and_then(Value::as_bool) == Some(true) {
         return None;
     }
@@ -235,7 +238,8 @@ fn real_user_prompt_text(record: &Value) -> Option<String> {
 
 /// Extracts prompt text from a `user` record. `message.content` is either a
 /// plain string or an array of content blocks with `text` fields.
-fn user_prompt_text(record: &Value) -> Option<String> {
+/// Visible to the crate for the same reason as [`real_user_prompt_text`].
+pub(crate) fn user_prompt_text(record: &Value) -> Option<String> {
     let content = record.get("message")?.get("content")?;
     match content {
         Value::String(text) => Some(text.clone()),

@@ -287,6 +287,30 @@ pub fn next_chip_target(
         .map(|task| task.tab_index)
 }
 
+/// Which controls the rail header renders beside its chips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RailHeaderControls {
+    /// The magnifier that opens the session-search popup.
+    pub session_search: bool,
+    /// The funnel that hides shells without agents.
+    pub shell_filter: bool,
+}
+
+/// Decides the header's two controls from the only two inputs they depend on.
+///
+/// They deliberately disagree about `show_tasks`, and the asymmetry is the
+/// point: the funnel filters the task rows, so with the rows hidden it has
+/// nothing to filter and disappears with them — while session search reaches
+/// sessions that have **no row at all** (the rail caps its dormant rows, and a
+/// project with no open tab may not be listed), so hiding rows makes it more
+/// useful, not less.
+pub fn rail_header_controls(session_search_enabled: bool, show_tasks: bool) -> RailHeaderControls {
+    RailHeaderControls {
+        session_search: session_search_enabled,
+        shell_filter: show_tasks,
+    }
+}
+
 #[cfg(test)]
 #[path = "rail_triage_tests.rs"]
 mod tests;

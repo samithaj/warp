@@ -359,3 +359,41 @@ fn rail_triage_chip_with_no_targets_has_nowhere_to_jump() {
         None
     );
 }
+
+#[test]
+fn rail_header_session_search_survives_hiding_the_task_rows() {
+    // The regression this guards: "the funnel is inside `rail_show_tasks`, so
+    // the magnifier should be too". It must not be — with the rows hidden,
+    // search is the only way left to reach a session.
+    let hidden = rail_header_controls(
+        true,  /* session_search_enabled */
+        false, /* show_tasks */
+    );
+    assert!(hidden.session_search, "search must outlive the task rows");
+    assert!(
+        !hidden.shell_filter,
+        "the funnel has nothing left to filter"
+    );
+
+    let shown = rail_header_controls(
+        true, /* session_search_enabled */
+        true, /* show_tasks */
+    );
+    assert!(shown.session_search);
+    assert!(shown.shell_filter);
+}
+
+#[test]
+fn rail_header_session_search_is_gone_when_the_feature_is_off() {
+    // `resume_dormant_agent_task` returns early on the same flag, so an
+    // ungated magnifier would open a popup whose every row does nothing.
+    let controls = rail_header_controls(
+        false, /* session_search_enabled */
+        true,  /* show_tasks */
+    );
+    assert!(!controls.session_search);
+    assert!(
+        controls.shell_filter,
+        "the funnel is not gated on that flag"
+    );
+}
