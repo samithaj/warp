@@ -341,8 +341,9 @@ use crate::server::server_api::{ServerApi, ServerApiProvider, ServerTime};
 use crate::server::telemetry::{
     AddTabWithShellSource, AnonymousUserSignupEntrypoint, CloseTarget, EnvVarTelemetryMetadata,
     FileTreeSource, KnowledgePaneEntrypoint, LaunchConfigUiLocation,
-    MCPServerCollectionPaneEntrypoint, NotificationsTurnedOnSource, OpenedWarpAISource,
-    PaletteSource, SharingDialogSource, TabRenameEvent, TierLimitHitEvent, WarpDriveSource,
+    MCPServerCollectionPaneEntrypoint, NotificationAgentVariant, NotificationsTurnedOnSource,
+    OpenedWarpAISource, PaletteSource, SharingDialogSource, TabRenameEvent, TierLimitHitEvent,
+    WarpDriveSource,
 };
 use crate::session_management::{SessionNavigationData, SessionSource, TabNavigationData};
 use crate::settings::cloud_preferences::CloudPreferencesSettings;
@@ -394,7 +395,7 @@ use crate::terminal::cli_agent_sessions::session_scan::{
     self, ClaudeSessionScanModel, ScannedSession,
 };
 use crate::terminal::cli_agent_sessions::{
-    CLIAgentSession, CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
+    CLIAgentSession, CLIAgentSessionStatus, CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
 };
 use crate::terminal::enable_auto_reload_modal::{
     EnableAutoReloadModal, EnableAutoReloadModalEvent,
@@ -436,12 +437,14 @@ use crate::terminal::view::load_ai_conversation::{
 };
 use crate::terminal::view::ssh_file_upload::FileUploadId;
 use crate::terminal::view::{
-    AgentOnboardingVersion, ConversationRestorationInNewPaneType, LeftPanelTargetView,
-    NOTIFICATIONS_TROUBLESHOOT_URL, OnboardingIntention, OnboardingVersion, SyncEvent,
-    SyncInputType, TerminalAction,
+    AgentOnboardingVersion, BlockNotification, ConversationRestorationInNewPaneType,
+    LeftPanelTargetView, NOTIFICATIONS_TROUBLESHOOT_URL, NotificationsTrigger, OnboardingIntention,
+    OnboardingVersion, SyncEvent, SyncInputType, TerminalAction,
 };
 use crate::terminal::warpify::settings::WarpifySettings;
-use crate::terminal::{self, BlockListSettings, CLIAgent, SizeInfo, TerminalModel, TerminalView};
+use crate::terminal::{
+    self, AudibleBell, BlockListSettings, CLIAgent, SizeInfo, TerminalModel, TerminalView,
+};
 use crate::themes::theme::{AnsiColorIdentifier, RespectSystemTheme, ThemeKind};
 use crate::themes::theme_chooser::{ThemeChooser, ThemeChooserEvent, ThemeChooserMode};
 use crate::themes::theme_creator_modal::{ThemeCreatorModal, ThemeCreatorModalEvent};
@@ -507,6 +510,7 @@ use crate::workspace::cross_window_tab_drag::{
 };
 use crate::workspace::header_toolbar_editor::{HeaderToolbarEditorEvent, HeaderToolbarEditorModal};
 use crate::workspace::header_toolbar_item::HeaderToolbarItemKind;
+use crate::workspace::nag_engine::{BlockedTask, NagEngine, NagOutcome, NagSummary};
 use crate::workspace::one_time_modal_model::OneTimeModalModel;
 use crate::workspace::project_key::ProjectKey;
 use crate::workspace::project_layout::{self, ProjectId, ProjectLayout};
@@ -1129,6 +1133,23 @@ pub struct Workspace {
     /// repaint would be waste. Dropping the workspace drops the handle and
     /// cancels the spawn with it.
     rail_wait_age_refresh: Option<AbortHandle>,
+    /// Repeats the "an agent is waiting on you" announcement until the wait
+    /// actually ends (spec §6). Rules live in [`NagEngine`]; this field is the
+    /// per-window state they run on.
+    ///
+    /// A workspace rather than the singleton `CLIAgentSessionsModel`, because
+    /// every input and every output is window-shaped: only a `ViewContext` can
+    /// send a desktop notification, "the user is looking at it" means *this*
+    /// window's active tab, and the project rank a task's cadence depends on
+    /// comes from the tab→project projection the workspace already computes.
+    /// A singleton would have to pick a window to speak through and would
+    /// coalesce waiters the user sees on different screens into one banner.
+    nag_engine: NagEngine,
+    /// Timer driving [`Self::nag_engine`], a sibling of
+    /// [`Self::rail_wait_age_refresh`] with the same lifecycle: armed while
+    /// something is blocked, self-rescheduling at the interval the engine asks
+    /// for, aborted the moment the engine goes idle.
+    nag_poll: Option<AbortHandle>,
     /// Scroll position of the project rail. Held here rather than rebuilt each
     /// render so the scroll offset survives repaints.
     project_rail_scroll_state: ClippedScrollStateHandle,
@@ -3512,6 +3533,8 @@ impl Workspace {
             rail_dormant_mouse_states: RefCell::default(),
             rail_chip_mouse_states: RefCell::default(),
             rail_wait_age_refresh: None,
+            nag_engine: NagEngine::default(),
+            nag_poll: None,
             project_rail_scroll_state: ClippedScrollStateHandle::new(),
             project_rail_resizable_state: resizable_state_handle(RAIL_DEFAULT_WIDTH),
             tab_rename_editor: Self::tab_rename_editor(ctx),
@@ -3858,6 +3881,10 @@ impl Workspace {
         // Status changes are the only thing that can start or end a wait, so
         // this is the one place the refresh timer needs re-evaluating.
         self.sync_rail_wait_age_refresh(ctx);
+        // A wait starting or ending is also the one thing the nag engine must
+        // never learn about late: an agent that just unblocked has to stop
+        // nagging now, not at the next tick.
+        self.poll_nag_engine(ctx);
     }
 
     /// Arms or disarms the rail's wait-age refresh to match reality.
@@ -3899,6 +3926,265 @@ impl Workspace {
         self.rail_wait_age_refresh = Some(handle.abort_handle());
     }
 
+    /// Whether the nag engine may speak at all.
+    ///
+    /// Three existing gates, no new setting (spec §6): the project layout,
+    /// because rank — which decides both the debounce and the cadence — only
+    /// exists there and a user who never opted into the rail must not start
+    /// getting repeat banners; `NotificationsMode::Enabled`, because the
+    /// `Unset` case is the discovery banner the one-shot path still owns; and
+    /// `is_needs_attention_enabled`, which is the user's existing "stop telling
+    /// me an agent is blocked" switch and therefore the engine's off switch.
+    fn nag_engine_enabled(ctx: &AppContext) -> bool {
+        let notifications = &SessionSettings::as_ref(ctx).notifications;
+        project_layout_active(ctx)
+            && matches!(notifications.mode, NotificationsMode::Enabled)
+            && notifications.is_needs_attention_enabled
+    }
+
+    /// Every agent in this window that is currently waiting on the user, as the
+    /// nag engine sees it.
+    ///
+    /// Read fresh on every poll rather than remembered, so a project that gains
+    /// a rank, or a tab the user switches to, takes effect immediately.
+    ///
+    /// Every *visible pane*, not just each tab's focused one as the rail's row
+    /// triage does. The rail can settle for one row per tab because a row is a
+    /// label; a notification cannot, because the one-shot `NeedsAttention`
+    /// notification is now suppressed in favour of this engine, and a blocked
+    /// agent in the other half of a split would otherwise be announced by
+    /// nobody. The trust gate is shared with the rail
+    /// ([`Self::is_rich_cli_session`]), so the two can never disagree about
+    /// whose `Blocked` is believable.
+    ///
+    /// `window_is_frontmost` is passed in rather than read here because it
+    /// belongs to the window, not to any tab, and the same answer decides both
+    /// what counts as "in view" and whether an announcement may raise a banner.
+    fn blocked_nag_tasks(&self, window_is_frontmost: bool, ctx: &AppContext) -> Vec<BlockedTask> {
+        // Polls are driven by session events, which arrive on every agent turn
+        // in every window, so the overwhelmingly common answer is "nobody is
+        // waiting". One hash-map scan settles that before any per-tab work or
+        // the priority-list clone.
+        let sessions = CLIAgentSessionsModel::as_ref(ctx);
+        if !sessions.any_blocked() {
+            return Vec::new();
+        }
+        let priorities = TabSettings::as_ref(ctx).project_priorities.value().clone();
+        let mut tasks = Vec::new();
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let pane_group = tab.pane_group.as_ref(ctx);
+            // `terminal_views` rather than `visible_terminal_views`: an
+            // off-tree child-agent pane can block on a permission prompt too,
+            // and since its one-shot notification is now suppressed, leaving it
+            // out here would mean nobody announces it at all.
+            let waiting: Vec<EntityId> = pane_group
+                .terminal_views(ctx)
+                .into_iter()
+                .map(|terminal_view| terminal_view.as_ref(ctx).id())
+                .filter(|terminal_view_id| {
+                    sessions.session(*terminal_view_id).is_some_and(|session| {
+                        Self::is_rich_cli_session(session)
+                            && matches!(session.status, CLIAgentSessionStatus::Blocked { .. })
+                    })
+                })
+                .collect();
+            if waiting.is_empty() {
+                continue;
+            }
+            // Resolved once per waiting tab rather than per pane: project
+            // detection walks the filesystem's repo cache, and every pane in a
+            // tab shares the tab's project anyway.
+            let project = ProjectLayout::project_of_tab_data(tab, ctx);
+            let ranked = priorities.contains(&project);
+            let label = project.display_name();
+            // "Seen" needs the pane to actually be on screen, so being in the
+            // active tab of a frontmost window is necessary but not sufficient
+            // — a pane the layout tree does not draw is not being looked at
+            // however active its tab is.
+            let on_screen: Vec<EntityId> = if window_is_frontmost && index == self.active_tab_index
+            {
+                pane_group
+                    .visible_terminal_views(ctx)
+                    .into_iter()
+                    .map(|terminal_view| terminal_view.as_ref(ctx).id())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            tasks.extend(waiting.into_iter().map(|id| BlockedTask {
+                id,
+                ranked,
+                project: label.clone(),
+                in_view: on_screen.contains(&id),
+            }));
+        }
+        tasks
+    }
+
+    /// One pass of the nag engine: observe, decide, announce, re-arm the timer.
+    ///
+    /// Safe to call from anywhere something the engine reads might have
+    /// changed — a status event, a tab switch, its own tick. Polling is cheap
+    /// and idempotent; the engine's own deadlines decide whether anything is
+    /// actually said.
+    fn poll_nag_engine(&mut self, ctx: &mut ViewContext<Self>) {
+        if !Self::nag_engine_enabled(ctx) {
+            // Switched off underneath us. Forget the cycle rather than freeze
+            // it, so re-enabling starts fresh instead of firing a nag whose
+            // deadline was computed while nobody was watching.
+            self.nag_engine.reset();
+            self.cancel_nag_poll();
+            return;
+        }
+
+        // Read once and used twice: an agent waiting in the active tab of a
+        // window nobody is looking at has not been seen, and a banner over a
+        // window nobody is looking at is not noise.
+        let window_is_frontmost = Some(ctx.window_id()) == ctx.windows().active_window();
+        let blocked = self.blocked_nag_tasks(window_is_frontmost, ctx);
+        let outcome = self.nag_engine.poll(&blocked, instant::Instant::now());
+        Self::announce_nag(&outcome, window_is_frontmost, ctx);
+
+        self.cancel_nag_poll();
+        if let Some(delay) = outcome.next_poll {
+            self.schedule_nag_poll(delay, ctx);
+        }
+    }
+
+    /// Aborts the pending nag tick, if any.
+    fn cancel_nag_poll(&mut self) {
+        if let Some(handle) = self.nag_poll.take() {
+            handle.abort();
+        }
+    }
+
+    /// Schedules the next nag tick.
+    ///
+    /// Self-rescheduling `Timer::after` + `AbortHandle` like
+    /// [`Self::schedule_rail_wait_age_refresh`], but at the interval the engine
+    /// asks for rather than a fixed one: the next interesting moment is a
+    /// debounce expiring, a cadence coming due or an acknowledgement grace
+    /// running out, and those are minutes apart.
+    fn schedule_nag_poll(&mut self, delay: Duration, ctx: &mut ViewContext<Self>) {
+        let handle = ctx.spawn(async move { Timer::after(delay).await }, |me, _, ctx| {
+            // The tick is spent whatever happens next; clearing it first is
+            // what lets the poll arm the following one.
+            me.nag_poll = None;
+            me.poll_nag_engine(ctx);
+        });
+        self.nag_poll = Some(handle.abort_handle());
+    }
+
+    /// Delivers one poll's announcement: an OS banner, a bare sound, or
+    /// nothing at all.
+    ///
+    /// The two paths are disjoint by construction (spec §8): a banner only when
+    /// this window is *not* frontmost, a sound-without-banner only when it is.
+    /// They can therefore never double up on the same announcement.
+    fn announce_nag(outcome: &NagOutcome, window_is_frontmost: bool, ctx: &mut ViewContext<Self>) {
+        let Some(&announced) = outcome.announced.first() else {
+            return;
+        };
+        let notifications = SessionSettings::as_ref(ctx).notifications.value().clone();
+
+        // Suppressing the banner while Warp is frontmost is the existing rule
+        // (`TerminalView::is_navigated_away_from_window`) and it stays: an OS
+        // banner over the window the user is already in is noise. The *sound*
+        // is deliberately not suppressed with it (spec §6). The announced set
+        // never contains a task the user is looking at — the engine
+        // acknowledges those — so a sound here always means "something you
+        // cannot see is waiting", which is the case of being deep in project A
+        // while B blocks.
+        if window_is_frontmost {
+            if notifications.play_notification_sound
+                && let Err(error) = AudibleBell::as_ref(ctx).ring()
+            {
+                log::warn!("Unable to ring the waiting-agent bell: {error:#}");
+            }
+            return;
+        }
+
+        let (content, agent_variant) = match &outcome.summary {
+            // Several waiters: one banner naming the projects, never one
+            // banner each. No single agent to attribute it to either.
+            Some(NagSummary { title, body }) => (
+                BlockNotification {
+                    title: title.clone(),
+                    body: body.clone(),
+                },
+                None,
+            ),
+            // A single waiter has better copy available than any summary: the
+            // agent's own question, formatted exactly as the one-shot
+            // `NeedsAttention` notification formats it.
+            None => {
+                let sessions = CLIAgentSessionsModel::as_ref(ctx);
+                let Some(session) = sessions.session(announced) else {
+                    return;
+                };
+                let context = &session.session_context;
+                let title = context
+                    .query
+                    .as_deref()
+                    .filter(|query| !query.is_empty())
+                    .or(context.summary.as_deref().filter(|s| !s.is_empty()))
+                    .unwrap_or(session.agent.command_prefix())
+                    .to_owned();
+                let description = match &session.status {
+                    CLIAgentSessionStatus::Blocked { message } => {
+                        message.clone().unwrap_or_default()
+                    }
+                    // Unreachable: the engine is only ever handed blocked
+                    // tasks. Falling back to an empty body beats a panic on a
+                    // notification path.
+                    CLIAgentSessionStatus::InProgress
+                    | CLIAgentSessionStatus::Success
+                    | CLIAgentSessionStatus::Failed { .. } => String::new(),
+                };
+                (
+                    NotificationsTrigger::NeedsAttention
+                        .create_notification_content(title, description),
+                    Some(NotificationAgentVariant::CLIAgent(session.agent.into())),
+                )
+            }
+        };
+
+        ctx.send_desktop_notification(
+            UserNotification::new_with_sound(
+                content.title,
+                content.body,
+                // No click target: a coalesced banner speaks for several panes
+                // and has no single one to focus. Routing a lone waiter's
+                // click would need the `PaneId` this path never resolves, and
+                // the rail's waiting chip already jumps to the next blocked
+                // task in one click.
+                None,
+                notifications.play_notification_sound,
+            ),
+            |_, notification_error, ctx| {
+                if let NotificationSendError::Other { error_message } = &notification_error {
+                    report_error!(
+                        "Unknown error when sending a waiting-agent notification",
+                        extra: { "error_message" => %error_message }
+                    );
+                }
+                send_telemetry_from_ctx!(
+                    TelemetryEvent::NotificationFailedToSend {
+                        error: notification_error,
+                    },
+                    ctx
+                );
+            },
+        );
+        send_telemetry_from_ctx!(
+            TelemetryEvent::NotificationSent {
+                trigger: NotificationsTrigger::NeedsAttention,
+                agent_variant,
+            },
+            ctx
+        );
+    }
+
     /// Handle session settings changes.
     fn handle_session_settings_event(
         &mut self,
@@ -3919,6 +4205,11 @@ impl Workspace {
         // When Notifications settings change, request system notification permissions if needed.
         if let SessionSettingsChangedEvent::Notifications { .. } = event {
             self.request_notification_permissions_if_needed(ctx);
+            // The notification settings are the nag engine's on/off switch, and
+            // an agent may already be waiting when they are flipped — without
+            // this, turning notifications back on would stay silent until the
+            // next status event, which for a stuck agent may never come.
+            self.poll_nag_engine(ctx);
         }
     }
 
@@ -5922,6 +6213,11 @@ impl Workspace {
             // model's own per-directory interval keeps repeated tab switches
             // from re-reading anything.
             self.refresh_claude_session_scan(ctx);
+            // Switching to a waiting agent's tab is how the user acknowledges
+            // it, and the nag has to fall silent *now* rather than at the next
+            // tick — otherwise the banner they just walked over to answer
+            // arrives anyway. Switching away re-arms it, on the engine's grace.
+            self.poll_nag_engine(ctx);
         }
         if self.vertical_tabs_panel_open && vertical_tabs_layout_active(ctx) {
             self.vertical_tabs_panel.scroll_to_tab(index);
@@ -23325,7 +23621,17 @@ impl Workspace {
         let terminal_view_id = terminal_view.as_ref(ctx).id();
         CLIAgentSessionsModel::as_ref(ctx)
             .session(terminal_view_id)
-            .filter(|session| session.listener.is_some() && session.supports_rich_status())
+            .filter(|session| Self::is_rich_cli_session(session))
+    }
+
+    /// Whether a session's own protocol status can be believed.
+    ///
+    /// Extracted so the pane-level consumers (the nag engine, which looks at
+    /// every visible pane) apply exactly the gate the tab-level ones do — a
+    /// session that cannot really know it is blocked must neither tint a row
+    /// nor ring a bell.
+    fn is_rich_cli_session(session: &CLIAgentSession) -> bool {
+        session.listener.is_some() && session.supports_rich_status()
     }
 
     /// Everything the rail's triage needs from one tab: the status its badge
