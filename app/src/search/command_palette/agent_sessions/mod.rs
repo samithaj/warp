@@ -10,10 +10,13 @@
 //! two would be a standing invitation to wire one to the other.
 
 pub mod candidate;
+pub mod content_data_source;
+pub mod content_search_item;
 pub mod data_source;
 pub mod search;
 pub mod search_item;
 pub mod tiers;
 
 pub use candidate::{AgentSessionCandidate, CandidateOrigin};
+pub use content_data_source::ContentDataSource;
 pub use data_source::DataSource;

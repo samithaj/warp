@@ -21,6 +21,7 @@ use crate::search::files::model::FileSearchModel;
 use crate::search::mixer::AddAsyncSourceOptions;
 use crate::session_management::SessionSource;
 use crate::settings::AISettings;
+use crate::terminal::cli_agent_sessions::transcript_digest::ContentHit;
 
 /// Store of all of the [`crate::search::DataSource`]s for the command palette.
 pub struct DataSourceStore {
@@ -33,6 +34,10 @@ pub struct DataSourceStore {
     repo_data_source: ModelHandle<RepoDataSource>,
     tabs_data_source: Option<ModelHandle<tabs::DataSource>>,
     agent_sessions_data_source: Option<ModelHandle<agent_sessions::DataSource>>,
+    /// Transcript-content hits for the session-search popup. Separate from the
+    /// name source above because the two answer different questions and are
+    /// filled at different times: names on open, content when a search lands.
+    agent_session_content_data_source: Option<ModelHandle<agent_sessions::ContentDataSource>>,
 }
 
 impl DataSourceStore {
@@ -70,6 +75,7 @@ impl DataSourceStore {
             repo_data_source,
             tabs_data_source: None,
             agent_sessions_data_source: None,
+            agent_session_content_data_source: None,
         }
     }
 
@@ -183,13 +189,16 @@ impl DataSourceStore {
         }
     }
 
-    /// Resets the [`CommandPaletteMixer`] to the single source relevant for the
-    /// session-search popup: the CLI-agent sessions assembled when it opened.
+    /// Resets the [`CommandPaletteMixer`] to the two sources relevant for the
+    /// session-search popup: the CLI-agent sessions assembled when it opened,
+    /// and whatever the transcript digest has published for the current query.
     ///
-    /// Kept to one synchronous source on purpose. An async source would withhold
-    /// these instant, in-memory results for up to the mixer's initial-results
-    /// timeout while the palette still shows the previous query's rows, and
-    /// would block Enter while loading.
+    /// Both are synchronous, on purpose. An async source would withhold these
+    /// instant, in-memory results for up to the mixer's initial-results timeout
+    /// while the palette still shows the previous query's rows, and would block
+    /// Enter while loading. The content source is fed from the outside instead
+    /// (see [`Self::set_agent_session_content_results`]), so the expensive part
+    /// of content search never happens on a keystroke.
     pub fn reset_session_search_mixer(
         &mut self,
         mixer: ModelHandle<CommandPaletteMixer>,
@@ -200,18 +209,49 @@ impl DataSourceStore {
             self.agent_sessions_data_source =
                 Some(ctx.add_model(|_| agent_sessions::DataSource::new()));
         }
+        if self.agent_session_content_data_source.is_none() {
+            self.agent_session_content_data_source =
+                Some(ctx.add_model(|_| agent_sessions::ContentDataSource::new()));
+        }
 
-        if let Some(agent_sessions_data_source) = &self.agent_sessions_data_source {
+        if let (Some(agent_sessions_data_source), Some(content_data_source)) = (
+            &self.agent_sessions_data_source,
+            &self.agent_session_content_data_source,
+        ) {
             agent_sessions_data_source.update(ctx, |source, _| source.set_candidates(candidates));
+            // A fresh popup must not flash the previous one's content hits:
+            // they were found in a corpus that has just been replaced.
+            content_data_source.update(ctx, |source, _| source.clear());
             mixer.update(ctx, |mixer, ctx| {
                 mixer.reset(ctx);
                 mixer.add_sync_source(
                     agent_sessions_data_source.clone(),
                     HashSet::from([QueryFilter::AgentSessions]),
                 );
+                mixer.add_sync_source(
+                    content_data_source.clone(),
+                    HashSet::from([QueryFilter::AgentSessions]),
+                );
                 ctx.notify();
             });
         }
+    }
+
+    /// Publishes the transcript-content hits the digest found for `query`.
+    ///
+    /// Push rather than pull: the source is queried on every keystroke and must
+    /// stay a pure function of what it holds, so the results land here once,
+    /// when a search finishes.
+    pub fn set_agent_session_content_results(
+        &mut self,
+        query: String,
+        hits: Vec<ContentHit>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(content_data_source) = &self.agent_session_content_data_source else {
+            return;
+        };
+        content_data_source.update(ctx, |source, _| source.set_results(query, hits));
     }
 
     /// Restores the [`CommandPaletteMixer`] to the sessions-only source for Ctrl+Tab,

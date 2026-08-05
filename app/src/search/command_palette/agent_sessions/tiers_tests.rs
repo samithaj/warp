@@ -1,14 +1,22 @@
 use ordered_float::OrderedFloat;
 use warpui::elements::Empty;
-use warpui::{AppContext, Element};
+use warpui::{App, AppContext, Element};
 
 use super::*;
 use crate::appearance::Appearance;
 use crate::search::SearchItem;
+use crate::search::command_palette::agent_sessions::candidate::{
+    AgentSessionCandidate, CandidateOrigin,
+};
+use crate::search::command_palette::agent_sessions::content_data_source::ContentDataSource;
+use crate::search::command_palette::agent_sessions::data_source::DataSource;
 use crate::search::command_palette::mixer::CommandPaletteItemAction;
 use crate::search::command_palette::separator_search_item::SeparatorSearchItem;
-use crate::search::data_source::QueryResult;
+use crate::search::data_source::{Query, QueryResult};
+use crate::search::mixer::SyncDataSource;
 use crate::search::result_renderer::ItemHighlightState;
+use crate::terminal::CLIAgent;
+use crate::terminal::cli_agent_sessions::transcript_digest::ContentHit;
 
 /// A stand-in row for whichever tier a test needs one in — including the
 /// content tier, which Phase 1 has no producer for yet. Ordering has to be
@@ -111,6 +119,91 @@ fn sections_render_names_above_content_with_each_header_above_its_rows() {
         "higher tier must render higher: swapping any two tier constants \
          inverts this silently, with no compile error"
     );
+}
+
+/// The name source, holding candidates whose task names match `query`.
+fn name_source(task_names: &[&str]) -> DataSource {
+    let mut source = DataSource::new();
+    source.set_candidates(
+        task_names
+            .iter()
+            .map(|task_name| AgentSessionCandidate {
+                agent: CLIAgent::Claude,
+                session_id: format!("session-{task_name}"),
+                project_name: "warp".to_owned(),
+                task_name: (*task_name).to_owned(),
+                cwd: "/repos/warp".to_owned(),
+                origin: CandidateOrigin::Handle,
+                last_active: None,
+            })
+            .collect(),
+    );
+    source
+}
+
+/// The content source, holding hits the digest published for `query`.
+fn content_source(query: &str, task_names: &[&str]) -> ContentDataSource {
+    let mut source = ContentDataSource::new();
+    source.set_results(
+        query.to_owned(),
+        task_names
+            .iter()
+            .map(|task_name| ContentHit {
+                agent: CLIAgent::Claude,
+                session_id: format!("content-{task_name}"),
+                project_name: "warp".to_owned(),
+                task_name: (*task_name).to_owned(),
+                cwd: "/repos/warp".to_owned(),
+                snippet: format!("…mentions {query} somewhere in {task_name}…"),
+                snippet_match_indices: Vec::new(),
+                partial: false,
+            })
+            .collect(),
+    );
+    source
+}
+
+#[test]
+fn the_two_real_sources_render_as_names_then_content() {
+    App::test((), |app| async move {
+        // The same assertion as the stand-in test above, but on the rows the
+        // popup actually emits: nothing about the ordering may depend on which
+        // types produced the results.
+        let query = "rail";
+        let names = name_source(&["Rail search popup", "Rail triage rewrite"]);
+        let content = content_source(query, &["Deadlock in the mixer", "Two-line tab titles"]);
+
+        let (name_results, content_results) = app.read(|app| {
+            (
+                names.run_query(&Query::from(query), app).unwrap(),
+                content.run_query(&Query::from(query), app).unwrap(),
+            )
+        });
+
+        let names_only = rendered_labels(name_results.clone());
+        let mixed = rendered_labels([name_results, content_results].concat());
+
+        let agent = CLIAgent::Claude.display_name();
+        assert_eq!(
+            mixed,
+            vec![
+                format!("Section: {NAME_SEPARATOR_TITLE}"),
+                format!("{agent} session: Rail search popup"),
+                format!("{agent} session: Rail triage rewrite"),
+                format!("Section: {CONTENT_SEPARATOR_TITLE}"),
+                format!("{agent} session with matching text: Deadlock in the mixer"),
+                format!("{agent} session with matching text: Two-line tab titles"),
+            ],
+            "content appends below the names under its own header, and never \
+             interleaves with them"
+        );
+        assert_eq!(
+            mixed[..names_only.len()],
+            names_only[..],
+            "the promise of the popup: appending content must not reorder, \
+             rename or drop a single name row"
+        );
+    })
 }
 
 #[test]
