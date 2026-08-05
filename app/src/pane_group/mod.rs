@@ -1198,6 +1198,13 @@ impl PaneGroup {
         sync_event: &SyncEvent,
         ctx: &mut ViewContext<Self>,
     ) {
+        // Synchronized input is explicitly opt-in: the user turned syncing on
+        // for these panes and expects their keystrokes to land in all of them,
+        // so a deferred pane starts rather than silently dropping the input.
+        // (Contrast the settings broadcast in
+        // `send_prompt_change_bindkey_to_all_sessions`, which must NOT start
+        // panes — one setting change would otherwise spawn every shell.)
+        self.ensure_session_started(terminal_pane_id.into(), ctx);
         if let Some(pane_view) = self.terminal_view_from_pane_id(terminal_pane_id, ctx) {
             pane_view.update(ctx, |terminal_view, ctx| {
                 terminal_view.receive_sync_input_event(sync_event, ctx);
@@ -1381,6 +1388,7 @@ impl PaneGroup {
                         model_event_sender.clone(),
                         chosen_shell,
                         None,
+                        false,
                         ctx,
                     ),
                 };
@@ -1687,6 +1695,10 @@ impl PaneGroup {
                     model_event_sender.clone(),
                     chosen_shell,
                     terminal_snapshot.input_config,
+                    // Restoring a window full of tabs would otherwise fork a
+                    // shell per tab up front, for tabs that are mostly never
+                    // opened. The shell starts when the tab does.
+                    FeatureFlag::LazyShellStartup.is_enabled(),
                     ctx,
                 );
 
@@ -3372,6 +3384,7 @@ impl PaneGroup {
             model_event_sender.clone(),
             options.shell,
             None,
+            false,
             ctx,
         );
 
@@ -6024,6 +6037,9 @@ impl PaneGroup {
         model_event_sender: Option<SyncSender<ModelEvent>>,
         chosen_shell: Option<AvailableShell>,
         initial_input_config: Option<InputConfig>,
+        // Restored panes build their surface and blocks but hold the shell
+        // back until the tab is opened; see `ensure_shell_started`.
+        defer_shell_start: bool,
         ctx: &mut ViewContext<Self>,
     ) -> (
         ViewHandle<TerminalView>,
@@ -6075,6 +6091,7 @@ impl PaneGroup {
                     initial_size,
                     model_event_sender,
                     chosen_shell,
+                    defer_shell_start,
                     ctx,
                     |surface_init, ctx| {
                         create_terminal_view_surface(
@@ -6447,8 +6464,9 @@ impl PaneGroup {
                 .clone(),
             view_bounds.size(),
             self.model_event_sender.clone(),
-            None, // chosen_shell
-            None, // initial_input_config
+            None,  // chosen_shell
+            None,  // initial_input_config
+            false, // the user just asked for this session
             ctx,
         );
 
@@ -6570,6 +6588,7 @@ impl PaneGroup {
             self.model_event_sender.clone(),
             chosen_shell,
             None,
+            false,
             ctx,
         );
 
@@ -7550,6 +7569,11 @@ impl PaneGroup {
             focus_state.set_focused_pane(id, ctx);
         });
 
+        // The user moved focus to this pane, so if its shell was deferred at
+        // restore, this is when it starts. Cheap and idempotent for every
+        // other pane.
+        self.ensure_session_started(id, ctx);
+
         ctx.emit(Event::PaneTitleUpdated);
         // Update the active session if the newly focused pane is a terminal pane.
         if let Some(terminal_pane_id) = id.as_terminal_pane_id() {
@@ -7592,6 +7616,28 @@ impl PaneGroup {
         }
         focused
     }
+    /// Starts `pane_id`'s shell if it was deferred at restore.
+    ///
+    /// No-op for a pane that was never deferred, for one already started, and
+    /// for panes with no local shell of their own.
+    pub(crate) fn ensure_session_started(&self, pane_id: PaneId, ctx: &mut ViewContext<Self>) {
+        let manager = self
+            .downcast_pane_by_id::<TerminalPane>(pane_id)
+            .map(|session| session.terminal_manager(ctx));
+        if let Some(manager) = manager {
+            manager.update(ctx, |manager, ctx| manager.ensure_shell_started(ctx));
+        }
+    }
+
+    /// Starts the shell of whichever pane currently holds focus in this group.
+    ///
+    /// This is the tab-level entry point: activating a tab focuses it, and the
+    /// pane that ends up focused is the one the user is looking at. Split panes
+    /// they have not touched stay deferred until clicked.
+    pub(crate) fn ensure_focused_session_started(&self, ctx: &mut ViewContext<Self>) {
+        self.ensure_session_started(self.focused_pane_id(ctx), ctx);
+    }
+
     fn focus_pane_and_record_in_history(
         &mut self,
         id: PaneId,

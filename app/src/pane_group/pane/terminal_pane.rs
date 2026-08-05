@@ -618,6 +618,12 @@ impl PaneContent for TerminalPane {
     }
 
     fn focus(&self, ctx: &mut ViewContext<PaneGroup>) {
+        // Deliberately does NOT start a deferred shell. `PaneGroup::new_internal`
+        // focuses every pane group as it is constructed (behind
+        // `DragTabsToWindows`, a release flag), so a start here fires once per
+        // restored tab and defeats deferral entirely -- measured: 46 of 48 tabs
+        // spawned. The start belongs on the paths that mean a *user* opened
+        // something: `Workspace::focus_active_tab` and `PaneGroup::focus_pane`.
         self.terminal_view(ctx)
             .update(ctx, |view, ctx| view.redetermine_global_focus(ctx));
     }
