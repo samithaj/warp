@@ -72,11 +72,11 @@ use crate::workspace::view::{
     LEFT_PANEL_AGENT_CONVERSATIONS_BINDING_NAME, LEFT_PANEL_GLOBAL_SEARCH_BINDING_NAME,
     LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME, LEFT_PANEL_WARP_DRIVE_BINDING_NAME,
     NEW_AGENT_TAB_BINDING_NAME, NEW_AMBIENT_AGENT_TAB_BINDING_NAME, NEW_FILE_BINDING_NAME,
-    NEW_TAB_BINDING_NAME, NEW_TERMINAL_TAB_BINDING_NAME, OPEN_GLOBAL_SEARCH_BINDING_NAME,
-    TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME, TOGGLE_NOTIFICATION_MAILBOX_BINDING_NAME,
-    TOGGLE_PROJECT_EXPLORER_BINDING_NAME, TOGGLE_RIGHT_PANEL_BINDING_NAME,
-    TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME, TOGGLE_VERTICAL_TABS_PANEL_BINDING_NAME,
-    TOGGLE_WARP_DRIVE_BINDING_NAME,
+    NEW_PROJECT_BINDING_NAME, NEW_TAB_BINDING_NAME, NEW_TERMINAL_TAB_BINDING_NAME,
+    OPEN_GLOBAL_SEARCH_BINDING_NAME, TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME,
+    TOGGLE_NOTIFICATION_MAILBOX_BINDING_NAME, TOGGLE_PROJECT_EXPLORER_BINDING_NAME,
+    TOGGLE_RIGHT_PANEL_BINDING_NAME, TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME,
+    TOGGLE_VERTICAL_TABS_PANEL_BINDING_NAME, TOGGLE_WARP_DRIVE_BINDING_NAME,
 };
 
 pub fn init(app: &mut AppContext) {
@@ -716,6 +716,35 @@ pub fn init(app: &mut AppContext) {
         )
         .with_context_predicate(id!("Workspace") & !id!("Workspace_PaneDragging"))
         .with_custom_action(CustomAction::NewTab)
+        .with_enabled(|| ContextFlag::CreateNewSession.is_enabled()),
+        // Reuses `OpenRepository` rather than a new action: it already does
+        // everything starting a project needs (folder picker, project-model
+        // upsert, and opening a tab there), which is also what the rail
+        // header's "+" button dispatches. `cmd-shift-N`/`alt-shift-N` are
+        // taken by `project_buttons:create_new_project`, so this defaults to
+        // an unused chord instead.
+        EditableBinding::new(
+            NEW_PROJECT_BINDING_NAME,
+            BindingDescription::new("New project (open folder)"),
+            WorkspaceAction::OpenRepository { path: None },
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Folders.as_str())
+        .with_mac_key_binding("cmd-ctrl-n")
+        .with_linux_or_windows_key_binding("ctrl-alt-n"),
+        // No default chord: cmd-t already triggers `workspace:new_tab`,
+        // which has the identical effect inside the selected project
+        // (`AddDefaultTab` is project-aware via
+        // `selected_project_startup_directory`). This binding exists only so
+        // that behavior is independently discoverable and searchable — in
+        // Settings and the command palette — under its own name, not to add
+        // a second default shortcut for the same keystroke.
+        EditableBinding::new(
+            "workspace:new_task_in_project",
+            BindingDescription::new("New task in selected project"),
+            WorkspaceAction::AddDefaultTab,
+        )
+        .with_context_predicate(id!("Workspace"))
         .with_enabled(|| ContextFlag::CreateNewSession.is_enabled()),
         EditableBinding::new(
             NEW_TERMINAL_TAB_BINDING_NAME,

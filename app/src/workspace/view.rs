@@ -718,6 +718,10 @@ pub(crate) const NEW_FILE_BINDING_NAME: &str = "workspace:new_file";
 pub(crate) const NEW_AGENT_TAB_BINDING_NAME: &str = "workspace:new_agent_tab";
 pub(crate) const NEW_AMBIENT_AGENT_TAB_BINDING_NAME: &str = "workspace:new_ambient_agent_tab";
 pub(crate) const TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME: &str = "workspace:toggle_tab_configs_menu";
+/// Starts a new project (the rail header's "+" button dispatches this same
+/// binding's action, so its tooltip can show whatever shortcut the user has
+/// assigned).
+pub(crate) const NEW_PROJECT_BINDING_NAME: &str = "workspace:new_project";
 
 // Editable left panel toolbelt keybindings.
 pub(crate) const LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME: &str =
@@ -23524,6 +23528,25 @@ impl Workspace {
                 CHIP_FONT_SIZE,
             ));
         }
+
+        // Reuses `OpenRepository` (the same action the top-level "Open
+        // repository" entrypoint dispatches) rather than a new action: it
+        // already does everything a new rail row needs — folder picker,
+        // `ProjectManagementModel` upsert, and opening a tab in the chosen
+        // directory, which is what actually makes the row exist.
+        header_row.add_child(
+            self.render_tab_bar_icon_button(
+                appearance,
+                icons::Icon::Plus,
+                &self.mouse_states.rail_new_project_button,
+                WorkspaceAction::OpenRepository { path: None },
+                "New project".to_string(),
+                keybinding_name_to_display_string(NEW_PROJECT_BINDING_NAME, ctx),
+                false,
+                false,
+            )
+            .finish(),
+        );
 
         Container::new(header_row.finish())
             .with_padding_left(12.)
