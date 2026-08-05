@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use super::parse_skill::{parse_skill, ParsedSkill};
+use super::parse_skill::{ParsedSkill, parse_skill};
 
 /// Read all skills from a directory containing skill subdirectories
 ///
@@ -46,5 +46,5 @@ pub fn read_skills(path: &Path) -> Vec<ParsedSkill> {
 }
 
 #[cfg(test)]
-#[path = "read_skills_test.rs"]
+#[path = "read_skills_tests.rs"]
 mod read_skills_test;

@@ -1,13 +1,12 @@
 use serde::{Deserialize, Serialize};
+use settings::Setting as _;
+use warpui::{AppContext, SingletonEntity};
 
 use crate::auth::AuthStateProvider;
 use crate::features::FeatureFlag;
 use crate::settings::AISettings;
 use crate::ui_components::icons::Icon;
-use crate::workspace::tab_settings::TabSettings;
-
-use settings::Setting as _;
-use warpui::{AppContext, SingletonEntity};
+use crate::workspace::tab_settings::{TabSettings, vertical_tabs_layout_active};
 
 /// A configurable item in the vertical tabs header toolbar.
 ///
@@ -60,10 +59,7 @@ impl HeaderToolbarItemKind {
     /// Does not check user show/hide preferences — use `is_available` for that.
     pub fn is_supported(&self, app: &AppContext) -> bool {
         match self {
-            Self::TabsPanel => {
-                FeatureFlag::VerticalTabs.is_enabled()
-                    && *TabSettings::as_ref(app).use_vertical_tabs
-            }
+            Self::TabsPanel => vertical_tabs_layout_active(app),
             Self::ToolsPanel => true,
             Self::AgentManagement => {
                 let is_web_anonymous_user = AuthStateProvider::as_ref(app)

@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::borrow::Cow;
+
 use ai::LLMId;
 use anyhow::Result;
 use onboarding::slides::OnboardingModelInfo;
@@ -8,21 +10,21 @@ use onboarding::{
 };
 use pathfinder_color::ColorU;
 use rust_embed::RustEmbed;
-use std::borrow::Cow;
+use warp_core::ui::appearance::Appearance;
 use warp_core::ui::icons::Icon;
-use warp_core::ui::theme::{AnsiColor, AnsiColors, Details, Fill, Image, TerminalColors};
-use warp_core::ui::{appearance::Appearance, theme::WarpTheme};
-use warpui::assets::asset_cache::AssetSource;
-use warpui::platform;
-use warpui::{
-    elements::{
-        Container, CrossAxisAlignment, Flex, MainAxisAlignment, MainAxisSize, ParentElement,
-    },
-    fonts::{Cache, FamilyId, Weight},
-    presenter::ChildView,
-    ui_components::components::{UiComponent as _, UiComponentStyles},
+use warp_core::ui::theme::{
+    AnsiColor, AnsiColors, Details, Fill, Image, TerminalColors, WarpTheme,
+};
+use warpui_core::assets::asset_cache::AssetSource;
+use warpui_core::elements::{
+    Container, CrossAxisAlignment, Flex, MainAxisAlignment, MainAxisSize, ParentElement,
+};
+use warpui_core::fonts::{Cache, FamilyId, Weight};
+use warpui_core::presenter::ChildView;
+use warpui_core::ui_components::components::{UiComponent as _, UiComponentStyles};
+use warpui_core::{
     AddWindowOptions, AppContext, AssetProvider, Element, Entity, SingletonEntity as _,
-    TypedActionView, View, ViewContext, ViewHandle,
+    TypedActionView, View, ViewContext, ViewHandle, platform,
 };
 
 #[derive(Clone, Copy, RustEmbed)]
@@ -42,12 +44,15 @@ impl AssetProvider for Assets {
 fn main() -> Result<()> {
     // Initialize logging for the onboarding binary.
     warp_logging::init(warp_logging::LogConfig {
-        is_cli: false,
         log_destination: None,
+        ..Default::default()
     })?;
 
-    let app_builder =
-        platform::AppBuilder::new(platform::AppCallbacks::default(), Box::new(ASSETS), None);
+    let app_builder = warpui::platform::AppBuilder::new(
+        platform::AppCallbacks::default(),
+        Box::new(ASSETS),
+        None,
+    );
     let _ = app_builder.run(move |ctx| {
         // Register Appearance singleton so views can access Appearance::handle(ctx).
         ctx.add_singleton_model(|ctx| build_appearance(phenomenon(), ctx));
@@ -84,26 +89,23 @@ impl OnboardingMainView {
                 id: LLMId::from("auto"),
                 title: "Auto".to_string(),
                 icon: Icon::Oz,
-                requires_upgrade: false,
                 is_default: true,
             },
             OnboardingModelInfo {
                 id: LLMId::from("claude-sonnet"),
                 title: "Claude Sonnet".to_string(),
                 icon: Icon::ClaudeLogo,
-                requires_upgrade: false,
                 is_default: false,
             },
             OnboardingModelInfo {
                 id: LLMId::from("gpt-4o"),
                 title: "GPT-4o".to_string(),
                 icon: Icon::OpenAILogo,
-                requires_upgrade: true,
                 is_default: false,
             },
         ];
         let onboarding_view = ctx.add_typed_action_view(move |ctx| {
-            // agent_modality_enabled and no_ai_experiment are false for demo purposes
+            // agent_modality_enabled is false for demo purposes
             AgentOnboardingView::new(
                 themes.clone(),
                 true,
@@ -111,8 +113,6 @@ impl OnboardingMainView {
                 default_model_id.clone(),
                 false,
                 false,
-                false,
-                None,
                 onboarding::OnboardingAuthState::LoggedOut,
                 ctx,
             )
@@ -266,11 +266,11 @@ impl View for OnboardingMainView {
         }
     }
 
-    fn on_focus(&mut self, focus_ctx: &warpui::FocusContext, ctx: &mut ViewContext<Self>) {
-        if let OnboardingMainState::Onboarding(view) = &self.state {
-            if focus_ctx.is_self_focused() {
-                ctx.focus(view);
-            }
+    fn on_focus(&mut self, focus_ctx: &warpui_core::FocusContext, ctx: &mut ViewContext<Self>) {
+        if let OnboardingMainState::Onboarding(view) = &self.state
+            && focus_ctx.is_self_focused()
+        {
+            ctx.focus(view);
         }
     }
 }

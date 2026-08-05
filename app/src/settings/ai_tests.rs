@@ -1,11 +1,12 @@
-use super::*;
-use crate::{
-    ai::request_usage_model::{RequestLimitInfo, RequestLimitRefreshDuration},
-    test_util::settings::initialize_settings_for_tests,
-};
 use chrono::Utc;
 use warp_graphql::scalars::time::ServerTimestamp;
 use warpui::{App, SingletonEntity};
+
+use super::*;
+use crate::ai::request_usage_model::{RequestLimitInfo, RequestLimitRefreshDuration};
+use crate::auth::AuthStateProvider;
+use crate::test_util::settings::initialize_settings_for_tests;
+use crate::workspaces::user_workspaces::UserWorkspaces;
 
 fn create_test_request_limit_info(
     limit: usize,
@@ -30,6 +31,11 @@ fn create_test_request_limit_info(
     }
 }
 
+fn add_ai_enablement_dependencies_for_test(app: &mut App) {
+    app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+    app.add_singleton_model(UserWorkspaces::default_mock);
+}
+
 // FocusedTerminalInfo Tests
 
 #[test]
@@ -40,11 +46,10 @@ fn test_update_both_values_changed() {
 
         // Setup event tracking
         let (sender, receiver) = async_channel::unbounded();
-        let model_handle_clone = model_handle.clone();
-        model_handle.update(&mut app, move |_, ctx| {
+        app.update(|ctx| {
             let sender = sender.clone();
             ctx.subscribe_to_model(
-                &model_handle_clone,
+                &model_handle,
                 move |_, event: &FocusedTerminalInfoEvent, _| match event {
                     FocusedTerminalInfoEvent::TerminalInfoUpdated => {
                         let _ = sender.try_send(());
@@ -81,11 +86,10 @@ fn test_update_additional_value_changed() {
 
         // Setup event tracking
         let (sender, receiver) = async_channel::unbounded();
-        let model_handle_clone = model_handle.clone();
-        model_handle.update(&mut app, move |_, ctx| {
+        app.update(|ctx| {
             let sender = sender.clone();
             ctx.subscribe_to_model(
-                &model_handle_clone,
+                &model_handle,
                 move |_, event: &FocusedTerminalInfoEvent, _| match event {
                     FocusedTerminalInfoEvent::TerminalInfoUpdated => {
                         let _ = sender.try_send(());
@@ -130,11 +134,10 @@ fn test_update_no_change() {
 
         // Setup event tracking
         let (sender, receiver) = async_channel::unbounded();
-        let model_handle_clone = model_handle.clone();
-        model_handle.update(&mut app, move |_, ctx| {
+        app.update(|ctx| {
             let sender = sender.clone();
             ctx.subscribe_to_model(
-                &model_handle_clone,
+                &model_handle,
                 move |_, event: &FocusedTerminalInfoEvent, _| match event {
                     FocusedTerminalInfoEvent::TerminalInfoUpdated => {
                         let _ = sender.try_send(());
@@ -179,11 +182,10 @@ fn test_update_only_remote_toggles() {
 
         // Setup event tracking
         let (sender, receiver) = async_channel::unbounded();
-        let model_handle_clone = model_handle.clone();
-        model_handle.update(&mut app, move |_, ctx| {
+        app.update(|ctx| {
             let sender = sender.clone();
             ctx.subscribe_to_model(
-                &model_handle_clone,
+                &model_handle,
                 move |_, event: &FocusedTerminalInfoEvent, _| match event {
                     FocusedTerminalInfoEvent::TerminalInfoUpdated => {
                         let _ = sender.try_send(());
@@ -228,11 +230,10 @@ fn test_update_only_restored_toggles() {
 
         // Setup event tracking
         let (sender, receiver) = async_channel::unbounded();
-        let model_handle_clone = model_handle.clone();
-        model_handle.update(&mut app, move |_, ctx| {
+        app.update(|ctx| {
             let sender = sender.clone();
             ctx.subscribe_to_model(
-                &model_handle_clone,
+                &model_handle,
                 move |_, event: &FocusedTerminalInfoEvent, _| match event {
                     FocusedTerminalInfoEvent::TerminalInfoUpdated => {
                         let _ = sender.try_send(());
@@ -360,9 +361,11 @@ fn test_toolbar_command_map_matched_agent() {
         map.insert("^custom-tool".to_string(), String::new());
 
         AISettings::handle(&app).update(&mut app, |settings, ctx| {
-            report_if_error!(settings
-                .cli_agent_footer_enabled_commands
-                .set_value(ToolbarCommandMap::new(map), ctx));
+            report_if_error!(
+                settings
+                    .cli_agent_footer_enabled_commands
+                    .set_value(ToolbarCommandMap::new(map), ctx)
+            );
         });
 
         app.read(|ctx| {
@@ -379,6 +382,18 @@ fn test_toolbar_command_map_matched_agent() {
             let agent =
                 CompiledCommandsForCodingAgentToolbar::matched_agent(ctx, "unmatched-command");
             assert_eq!(agent, None);
+        });
+    });
+}
+
+#[test]
+fn orchestration_is_enabled_when_ai_is_enabled() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        add_ai_enablement_dependencies_for_test(&mut app);
+
+        AISettings::handle(&app).read(&app, |settings, ctx| {
+            assert!(settings.is_orchestration_enabled(ctx));
         });
     });
 }
@@ -743,6 +758,126 @@ fn test_mark_quota_banner_as_dismissed() {
             assert!(cycle_history[1].banner_state.dismissed);
             // Future cycle should not be dismissed
             assert!(!cycle_history[2].banner_state.dismissed);
+        });
+    });
+}
+
+// VOICE_INPUT_LANGUAGES catalog tests
+
+#[test]
+fn test_voice_input_languages_auto_detect_is_first_with_empty_code() {
+    // The picker relies on the first entry being the Auto-detect sentinel with an
+    // empty code, since an empty stored value means "don't force a language".
+    let (code, name) = VOICE_INPUT_LANGUAGES[0];
+    assert_eq!(code, "");
+    assert_eq!(name, "Auto-detect");
+}
+
+#[test]
+fn test_voice_input_languages_has_full_catalog() {
+    // Sanity check that we ship the full list rather than a small curated subset:
+    // Auto-detect plus well over 100 ISO-639-1 languages.
+    assert!(
+        VOICE_INPUT_LANGUAGES.len() > 150,
+        "expected the full ISO-639-1 catalog, got {} entries",
+        VOICE_INPUT_LANGUAGES.len()
+    );
+}
+
+#[test]
+fn test_voice_input_languages_codes_and_names_are_valid_and_unique() {
+    use std::collections::HashSet;
+
+    let mut seen_codes = HashSet::new();
+    let mut seen_names = HashSet::new();
+    for (index, (code, name)) in VOICE_INPUT_LANGUAGES.iter().enumerate() {
+        assert!(
+            !name.is_empty(),
+            "language name must not be empty: {code:?}"
+        );
+        assert!(
+            seen_names.insert(*name),
+            "duplicate language name: {name:?}"
+        );
+        assert!(
+            seen_codes.insert(*code),
+            "duplicate language code: {code:?}"
+        );
+
+        if index == 0 {
+            // Auto-detect sentinel: empty code, validated separately.
+            continue;
+        }
+        // Every real language uses a two-letter lowercase ISO-639-1 code.
+        assert_eq!(
+            code.len(),
+            2,
+            "expected a 2-letter ISO-639-1 code: {code:?}"
+        );
+        assert!(
+            code.chars().all(|c| c.is_ascii_lowercase()),
+            "ISO-639-1 code must be lowercase ascii: {code:?}"
+        );
+    }
+}
+
+#[test]
+fn test_voice_input_languages_includes_common_languages() {
+    // A representative spot check, including Marathi (mr) which was explicitly
+    // requested in the review that motivated the full list.
+    for expected in [("en", "English"), ("es", "Spanish"), ("mr", "Marathi")] {
+        assert!(
+            VOICE_INPUT_LANGUAGES.contains(&expected),
+            "catalog is missing {expected:?}"
+        );
+    }
+}
+#[test]
+fn ai_autodetection_defaults_to_opt_in() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        add_ai_enablement_dependencies_for_test(&mut app);
+
+        AISettings::handle(&app).read(&app, |settings, ctx| {
+            // NLD is opt-in: a fresh user who never touched the setting has it off.
+            // This fails before the default flip (default was `true`) and passes after.
+            assert!(!*settings.ai_autodetection_enabled_internal.value());
+            // AI is enabled by default, so the getter reflects the opt-in setting
+            // rather than a disabled-AI state.
+            assert!(settings.is_any_ai_enabled(ctx));
+            assert!(!settings.is_ai_autodetection_enabled(ctx));
+        });
+    });
+}
+
+#[test]
+fn ai_autodetection_setting_can_be_toggled_on_and_off() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        add_ai_enablement_dependencies_for_test(&mut app);
+
+        // Mirrors what `/enable-natural-language-detection` does in the TUI.
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .ai_autodetection_enabled_internal
+                .set_value(true, ctx)
+                .unwrap();
+        });
+        AISettings::handle(&app).read(&app, |settings, ctx| {
+            assert!(*settings.ai_autodetection_enabled_internal.value());
+            assert!(settings.is_ai_autodetection_enabled(ctx));
+        });
+
+        // Mirrors what `/disable-natural-language-detection` does in the TUI.
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .ai_autodetection_enabled_internal
+                .set_value(false, ctx)
+                .unwrap();
+        });
+        AISettings::handle(&app).read(&app, |settings, ctx| {
+            assert!(!*settings.ai_autodetection_enabled_internal.value());
+            assert!(!settings.is_ai_autodetection_enabled(ctx));
         });
     });
 }

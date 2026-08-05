@@ -5,9 +5,10 @@ use itertools::Itertools as _;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
-use warp_core::ui::appearance::Appearance;
 use warp_core::ui::Icon;
+use warp_core::ui::appearance::Appearance;
 use warp_graphql::billing::AddonCreditsOption;
+use warp_graphql::error::BudgetExceededError;
 use warpui::elements::{
     Align, Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius,
     CrossAxisAlignment, DropShadow, Expanded, Flex, FormattedTextElement, HighlightedHyperlink,
@@ -31,9 +32,8 @@ use crate::send_telemetry_from_ctx;
 use crate::server::ids::ServerId;
 use crate::server::telemetry::{OutOfCreditsBannerAction, TelemetryEvent};
 use crate::settings_view::create_discount_badge;
-use crate::view_components::Dropdown;
+use crate::view_components::{Dropdown, DropdownAction};
 use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
-use warp_graphql::error::BudgetExceededError;
 
 #[derive(Default)]
 struct MouseStates {
@@ -137,6 +137,15 @@ impl BuyCreditsBanner {
                     .addon_credits_options
                     .get(self.selected_denomination_index)
                     .map(|option| option.credits);
+                let has_admin_permissions = {
+                    let auth_state = AuthStateProvider::as_ref(ctx).get();
+                    let current_team = UserWorkspaces::as_ref(ctx).current_team();
+                    auth_state
+                        .user_email()
+                        .zip(current_team)
+                        .map(|(email, team)| team.has_admin_permissions(&email))
+                        .unwrap_or_default()
+                };
 
                 // Things we always do:
                 // - emit telemetry
@@ -161,7 +170,7 @@ impl BuyCreditsBanner {
                 // - Banner toggle flow: optionally enable auto-reload immediately.
                 // - Post-purchase modal flow: show the modal.
                 if banner_toggle_flag_enabled {
-                    if self.auto_reload_enabled {
+                    if has_admin_permissions && self.auto_reload_enabled {
                         self.banner_auto_reload_update_in_flight = true;
 
                         if let Some(team_uid) = UserWorkspaces::as_ref(ctx).current_team_uid() {
@@ -176,7 +185,7 @@ impl BuyCreditsBanner {
                             });
                         }
                     }
-                } else if post_purchase_modal_flag_enabled {
+                } else if has_admin_permissions && post_purchase_modal_flag_enabled {
                     // Default selection in the modal should match the denomination the user clicked "buy" on.
                     ctx.emit(BuyCreditsBannerEvent::OpenAutoReloadModal {
                         purchased_credits: selected_credits.unwrap_or(0),
@@ -359,11 +368,15 @@ impl BuyCreditsBanner {
                         })),
                         Some(primary_text)
                     )
-                    .with_on_select_action(Action::SelectDenomination(index).into())
+                    .with_on_select_action(DropdownAction::select_action_and_close(
+                        Action::SelectDenomination(index),
+                    ))
                     .into_item()
                 } else {
                     MenuItemFields::new(primary_text.clone())
-                        .with_on_select_action(Action::SelectDenomination(index).into())
+                        .with_on_select_action(DropdownAction::select_action_and_close(
+                            Action::SelectDenomination(index),
+                        ))
                         .into_item()
                 }
             })
@@ -547,15 +560,17 @@ impl BuyCreditsBanner {
             .unwrap_or(false);
 
         let make_banner_text = || {
-            let mut banner_text_children = vec![appearance
-                .ui_builder()
-                .paragraph("Out of credits")
-                .with_style(UiComponentStyles {
-                    font_size: Some(14.),
-                    ..Default::default()
-                })
-                .build()
-                .finish()];
+            let mut banner_text_children = vec![
+                appearance
+                    .ui_builder()
+                    .paragraph("Out of credits")
+                    .with_style(UiComponentStyles {
+                        font_size: Some(14.),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            ];
 
             // Show different message based on whether purchase would exceed limit
             if is_at_monthly_limit || would_purchase_exceed_limit {
@@ -830,7 +845,7 @@ impl View for BuyCreditsBanner {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     SelectDenomination(usize),
     Close,

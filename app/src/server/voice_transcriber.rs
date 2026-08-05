@@ -3,10 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use warpui::{Entity, SingletonEntity};
 
+use super::server_api::{ServerApi, TranscribeError};
 use crate::ai::voice::transcribe::{Provider, TranscribeRequest};
 use crate::voice::transcriber::Transcriber;
-
-use super::server_api::{ServerApi, TranscribeError};
 
 pub struct ServerVoiceTranscriber {
     server_api: Arc<ServerApi>,
@@ -21,10 +20,15 @@ impl ServerVoiceTranscriber {
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl Transcriber for ServerVoiceTranscriber {
-    async fn transcribe(&self, wav_base64: String) -> Result<String, TranscribeError> {
+    async fn transcribe(
+        &self,
+        wav_base64: String,
+        language: Option<String>,
+    ) -> Result<String, TranscribeError> {
         let request = TranscribeRequest {
             provider: Provider::Wispr,
             audio: Some(wav_base64),
+            language,
             ..Default::default()
         };
         let response = self.server_api.transcribe(&request).await;

@@ -1,7 +1,35 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+#[cfg(feature = "local_fs")]
+use std::time::Duration;
+
+use chrono::Utc;
+use futures::stream::AbortHandle;
+use itertools::Itertools;
+#[cfg_attr(not(feature = "local_fs"), allow(unused_imports))]
+use parking_lot::{FairMutex, Mutex};
+use warp_completer::completer::{
+    self, AliasExpansionResult, CompleterOptions, CompletionsFallbackStrategy, MatchStrategy,
+    expand_command_aliases,
+};
+use warp_completer::meta::Spanned;
+use warp_completer::parsers::ParsedExpression;
+use warp_completer::parsers::hir::{Command, Expression, FlagType};
+use warp_core::features::FeatureFlag;
+use warp_errors::report_error;
+#[cfg(feature = "local_fs")]
+use warpui::r#async::FutureExt;
+use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
+
+use super::generate_ai_input_suggestions::{
+    GenerateAIInputSuggestionsRequest, GenerateAIInputSuggestionsResponseV2, NextCommandContext,
+    create_generate_ai_input_suggestions_request, get_context_messages,
+};
 use crate::ai::block_context::BlockContext;
 use crate::ai_assistant::execution_context::WarpAiExecutionContext;
 use crate::completer::SessionContext;
-use crate::report_error;
+#[cfg(feature = "local_fs")]
+use crate::persistence::{database_file_path_for_current_scope, establish_ro_connection};
 use crate::server::server_api::{AIApiError, ServerApi};
 use crate::settings::AISettings;
 use crate::terminal::event::UserBlockCompleted;
@@ -9,31 +37,6 @@ use crate::terminal::input::{CompleterData, IntelligentAutosuggestionResult};
 use crate::terminal::model::session::Sessions;
 use crate::terminal::{History, HistoryEntry, TerminalModel};
 use crate::workspaces::user_workspaces::UserWorkspaces;
-use chrono::Utc;
-use futures::stream::AbortHandle;
-use itertools::Itertools;
-#[cfg_attr(not(feature = "local_fs"), allow(unused_imports))]
-use parking_lot::{FairMutex, Mutex};
-use std::collections::HashMap;
-use std::sync::Arc;
-#[cfg(feature = "local_fs")]
-use std::time::Duration;
-use warp_completer::completer::{
-    self, expand_command_aliases, AliasExpansionResult, CompleterOptions,
-    CompletionsFallbackStrategy, MatchStrategy,
-};
-use warp_completer::meta::Spanned;
-use warp_completer::parsers::hir::{Command, Expression, FlagType};
-use warp_completer::parsers::ParsedExpression;
-use warp_core::features::FeatureFlag;
-#[cfg(feature = "local_fs")]
-use warpui::r#async::FutureExt;
-use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
-
-use super::generate_ai_input_suggestions::{
-    create_generate_ai_input_suggestions_request, get_context_messages,
-    GenerateAIInputSuggestionsRequest, GenerateAIInputSuggestionsResponseV2, NextCommandContext,
-};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "local_fs")] {
@@ -156,10 +159,10 @@ impl NextCommandModel {
         server_api: Arc<ServerApi>,
     ) -> Self {
         #[cfg(feature = "local_fs")]
-        let conn = crate::persistence::database_file_path()
+        let conn = database_file_path_for_current_scope()
             .to_str()
             .and_then(|db_url| {
-                crate::persistence::establish_ro_connection(db_url)
+                establish_ro_connection(db_url)
                     .ok()
                     .map(|conn| Arc::new(Mutex::new(conn)))
             });
@@ -524,8 +527,8 @@ impl NextCommandModel {
                             })
                         });
 
-                        if let Some(autosuggestion) = autosuggestion {
-                            if is_command_valid(&autosuggestion, Some(&completion_context), session_env_vars.as_ref()).await {
+                        if let Some(autosuggestion) = autosuggestion
+                            && is_command_valid(&autosuggestion, Some(&completion_context), session_env_vars.as_ref()).await {
                                 return (
                                     Ok(GenerateAIInputSuggestionsResponseV2 {
                                         commands: vec![autosuggestion.clone()],
@@ -540,7 +543,6 @@ impl NextCommandModel {
                                     next_command_context,
                                 );
                             }
-                        }
                     };
 
                     // Only if we have no commands from history and no completions, use the LLM to generate a partial suggestion.
@@ -661,22 +663,20 @@ async fn is_arg_valid(
                 match arg_type {
                     ArgType::File => {
                         let mut path_arg = PathBuf::from(arg.value().as_str());
-                        if path_arg.is_relative() {
-                            if let Ok(working_dir) = PathBuf::try_from(ctx.current_working_directory.clone()) {
+                        if path_arg.is_relative()
+                            && let Ok(working_dir) = PathBuf::try_from(ctx.current_working_directory.clone()) {
                                 path_arg = working_dir.join(path_arg);
                             }
-                        }
                         if path_arg.is_file() {
                             return true;
                         }
                     }
                     ArgType::Folder => {
                         let mut path_arg = PathBuf::from(arg.value().as_str());
-                        if path_arg.is_relative() {
-                            if let Ok(working_dir) = PathBuf::try_from(ctx.current_working_directory.clone()) {
+                        if path_arg.is_relative()
+                            && let Ok(working_dir) = PathBuf::try_from(ctx.current_working_directory.clone()) {
                                 path_arg = working_dir.join(path_arg);
                             }
-                        }
                         if path_arg.is_dir() {
                             return true;
                         }
@@ -786,10 +786,10 @@ pub async fn is_command_valid(
     }
     if let Some(flags) = shell_command.args.flags {
         for flag in flags.iter() {
-            if let FlagType::Argument { value } = &flag.flag_type {
-                if !is_arg_valid(&expanded_command_line, value, ctx, session_env_vars).await {
-                    return false;
-                }
+            if let FlagType::Argument { value } = &flag.flag_type
+                && !is_arg_valid(&expanded_command_line, value, ctx, session_env_vars).await
+            {
+                return false;
             }
         }
     }
@@ -828,5 +828,5 @@ fn find_potential_autosuggestions_from_history<'a>(
 }
 
 #[cfg(test)]
-#[path = "next_command_model_test.rs"]
+#[path = "next_command_model_tests.rs"]
 mod tests;

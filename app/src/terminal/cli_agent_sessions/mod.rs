@@ -1,24 +1,40 @@
 pub mod event;
+pub mod handle_store;
 pub mod listener;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod plugin_manager;
+/// Discovery of sessions Warp never witnessed, from Claude's own on-disk
+/// state. Unconditional (unlike `transcript_naming`) so the rail's projection
+/// needs no `cfg`; the filesystem work inside it is what is gated.
+pub mod session_scan;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod transcript_naming;
 
 use std::collections::{HashMap, HashSet};
 
+use event::{CLIAgentEvent, CLIAgentEventSource, CLIAgentEventType};
 use warpui::{Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
-
-use crate::ai::blocklist::InputConfig;
 
 use self::listener::CLIAgentSessionListener;
 use super::CLIAgent;
-use event::{CLIAgentEvent, CLIAgentEventType};
+use crate::GlobalResourceHandlesProvider;
+use crate::ai::blocklist::InputConfig;
+use crate::features::FeatureFlag;
+use crate::persistence::{AgentSessionHandleOp, ModelEvent};
+use crate::terminal::cli_agent_resume::is_valid_session_id;
 
 /// Status of a tracked CLI agent session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CLIAgentSessionStatus {
     InProgress,
     Success,
-    Blocked { message: Option<String> },
+    Failed {
+        error_type: Option<String>,
+        message: Option<String>,
+    },
+    Blocked {
+        message: Option<String>,
+    },
 }
 
 impl CLIAgentSessionStatus {
@@ -27,6 +43,7 @@ impl CLIAgentSessionStatus {
         match self {
             CLIAgentSessionStatus::InProgress => ConversationStatus::InProgress,
             CLIAgentSessionStatus::Success => ConversationStatus::Success,
+            CLIAgentSessionStatus::Failed { .. } => ConversationStatus::Error,
             CLIAgentSessionStatus::Blocked { message } => ConversationStatus::Blocked {
                 blocked_action: message.clone().unwrap_or_default(),
             },
@@ -123,12 +140,12 @@ pub struct CLIAgentSession {
     pub input_state: CLIAgentInputState,
     /// Whether status-driven auto-toggle is enabled for this session.
     pub should_auto_toggle_input: bool,
-    /// Plugin-backed event listener, if the CLI agent plugin is installed.
-    /// `None` for sessions created by command detection alone.
+    /// Event listener for plugin-backed sessions or Codex OSC9 fallback.
+    /// `None` for non-Codex sessions created by command detection alone.
     /// Dropping this handle cleans up the listener's PTY event subscription.
     pub listener: Option<ModelHandle<CLIAgentSessionListener>>,
-    /// The plugin version reported by the `SessionStart` event.
-    /// `None` if the plugin predates version reporting or hasn't connected yet.
+    /// The plugin version reported by structured plugin events.
+    /// `None` if the plugin predates version reporting or Codex is using OSC9 fallback.
     pub plugin_version: Option<String>,
     /// `None` when the session is local.
     /// `Some("user@hostname")` when running over SSH (warpified or legacy).
@@ -141,11 +158,37 @@ pub struct CLIAgentSession {
     /// the first word of the command (the binary/alias the user typed).
     /// Used to customize plugin instructions and force manual install mode.
     pub custom_command_prefix: Option<String>,
+    /// Set once the session has received any structured OSC 777 (rich)
+    /// notification. Codex's OSC 9 fallback never sets it, so this is the
+    /// single source of truth for whether the session is plugin-backed.
+    pub received_rich_notification: bool,
 }
 
 impl CLIAgentSession {
     pub fn is_remote(&self) -> bool {
         self.remote_host.is_some()
+    }
+
+    /// Whether the session surfaces trustworthy fine-grained status
+    /// (in-progress / blocked / success). True only after receiving a rich OSC
+    /// 777 notification. Codex's OSC 9 fallback emits only opaque `Stop`
+    /// notifications and never sets `received_rich_notification`, so it does
+    /// not qualify. Synthetic listener registration also does not qualify until
+    /// an actual rich notification arrives.
+    pub fn supports_rich_status(&self) -> bool {
+        self.received_rich_notification
+    }
+
+    /// Clears state populated by `PermissionRequest`. Called whenever the
+    /// session leaves the permission flow (the user replied, a blocking tool
+    /// completed, a new prompt is submitted, or the session ends successfully)
+    /// so the permission summary doesn't leak into later UI surfaces — most
+    /// visibly the tab title, which can fall back to `summary` when `query`
+    /// is unset.
+    fn clear_permission_scoped_state(&mut self) {
+        self.session_context.summary = None;
+        self.session_context.tool_name = None;
+        self.session_context.tool_input_preview = None;
     }
 
     /// Applies an event to this session, updating context and status.
@@ -165,18 +208,30 @@ impl CLIAgentSession {
             CLIAgentEventType::PromptSubmit => {
                 self.session_context.query = event.payload.query.clone();
                 self.session_context.response = None;
+                self.clear_permission_scoped_state();
                 CLIAgentSessionStatus::InProgress
             }
             CLIAgentEventType::ToolComplete => {
                 if !matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
                     return None;
                 }
+                self.clear_permission_scoped_state();
                 CLIAgentSessionStatus::InProgress
             }
             CLIAgentEventType::Stop => {
                 self.session_context.query = event.payload.query.clone();
                 self.session_context.response = event.payload.response.clone();
+                self.clear_permission_scoped_state();
                 CLIAgentSessionStatus::Success
+            }
+            CLIAgentEventType::StopFailure => {
+                self.session_context.query = event.payload.query.clone();
+                self.session_context.response = event.payload.response.clone();
+                self.clear_permission_scoped_state();
+                CLIAgentSessionStatus::Failed {
+                    error_type: event.payload.error_type.clone(),
+                    message: event.payload.response.clone(),
+                }
             }
             CLIAgentEventType::PermissionRequest => {
                 self.session_context.summary = event.payload.summary.clone();
@@ -197,6 +252,7 @@ impl CLIAgentSession {
                 if !matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
                     return None;
                 }
+                self.clear_permission_scoped_state();
                 CLIAgentSessionStatus::InProgress
             }
             // IdlePrompt means the agent is sitting at its prompt waiting for input.
@@ -277,6 +333,10 @@ pub struct CLIAgentSessionsModel {
     /// Tracks (agent, remote_host) pairs where an auto plugin operation (install or update) has failed.
     /// Shared across all views so failure in one tab is reflected everywhere.
     plugin_auto_failures: HashSet<(CLIAgent, Option<String>)>,
+    /// `terminal_panes.uuid` per terminal view, registered by the owning
+    /// [`TerminalPane`]. The durable session-handle store keys its in-flight
+    /// rows on this uuid (stable across restarts), never on the `EntityId`.
+    pane_uuids: HashMap<EntityId, Vec<u8>>,
 }
 
 impl Entity for CLIAgentSessionsModel {
@@ -290,11 +350,39 @@ impl CLIAgentSessionsModel {
         Self {
             sessions: HashMap::new(),
             plugin_auto_failures: HashSet::new(),
+            pane_uuids: HashMap::new(),
         }
+    }
+
+    /// Registers the durable pane uuid for a terminal view. Called by the
+    /// owning `TerminalPane`; without it, sessions in that pane are tracked
+    /// live-only and never written to the handle store.
+    pub fn register_pane_uuid(&mut self, terminal_view_id: EntityId, pane_uuid: Vec<u8>) {
+        self.pane_uuids.insert(terminal_view_id, pane_uuid);
+    }
+
+    /// Drops the pane-uuid mapping when a pane is closed for good (not moved).
+    /// Deliberately does NOT touch the handle store: closed panes are exactly
+    /// what dormant rows represent.
+    pub fn unregister_pane(&mut self, terminal_view_id: EntityId) {
+        self.pane_uuids.remove(&terminal_view_id);
     }
 
     pub fn session(&self, terminal_view_id: EntityId) -> Option<&CLIAgentSession> {
         self.sessions.get(&terminal_view_id)
+    }
+
+    /// The `(agent, session_id)` of every live tracked session. The rail uses
+    /// this to suppress a dormant handle whose session is currently running —
+    /// the live row wins.
+    pub fn live_session_ids(&self) -> HashSet<(CLIAgent, String)> {
+        self.sessions
+            .values()
+            .filter_map(|session| {
+                let session_id = session.session_context.session_id.clone()?;
+                Some((session.agent, session_id))
+            })
+            .collect()
     }
 
     /// Returns `true` if the rich input editor is currently open for this terminal.
@@ -333,6 +421,11 @@ impl CLIAgentSessionsModel {
             .get_mut(&terminal_view_id)
             .filter(|s| s.agent == agent)
         {
+            let had_valid_id_before = session
+                .session_context
+                .session_id
+                .as_deref()
+                .is_some_and(is_valid_session_id);
             // Upgrade existing session with plugin context.
             session.status = CLIAgentSessionStatus::InProgress;
             session.listener = Some(listener);
@@ -343,6 +436,7 @@ impl CLIAgentSessionsModel {
             session.session_context.project = project.or(session.session_context.project.take());
             session.session_context.session_id =
                 session_id.or(session.session_context.session_id.take());
+            self.sync_session_to_handle_store(terminal_view_id, had_valid_id_before, ctx);
             return;
         }
 
@@ -364,13 +458,24 @@ impl CLIAgentSessionsModel {
                 remote_host,
                 draft_text: None,
                 custom_command_prefix: None,
+                received_rich_notification: false,
             },
             ctx,
         );
+        self.sync_session_to_handle_store(terminal_view_id, false, ctx);
     }
 
     pub fn remove_session(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
         if let Some(session) = self.sessions.remove(&terminal_view_id) {
+            // Final `last_seen_at` stamp so the now-dormant handle sorts to the
+            // top of its project's dormant rows. Invariant: exiting a session
+            // must never delete its handle — the handle IS the dormant row the
+            // project rail resumes from.
+            if let Some(op) = Self::identified_session_op(&session, |agent, session_id| {
+                AgentSessionHandleOp::Touch { agent, session_id }
+            }) {
+                self.send_handle_op(op, ctx);
+            }
             ctx.emit(CLIAgentSessionsModelEvent::Ended {
                 terminal_view_id,
                 agent: session.agent,
@@ -378,7 +483,160 @@ impl CLIAgentSessionsModel {
         }
     }
 
+    /// Builds `op` from a session's agent + validated session id, or `None`
+    /// for remote sessions, missing ids, and ids that fail validation
+    /// (untrusted input never reaches the store or a command line).
+    fn identified_session_op(
+        session: &CLIAgentSession,
+        op: impl FnOnce(String, String) -> AgentSessionHandleOp,
+    ) -> Option<AgentSessionHandleOp> {
+        if session.remote_host.is_some() {
+            return None;
+        }
+        let session_id = session.session_context.session_id.as_deref()?;
+        if !is_valid_session_id(session_id) {
+            return None;
+        }
+        Some(op(
+            session.agent.to_serialized_name(),
+            session_id.to_owned(),
+        ))
+    }
+
+    /// Records the current lifecycle state of a local session into the durable
+    /// handle store: `Identify` once a valid session id is known, otherwise an
+    /// in-flight row keyed on the pane uuid. No-op when the pane uuid is
+    /// unregistered, the session is remote, or the cwd is unknown (a handle
+    /// without a cwd could never be resumed in the right directory).
+    fn sync_session_to_handle_store(
+        &self,
+        terminal_view_id: EntityId,
+        had_valid_id_before: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(session) = self.sessions.get(&terminal_view_id) else {
+            return;
+        };
+        if session.remote_host.is_some() {
+            return;
+        }
+        let Some(pane_uuid) = self.pane_uuids.get(&terminal_view_id) else {
+            return;
+        };
+        let Some(cwd) = session.session_context.cwd.clone() else {
+            return;
+        };
+        let agent = session.agent.to_serialized_name();
+
+        let op = match session.session_context.session_id.as_deref() {
+            Some(id) if is_valid_session_id(id) => {
+                if had_valid_id_before {
+                    // Already identified; activity stamps go through `Touch`
+                    // at the call sites that own event cadence.
+                    return;
+                }
+                AgentSessionHandleOp::Identify {
+                    agent,
+                    pane_uuid: pane_uuid.clone(),
+                    cwd,
+                    session_id: id.to_owned(),
+                }
+            }
+            // Invalid ids are dropped at ingest; the row stays in-flight and
+            // is never offered as resumable.
+            Some(_) => return,
+            None => AgentSessionHandleOp::StartInflight {
+                agent,
+                pane_uuid: pane_uuid.clone(),
+                cwd,
+            },
+        };
+        self.send_handle_op(op, ctx);
+    }
+
+    /// Resolves the session's display label from its transcript off-thread and
+    /// caches it onto the durable handle (`SetTitle`). Never touches the disk
+    /// on the calling thread; failure to resolve is a normal outcome and
+    /// leaves the previous cache in place.
+    fn refresh_cached_title(&self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            if !FeatureFlag::ResumeProjectTasks.is_enabled() {
+                return;
+            }
+            let Some(session) = self.sessions.get(&terminal_view_id) else {
+                return;
+            };
+            // Transcript layout and record format are Claude Code's; other
+            // agents keep their tier-0 cache until they get their own reader.
+            if session.agent != CLIAgent::Claude || session.remote_host.is_some() {
+                return;
+            }
+            let Some(session_id) = session
+                .session_context
+                .session_id
+                .clone()
+                .filter(|id| is_valid_session_id(id))
+            else {
+                return;
+            };
+            let Some(cwd) = session.session_context.cwd.clone() else {
+                return;
+            };
+            let agent = session.agent.to_serialized_name();
+
+            let _ = ctx.spawn(
+                async move {
+                    let cwd_path = std::path::PathBuf::from(&cwd);
+                    let title = transcript_naming::claude_transcript_path(&cwd_path, &session_id)
+                        .and_then(|path| {
+                            transcript_naming::resolve_label_from_transcript(&path, &cwd_path)
+                        });
+                    (agent, session_id, title)
+                },
+                |me: &mut Self, (agent, session_id, title), ctx| {
+                    if let Some(title) = title {
+                        me.send_handle_op(
+                            AgentSessionHandleOp::SetTitle {
+                                agent,
+                                session_id,
+                                title,
+                            },
+                            ctx,
+                        );
+                    }
+                },
+            );
+        }
+    }
+
+    /// Ships a handle-store op to the persistence writer and mirrors it into
+    /// the in-memory read model so the rail updates without a DB round-trip.
+    /// Feature-gated here so no call site can forget the flag.
+    fn send_handle_op(&self, op: AgentSessionHandleOp, ctx: &mut ModelContext<Self>) {
+        if !FeatureFlag::ResumeProjectTasks.is_enabled() {
+            return;
+        }
+        handle_store::AgentSessionHandlesModel::handle(ctx).update(ctx, |mirror, ctx| {
+            mirror.apply(&op, ctx);
+        });
+        let Some(sender) = GlobalResourceHandlesProvider::as_ref(ctx)
+            .get()
+            .model_event_sender
+            .clone()
+        else {
+            return;
+        };
+        // `try_send` rather than `send`: the writer queue blocking must never
+        // stall the UI thread for a best-effort index write.
+        if let Err(err) = sender.try_send(ModelEvent::AgentSessionHandle(op)) {
+            log::warn!("Failed to enqueue agent session handle op: {err}");
+        }
+    }
+
     /// Updates the session's status and context from a parsed CLI agent event.
+    /// Rich plugin events latch `received_rich_notification` so rich-status
+    /// surfaces stay consistent even if the first event was not SessionStart.
     pub fn update_from_event(
         &mut self,
         terminal_view_id: EntityId,
@@ -389,7 +647,17 @@ impl CLIAgentSessionsModel {
             return;
         };
 
-        let event_type = &event.event;
+        if event.source == CLIAgentEventSource::RichPlugin {
+            session.received_rich_notification = true;
+        }
+
+        let had_valid_id_before = session
+            .session_context
+            .session_id
+            .as_deref()
+            .is_some_and(is_valid_session_id);
+
+        let event_type = event.event.clone();
         if let Some(new_status) = session.apply_event(event) {
             let agent = session.agent;
             ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
@@ -410,6 +678,58 @@ impl CLIAgentSessionsModel {
                 terminal_view_id,
                 agent: session.agent,
             });
+        }
+
+        // Durable-handle bookkeeping. Only `SessionStart` may create an
+        // in-flight row; every other event syncs solely on the id *becoming*
+        // valid (late-id agents like Codex), so id-less fallback agents cannot
+        // generate a write per event. Already-identified sessions get a
+        // `Touch` stamp on the low-frequency turn boundaries so dormant
+        // ordering tracks real activity without a write per tool call.
+        let has_valid_id_now = self
+            .sessions
+            .get(&terminal_view_id)
+            .and_then(|session| session.session_context.session_id.as_deref())
+            .is_some_and(is_valid_session_id);
+        let id_just_arrived = !had_valid_id_before && has_valid_id_now;
+
+        match event_type {
+            CLIAgentEventType::SessionStart => {
+                self.sync_session_to_handle_store(terminal_view_id, had_valid_id_before, ctx);
+            }
+            CLIAgentEventType::PromptSubmit
+            | CLIAgentEventType::Stop
+            | CLIAgentEventType::StopFailure => {
+                if id_just_arrived {
+                    self.sync_session_to_handle_store(terminal_view_id, had_valid_id_before, ctx);
+                } else if had_valid_id_before
+                    && let Some(session) = self.sessions.get(&terminal_view_id)
+                    && let Some(op) = Self::identified_session_op(session, |agent, session_id| {
+                        AgentSessionHandleOp::Touch { agent, session_id }
+                    })
+                {
+                    self.send_handle_op(op, ctx);
+                }
+                // A stop is a turn boundary: the transcript now holds whatever
+                // `ai-title` Claude generated for this turn. Refresh the cached
+                // label so the row is well-named the moment it goes dormant.
+                if matches!(
+                    event_type,
+                    CLIAgentEventType::Stop | CLIAgentEventType::StopFailure
+                ) {
+                    self.refresh_cached_title(terminal_view_id, ctx);
+                }
+            }
+            CLIAgentEventType::ToolComplete
+            | CLIAgentEventType::PermissionRequest
+            | CLIAgentEventType::PermissionReplied
+            | CLIAgentEventType::QuestionAsked
+            | CLIAgentEventType::IdlePrompt
+            | CLIAgentEventType::Unknown(_) => {
+                if id_just_arrived {
+                    self.sync_session_to_handle_store(terminal_view_id, had_valid_id_before, ctx);
+                }
+            }
         }
     }
 

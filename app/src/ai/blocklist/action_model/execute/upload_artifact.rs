@@ -5,9 +5,13 @@ use std::path::PathBuf;
 #[path = "upload_artifact_tests.rs"]
 mod tests;
 
-use futures::{future::BoxFuture, FutureExt};
+use futures::FutureExt;
+use futures::future::BoxFuture;
+#[cfg(not(target_family = "wasm"))]
+use warpui::SingletonEntity;
 use warpui::{Entity, EntityId, ModelContext, ModelHandle};
 
+use super::{ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput};
 use crate::terminal::model::session::active_session::ActiveSession;
 #[cfg(not(target_family = "wasm"))]
 use crate::{
@@ -19,10 +23,17 @@ use crate::{
     },
     server::server_api::ServerApiProvider,
 };
-#[cfg(not(target_family = "wasm"))]
-use warpui::SingletonEntity;
 
-use super::{ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput};
+#[cfg(not(target_family = "wasm"))]
+fn format_upload_artifact_error(err: &anyhow::Error) -> String {
+    let error_chain = format!("{err:#}");
+
+    if error_chain != err.to_string() {
+        format!("Artifact upload failed: {error_chain}")
+    } else {
+        error_chain
+    }
+}
 
 pub struct UploadArtifactExecutor {
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
@@ -132,6 +143,7 @@ impl UploadArtifactExecutor {
                         path: resolved_path,
                         run_id: None,
                         conversation_id: Some(server_conversation_token),
+                        title: None,
                         description,
                     };
                     let association = uploader.resolve_upload_association(&request).await?;
@@ -148,7 +160,7 @@ impl UploadArtifactExecutor {
                         })
                     }
                     Err(err) => AIAgentActionResultType::UploadArtifact(
-                        UploadArtifactResult::Error(err.to_string()),
+                        UploadArtifactResult::Error(format_upload_artifact_error(&err)),
                     ),
                 },
             )

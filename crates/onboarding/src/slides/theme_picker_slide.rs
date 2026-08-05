@@ -1,27 +1,30 @@
+use pathfinder_color::ColorU;
+use ui_components::{Component as _, Options as _, button};
+use warp_core::features::FeatureFlag;
+use warp_core::send_telemetry_from_ctx;
+use warp_core::ui::appearance::Appearance;
+use warp_core::ui::theme::WarpTheme;
+use warp_core::ui::theme::color::internal_colors;
+use warpui_core::elements::{
+    Border, ClippedScrollStateHandle, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
+    Empty, Flex, FormattedTextElement, Hoverable, MainAxisAlignment, MainAxisSize,
+    MouseStateHandle, ParentElement, Radius, Text,
+};
+use warpui_core::fonts::{Properties, Weight};
+use warpui_core::keymap::Keystroke;
+use warpui_core::platform::Cursor;
+use warpui_core::text_layout::TextAlignment;
+use warpui_core::ui_components::components::{UiComponent, UiComponentStyles};
+use warpui_core::{
+    AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
+};
+
 use super::OnboardingSlide;
+use crate::OnboardingIntention;
 use crate::model::{OnboardingStateEvent, OnboardingStateModel};
 use crate::slides::{bottom_nav, layout, slide_content};
 use crate::telemetry::OnboardingEvent;
 use crate::visuals::theme_picker_visual;
-use crate::OnboardingIntention;
-use pathfinder_color::ColorU;
-use ui_components::{button, Component as _, Options as _};
-use warp_core::features::FeatureFlag;
-use warp_core::send_telemetry_from_ctx;
-use warp_core::ui::{appearance::Appearance, theme::color::internal_colors, theme::WarpTheme};
-use warpui::{
-    elements::{
-        Border, ClippedScrollStateHandle, ConstrainedBox, Container, CornerRadius,
-        CrossAxisAlignment, Empty, Flex, FormattedTextElement, Hoverable, MainAxisAlignment,
-        MainAxisSize, MouseStateHandle, ParentElement, Radius, Text,
-    },
-    fonts::{Properties, Weight},
-    keymap::Keystroke,
-    platform::Cursor,
-    text_layout::TextAlignment,
-    ui_components::components::{UiComponent, UiComponentStyles},
-    AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
-};
 
 #[derive(Debug, Clone)]
 pub enum ThemePickerSlideEvent {
@@ -134,12 +137,15 @@ impl ThemePickerSlide {
         app: &AppContext,
     ) -> Box<dyn Element> {
         // The option "chrome" (background, borders, text) should be styled using the currently
-        // selected theme.
-        let selected_theme = self
-            .theme_options
-            .get(self.selected_theme_index)
-            .map(|option| option.theme.clone())
-            .unwrap_or_else(|| self.theme_options[0].theme.clone());
+        // selected theme, if sync_with_os is not selected.
+        let selected_theme = if self.sync_with_os {
+            appearance.theme().clone()
+        } else {
+            self.theme_options
+                .get(self.selected_theme_index)
+                .map(|option| option.theme.clone())
+                .unwrap_or_else(|| self.theme_options[0].theme.clone())
+        };
 
         let bottom_nav = self.render_bottom_nav(appearance, app);
 
@@ -159,7 +165,9 @@ impl ThemePickerSlide {
 
         let mut content = vec![self.render_header_text(appearance), theme_options_section];
 
-        if FeatureFlag::OpenWarpNewSettingsModes.is_enabled() {
+        if FeatureFlag::AccountFirstOnboarding.is_enabled()
+            || FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
+        {
             content.push(self.render_sync_with_os_section(appearance));
         }
 
@@ -172,7 +180,10 @@ impl ThemePickerSlide {
         let state = self.onboarding_state.as_ref(app);
         let is_terminal = matches!(state.intention(), OnboardingIntention::Terminal);
         let warp_drive_enabled = state.ui_customization().show_warp_drive;
-        if is_terminal && !warp_drive_enabled && FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
+        if !FeatureFlag::AccountFirstOnboarding.is_enabled()
+            && is_terminal
+            && !warp_drive_enabled
+            && FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
         {
             content.push(self.render_disclaimer_section(appearance));
         }
@@ -266,8 +277,11 @@ impl ThemePickerSlide {
             },
         );
 
+        let account_first = FeatureFlag::AccountFirstOnboarding.is_enabled();
         let theme_picker_last = FeatureFlag::OpenWarpNewSettingsModes.is_enabled();
-        let next_label = if theme_picker_last {
+        let next_label = if account_first {
+            "Next"
+        } else if theme_picker_last {
             "Get Warping"
         } else {
             "Next"
@@ -289,16 +303,14 @@ impl ThemePickerSlide {
             },
         );
 
-        let (step_index, step_count) = if theme_picker_last {
+        let (step_index, step_count) = if account_first {
+            self.onboarding_state.as_ref(app).progress()
+        } else if theme_picker_last {
             let is_terminal = matches!(
                 self.onboarding_state.as_ref(app).intention(),
                 OnboardingIntention::Terminal
             );
-            if is_terminal {
-                (3, 4)
-            } else {
-                (4, 5)
-            }
+            if is_terminal { (3, 4) } else { (4, 5) }
         } else {
             (0, 4)
         };
@@ -481,7 +493,9 @@ impl ThemePickerSlide {
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
-        if FeatureFlag::OpenWarpNewSettingsModes.is_enabled() {
+        if FeatureFlag::AccountFirstOnboarding.is_enabled()
+            || FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
+        {
             let path = self.theme_visual_path(app);
             layout::onboarding_right_panel_with_bg(path, layout::FOREGROUND_LAYOUT_DEFAULT)
         } else {
@@ -646,7 +660,9 @@ impl ThemePickerSlide {
 
     fn next(&mut self, ctx: &mut ViewContext<Self>) {
         self.onboarding_state.update(ctx, |model, ctx| {
-            if FeatureFlag::OpenWarpNewSettingsModes.is_enabled() {
+            if FeatureFlag::AccountFirstOnboarding.is_enabled()
+                || FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
+            {
                 model.complete(ctx);
             } else {
                 model.next(ctx);

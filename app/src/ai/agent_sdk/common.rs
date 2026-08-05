@@ -18,11 +18,11 @@ use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::cloud_environments::CloudAmbientAgentEnvironment;
 use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::auth::auth_state::AuthStateProvider;
-use crate::cloud_object::{CloudObject, Owner};
+use crate::cloud_object::{CloudObject, CloudObjectLookup as _, Owner};
 use crate::server::cloud_objects::update_manager::UpdateManager;
 use crate::server::ids::{ServerId, SyncId};
-use crate::server::server_api::ai::AIClient;
 use crate::server::server_api::ServerApiProvider;
+use crate::server::server_api::ai::AIClient;
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::workspaces::user_workspaces::UserWorkspaces;
 
@@ -37,7 +37,7 @@ pub fn validate_agent_mode_base_model_id(
 
     let llm_id: LLMId = model_id.into();
     let valid_ids = llm_prefs
-        .get_base_llm_choices_for_agent_mode()
+        .get_base_llm_choices_for_agent_mode(ctx)
         .map(|info| info.id.clone())
         .collect::<Vec<_>>();
 
@@ -116,7 +116,7 @@ pub fn resolve_owner(team_flag: bool, user_flag: bool, ctx: &AppContext) -> anyh
 /// other operations that depend on team membership.
 pub fn refresh_workspace_metadata<C>(
     ctx: &mut C,
-) -> impl Future<Output = anyhow::Result<()>> + Send + 'static
+) -> impl Future<Output = anyhow::Result<()>> + Send + 'static + use<C>
 where
     C: GetSingletonModelHandle + UpdateModel,
 {
@@ -137,7 +137,7 @@ where
 /// Refresh Warp Drive before executing an operation.
 pub fn refresh_warp_drive(
     ctx: &AppContext,
-) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
+) -> impl Future<Output = anyhow::Result<()>> + Send + 'static + use<> {
     UpdateManager::as_ref(ctx)
         .initial_load_complete()
         .with_timeout(WARP_DRIVE_SYNC_TIMEOUT)
@@ -329,22 +329,5 @@ impl fmt::Display for EnvironmentChoice {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::parse_ambient_task_id;
-
-    #[test]
-    fn parse_ambient_task_id_accepts_valid_ids() {
-        let task_id =
-            parse_ambient_task_id("550e8400-e29b-41d4-a716-446655440000", "Invalid run ID")
-                .unwrap();
-
-        assert_eq!(task_id.to_string(), "550e8400-e29b-41d4-a716-446655440000");
-    }
-
-    #[test]
-    fn parse_ambient_task_id_preserves_error_prefix() {
-        let err = parse_ambient_task_id("not-a-run-id", "Invalid run ID").unwrap_err();
-
-        assert!(err.to_string().contains("Invalid run ID 'not-a-run-id'"));
-    }
-}
+#[path = "common_tests.rs"]
+mod tests;

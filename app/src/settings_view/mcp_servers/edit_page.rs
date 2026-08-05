@@ -1,64 +1,63 @@
-#[cfg(not(target_family = "wasm"))]
+use std::collections::HashMap;
+use std::path::Path;
+#[cfg(feature = "local_fs")]
 use std::sync::Arc;
-use std::{collections::HashMap, path::Path};
 
+#[cfg(feature = "local_fs")]
 #[cfg(not(target_family = "wasm"))]
 use diesel::SqliteConnection;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(feature = "local_fs")]
 use parking_lot::Mutex;
 use pathfinder_geometry::vector::vec2f;
+use settings::Setting as _;
 use uuid::Uuid;
-use warp_core::{
-    send_telemetry_from_ctx,
-    ui::{appearance::Appearance, theme::color::internal_colors},
+use warp_core::send_telemetry_from_ctx;
+use warp_core::ui::appearance::Appearance;
+use warp_core::ui::theme::color::internal_colors;
+use warp_editor::content::buffer::InitialBufferState;
+use warp_editor::render::element::VerticalExpansionBehavior;
+use warp_errors::report_error;
+use warpui::elements::{
+    Border, ChildAnchor, ChildView, Container, CornerRadius, CrossAxisAlignment, Flex,
+    MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
+    ParentElement, ParentOffsetBounds, Radius, Shrinkable, Stack, Text,
 };
-use warp_editor::{
-    content::buffer::InitialBufferState, render::element::VerticalExpansionBehavior,
-};
+use warpui::platform::Cursor;
+use warpui::ui_components::components::UiComponent;
 use warpui::{
-    elements::{
-        Border, ChildAnchor, ChildView, Container, CornerRadius, CrossAxisAlignment, Flex,
-        MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
-        ParentElement, ParentOffsetBounds, Radius, Shrinkable, Stack, Text,
-    },
-    platform::Cursor,
-    ui_components::components::UiComponent,
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
 };
 
-use crate::{
-    ai::{
-        blocklist::secret_redaction::find_secrets_in_text,
-        mcp::{
-            parsing::{prettify_json, resolve_json, ParsedTemplatableMCPServerResult},
-            templatable::CloudTemplatableMCPServer,
-            MCPServer, TemplatableMCPServer, TemplatableMCPServerInstallation,
-            TemplatableMCPServerManager, TransportType,
-        },
-    },
-    banner::{Banner, BannerTextContent},
-    cloud_object::{CloudObject, Space},
-    code::editor::view::{CodeEditorRenderOptions, CodeEditorView},
-    persistence::ModelEvent,
-    server::{
-        cloud_objects::update_manager::InitiatedBy,
-        telemetry::{MCPTemplateCreationSource, TelemetryEvent},
-    },
-    settings_view::mcp_servers::{
-        destructive_mcp_confirmation_dialog::{
-            DestructiveMCPConfirmationDialog, DestructiveMCPConfirmationDialogEvent,
-            DestructiveMCPConfirmationDialogVariant,
-        },
-        style, ServerCardItemId,
-    },
-    ui_components::{buttons::icon_button, icons::Icon},
-    view_components::{
-        action_button::{ActionButton, DangerNakedTheme, DangerSecondaryTheme, PrimaryTheme},
-        DismissibleToast,
-    },
-    workspace::ToastStack,
-    GlobalResourceHandlesProvider,
+use crate::GlobalResourceHandlesProvider;
+use crate::ai::blocklist::secret_redaction::find_secrets_in_text;
+use crate::ai::mcp::parsing::{ParsedTemplatableMCPServerResult, prettify_json, resolve_json};
+use crate::ai::mcp::templatable::CloudTemplatableMCPServer;
+use crate::ai::mcp::{
+    MCPServer, TemplatableMCPServer, TemplatableMCPServerInstallation, TemplatableMCPServerManager,
+    TransportType,
 };
+use crate::banner::{Banner, BannerTextContent};
+use crate::cloud_object::{CloudObject, Space};
+use crate::code::editor::view::{CodeEditorRenderOptions, CodeEditorView};
+use crate::persistence::ModelEvent;
+#[cfg(feature = "local_fs")]
+use crate::persistence::{database_file_path_for_current_scope, establish_ro_connection};
+use crate::server::cloud_objects::update_manager::InitiatedBy;
+use crate::server::telemetry::{MCPTemplateCreationSource, TelemetryEvent};
+use crate::settings_view::mcp_servers::destructive_mcp_confirmation_dialog::{
+    DestructiveMCPConfirmationDialog, DestructiveMCPConfirmationDialogEvent,
+    DestructiveMCPConfirmationDialogVariant,
+};
+use crate::settings_view::mcp_servers::{ServerCardItemId, style};
+use crate::terminal::safe_mode_settings::SafeModeSettings;
+use crate::ui_components::buttons::icon_button;
+use crate::ui_components::icons::Icon;
+use crate::view_components::DismissibleToast;
+use crate::view_components::action_button::{
+    ActionButton, DangerNakedTheme, DangerSecondaryTheme, PrimaryTheme,
+};
+use crate::workspace::ToastStack;
+use crate::workspaces::user_workspaces::UserWorkspaces;
 
 const DEFAULT_JSON_TEXT: &str = r#"{
     "": {
@@ -124,7 +123,7 @@ pub struct MCPServersEditPageView {
     log_out_icon_button_mouse_handle: MouseStateHandle,
     editing_disabled_banner: ViewHandle<Banner<()>>,
 
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(feature = "local_fs")]
     #[allow(dead_code)]
     database_connection: Option<Arc<Mutex<SqliteConnection>>>,
 }
@@ -175,7 +174,7 @@ impl MCPServersEditPageView {
                     true,
                 ),
             );
-            editor.set_language_with_path(Path::new("mcp.json"), ctx);
+            editor.set_language_with_local_path(Path::new("/mcp.json"), ctx);
             editor
         });
 
@@ -192,12 +191,12 @@ impl MCPServersEditPageView {
             .with_icon(Icon::Warning)
         });
 
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(feature = "local_fs")]
         let database_connection =
-            crate::persistence::database_file_path()
+            database_file_path_for_current_scope()
                 .to_str()
                 .and_then(|db_url| {
-                    crate::persistence::establish_ro_connection(db_url)
+                    establish_ro_connection(db_url)
                         .ok()
                         .map(|conn| Arc::new(Mutex::new(conn)))
                 });
@@ -215,7 +214,7 @@ impl MCPServersEditPageView {
             log_out_icon_button_mouse_handle: Default::default(),
             editing_disabled_banner,
 
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(feature = "local_fs")]
             database_connection,
         }
     }
@@ -531,10 +530,13 @@ impl MCPServersEditPageView {
         ctx: &mut ViewContext<Self>,
         templatable_mcp_server: &TemplatableMCPServer,
     ) -> Result<(), String> {
+        let safe_mode_enabled = *SafeModeSettings::as_ref(ctx).safe_mode_enabled.value();
+        let enterprise_enforced =
+            UserWorkspaces::as_ref(ctx).is_enterprise_secret_redaction_enabled();
         let contains_secrets =
             !find_secrets_in_text(&templatable_mcp_server.template.json).is_empty();
 
-        if contains_secrets {
+        if should_block_save_for_secrets(safe_mode_enabled, enterprise_enforced, contains_secrets) {
             let window_id = ctx.window_id();
             ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
                 toast_stack.add_ephemeral_toast(
@@ -699,21 +701,23 @@ impl MCPServersEditPageView {
                 .map(|env_var| (env_var.name.clone(), env_var.value.clone()))
                 .collect();
             let Ok(env_vars_string) = serde_json::to_string(&env_vars) else {
-                log::error!("Could not serialize MCP env vars");
+                report_error!("Could not serialize MCP env vars");
                 return;
             };
             let global_resource_handles = GlobalResourceHandlesProvider::as_ref(ctx).get().clone();
 
-            if let Some(model_event_sender) = &global_resource_handles.model_event_sender {
-                if let Err(e) =
+            if let Some(model_event_sender) = &global_resource_handles.model_event_sender
+                && let Err(e) =
                     model_event_sender.send(ModelEvent::UpsertMCPServerEnvironmentVariables {
                         mcp_server_uuid: mcp_server.uuid.as_bytes().to_vec(),
                         environment_variables: env_vars_string,
                     })
-                {
-                    log::error!("Error persisting MCP server env vars to database: {e:?}");
-                };
-            }
+            {
+                report_error!(
+                    anyhow::Error::new(e)
+                        .context("Error persisting MCP server env vars to database")
+                );
+            };
         }
     }
 
@@ -903,6 +907,19 @@ impl TypedActionView for MCPServersEditPageView {
                         return;
                     }
 
+                    if parsed_servers
+                        .iter()
+                        .try_for_each(|parsed_server| {
+                            self.detect_secrets_in_templatable_mcp_server(
+                                ctx,
+                                &parsed_server.templatable_mcp_server,
+                            )
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+
                     for parsed_server in parsed_servers {
                         TemplatableMCPServerManager::handle(ctx).update(
                             ctx,
@@ -949,3 +966,22 @@ impl TypedActionView for MCPServersEditPageView {
         }
     }
 }
+
+/// Decide whether to block saving an MCP server config because secret
+/// redaction is in force AND the parsed config contains secret-shaped strings.
+///
+/// We block only when redaction is actually active — either the user-level
+/// Settings > Privacy > Secret redaction toggle is on, or the user's workspace
+/// has enterprise enforcement enabled. With both off, the user has explicitly
+/// opted to embed secrets in the config and we save it as written (#8761).
+fn should_block_save_for_secrets(
+    safe_mode_enabled: bool,
+    enterprise_enforced: bool,
+    contains_secrets: bool,
+) -> bool {
+    (safe_mode_enabled || enterprise_enforced) && contains_secrets
+}
+
+#[cfg(test)]
+#[path = "edit_page_tests.rs"]
+mod tests;

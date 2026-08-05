@@ -16,13 +16,13 @@ use warpui::{AppContext, Element, Entity, SingletonEntity as _, View, ViewContex
 
 use crate::features::FeatureFlag;
 use crate::menu::MenuItemFields;
-use crate::modal::{Modal, ModalEvent, MODAL_PADDING, MODAL_WIDTH};
+use crate::modal::{MODAL_PADDING, MODAL_WIDTH, Modal, ModalEvent};
 use crate::pricing::{PricingInfoModel, PricingInfoModelEvent};
 use crate::send_telemetry_from_ctx;
 use crate::server::telemetry::{AutoReloadModalAction, TelemetryEvent};
 use crate::settings_view::create_discount_badge;
 use crate::ui_components::blended_colors;
-use crate::view_components::{Dropdown, ToastFlavor};
+use crate::view_components::{Dropdown, DropdownAction, ToastFlavor};
 use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
 
 const DENOMINATION_DROPDOWN_WIDTH: f32 = MODAL_WIDTH - 2. * MODAL_PADDING;
@@ -194,11 +194,15 @@ impl EnableAutoReloadModalBody {
                         })),
                         Some(primary_text),
                     )
-                    .with_on_select_action(Action::SelectDenomination(index).into())
+                    .with_on_select_action(DropdownAction::select_action_and_close(
+                        Action::SelectDenomination(index),
+                    ))
                     .into_item()
                 } else {
                     MenuItemFields::new(primary_text.clone())
-                        .with_on_select_action(Action::SelectDenomination(index).into())
+                        .with_on_select_action(DropdownAction::select_action_and_close(
+                            Action::SelectDenomination(index),
+                        ))
                         .into_item()
                 }
             })
@@ -363,7 +367,7 @@ impl View for EnableAutoReloadModalBody {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     SelectDenomination(usize),
     Cancel,

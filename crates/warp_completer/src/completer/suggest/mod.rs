@@ -3,33 +3,30 @@ pub mod alias;
 #[cfg_attr(not(feature = "v2"), path = "legacy.rs")]
 mod imp;
 mod priority;
-use alias::{expand_command_aliases, AliasExpansionResult};
-pub use priority::Priority;
-
-use imp::*;
-use warp_core::ui::theme::AnsiColorIdentifier;
-
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
 
+use alias::{AliasExpansionResult, expand_command_aliases};
 use async_recursion::async_recursion;
+use imp::*;
 use itertools::Itertools;
+pub use priority::Priority;
 use smol_str::SmolStr;
 use warp_command_signatures::IconType;
+use warp_core::ui::theme::AnsiColorIdentifier;
 
-use crate::parsers::simple::parse_for_completions;
-use crate::{completer::describe::OptionCaseSensitivity, parsers::classify_command};
-use crate::{completer::TopLevelCommandCaseSensitivity, meta::Span};
-
+use super::EngineFileType;
+use super::coalesce::coalesce_completion_results;
+use super::context::CompletionContext;
 use super::engine::{self, completion_location};
-use super::{
-    coalesce::coalesce_completion_results,
-    context::CompletionContext,
-    matchers::{Match, MatchStrategy, MatchType},
-    EngineFileType,
-};
+use super::matchers::{Match, MatchStrategy, MatchType};
+use crate::completer::TopLevelCommandCaseSensitivity;
+use crate::completer::describe::OptionCaseSensitivity;
+use crate::meta::Span;
+use crate::parsers::classify_command;
+use crate::parsers::simple::parse_for_completions;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Suggestion {
@@ -292,7 +289,7 @@ impl SuggestionResults {
         &self,
         query: &str,
         path_separators: &[char],
-    ) -> impl Iterator<Item = FilteredSuggestion<'_>> + '_ {
+    ) -> impl Iterator<Item = FilteredSuggestion<'_>> + '_ + use<'_> {
         // We build up the suggestions to avoid having to iterate over the
         // same set of suggestions multiple times. This is performance-sensitive code.
         // Note that the suggestions in these sets are mutually exclusive.

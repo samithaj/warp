@@ -1,7 +1,8 @@
 use warp_core::safe_info;
-use warpui::{keymap::Keystroke, Entity, ModelContext, ModelHandle, ViewContext};
+use warpui_core::keymap::Keystroke;
+use warpui_core::{Entity, ModelContext, ModelHandle, ViewContext};
 
-use crate::register::{valid_register_name, BLACK_HOLE_REGISTER};
+use crate::register::{BLACK_HOLE_REGISTER, valid_register_name};
 
 /// ASCII code for backspace.
 /// In Normal and Visual modes, Vim treats backspace as a leftward character motion.
@@ -245,6 +246,8 @@ enum PendingAction {
     },
     /// the full "g" command
     G,
+    /// the full "z" command (e.g. zz)
+    Z,
     FindChar {
         direction: Direction,
         destination: FindCharDestination,
@@ -269,6 +272,7 @@ impl From<char> for PendingAction {
                 pending_operand: None,
             },
             'g' => Self::G,
+            'z' => Self::Z,
             'f' => Self::FindChar {
                 direction: Direction::Forward,
                 destination: FindCharDestination::AtChar,
@@ -304,7 +308,7 @@ pub enum VimMotion {
     FindChar(FindCharMotion),
     JumpToFirstLine,
     JumpToLastLine,
-    /// Jump to a specific line number. See ":help G" in Vim.
+    /// Jump to a specific line number. See ":help gg" and ":help G" in Vim.
     JumpToLine(u32),
     /// See ":help %" in Vim.
     JumpToMatchingBracket,
@@ -586,6 +590,12 @@ pub enum VimEventType {
     GotoDefinition,
     FindReferences,
     ShowHover,
+    /// Center the current line vertically in the viewport. Triggered by `zz`.
+    CenterCursorVertically,
+    /// Move cursor and scroll viewport down by half a page. Triggered by `<C-d>`.
+    ScrollHalfPageDown,
+    /// Move cursor and scroll viewport up by half a page. Triggered by `<C-u>`.
+    ScrollHalfPageUp,
 }
 
 impl VimEventType {
@@ -643,7 +653,10 @@ impl VimEventType {
             | VimEventType::Escape
             | VimEventType::GotoDefinition
             | VimEventType::FindReferences
-            | VimEventType::ShowHover => None,
+            | VimEventType::ShowHover
+            | VimEventType::CenterCursorVertically
+            | VimEventType::ScrollHalfPageDown
+            | VimEventType::ScrollHalfPageUp => None,
         }
     }
 }
@@ -699,7 +712,7 @@ impl VimFSA {
             pending_operand_count: None,
             pending_visual_object: None,
             last_find_motion: None,
-            // When doing an operation that reads/writes to a register, the default (unnamed) regsiter
+            // When doing an operation that reads/writes to a register, the default (unnamed) register
             // is called ".
             register: '"',
             dot_repeat_event: None,
@@ -774,7 +787,7 @@ impl VimFSA {
             "backspace" => match self.mode {
                 VimMode::Insert => self.handle_insert_mode_backspace().into(),
                 VimMode::Visual(_) | VimMode::Normal => {
-                    return self.typed_character(BACKSPACE_CHAR)
+                    return self.typed_character(BACKSPACE_CHAR);
                 }
                 VimMode::Replace => self.change_mode(VimMode::Normal.into()).into(),
             },
@@ -794,6 +807,28 @@ impl VimFSA {
                 VimMode::Insert => self.handle_insert_mode_delete().into(),
                 VimMode::Normal | VimMode::Visual(_) => self.typed_character('x')?,
                 VimMode::Replace => self.change_mode(VimMode::Normal.into()).into(),
+            },
+            "ctrl-d" => match self.mode {
+                VimMode::Normal | VimMode::Visual(_) => {
+                    let count = self.get_action_count().unwrap_or(1);
+                    self.clear();
+                    VimEvent {
+                        event_type: VimEventType::ScrollHalfPageDown,
+                        count,
+                    }
+                }
+                _ => return None,
+            },
+            "ctrl-u" => match self.mode {
+                VimMode::Normal | VimMode::Visual(_) => {
+                    let count = self.get_action_count().unwrap_or(1);
+                    self.clear();
+                    VimEvent {
+                        event_type: VimEventType::ScrollHalfPageUp,
+                        count,
+                    }
+                }
+                _ => return None,
             },
             _ => return None,
         };
@@ -824,7 +859,7 @@ impl VimFSA {
         }
     }
 
-    /// Exiting insert mode is simple when it had been entered without a count, you just chenge the
+    /// Exiting insert mode is simple when it had been entered without a count, you just change the
     /// mode. However, if there was a count, we need to repeat the text that was entered n - 1
     /// times.
     fn exit_insert_mode(&mut self) -> VimEvent {
@@ -917,7 +952,7 @@ impl VimFSA {
                     },
                 ),
                 'r' => self.change_mode(VimMode::Replace.into()),
-                'g' | 'd' | 'c' | 'y' | 'f' | 'F' | 't' | 'T' | '[' | ']' | '"' => {
+                'g' | 'd' | 'c' | 'y' | 'z' | 'f' | 'F' | 't' | 'T' | '[' | ']' | '"' => {
                     self.pending_action = Some(PendingAction::from(c));
                     return None;
                 }
@@ -1025,13 +1060,23 @@ impl VimFSA {
         action: PendingAction,
     ) -> Option<VimEventType> {
         let event = match action {
+            PendingAction::Z => match c {
+                'z' => VimEventType::CenterCursorVertically,
+                _ => {
+                    self.clear();
+                    return None;
+                }
+            },
             PendingAction::G => match c {
                 'e' | 'E' => VimEventType::Navigate(VimMotion::Word(WordMotion {
                     direction: Direction::Backward,
                     bound: WordBound::End,
                     word_type: WordType::from(c),
                 })),
-                'g' => VimEventType::Navigate(VimMotion::JumpToFirstLine),
+                'g' => match self.get_action_count() {
+                    Some(line_number) => VimEventType::Navigate(VimMotion::JumpToLine(line_number)),
+                    None => VimEventType::Navigate(VimMotion::JumpToFirstLine),
+                },
                 'd' => VimEventType::GotoDefinition,
                 'h' => VimEventType::ShowHover,
                 'r' => VimEventType::FindReferences,
@@ -1289,7 +1334,10 @@ impl VimFSA {
                 'g' => self.create_operation(
                     operator,
                     VimOperand::Motion {
-                        motion: VimMotion::JumpToFirstLine,
+                        motion: match self.get_operand_count() {
+                            Some(line_number) => VimMotion::JumpToLine(line_number),
+                            None => VimMotion::JumpToFirstLine,
+                        },
                         motion_type: MotionType::Linewise,
                     },
                 ),
@@ -1467,7 +1515,7 @@ impl VimFSA {
                     write_register_name,
                 }
             }
-            'g' | 'f' | 'F' | 't' | 'T' | '[' | ']' | '"' => {
+            'g' | 'z' | 'f' | 'F' | 't' | 'T' | '[' | ']' | '"' => {
                 self.pending_action = Some(PendingAction::from(c));
                 return None;
             }
@@ -1502,13 +1550,23 @@ impl VimFSA {
         pending_action: PendingAction,
     ) -> Option<VimEventType> {
         let event_type = match pending_action {
+            PendingAction::Z => match c {
+                'z' => VimEventType::CenterCursorVertically,
+                _ => {
+                    self.clear();
+                    return None;
+                }
+            },
             PendingAction::G => match c {
                 'e' | 'E' => VimEventType::Navigate(VimMotion::Word(WordMotion {
                     direction: Direction::Backward,
                     bound: WordBound::End,
                     word_type: WordType::from(c),
                 })),
-                'g' => VimEventType::Navigate(VimMotion::JumpToFirstLine),
+                'g' => match self.get_action_count() {
+                    Some(line_number) => VimEventType::Navigate(VimMotion::JumpToLine(line_number)),
+                    None => VimEventType::Navigate(VimMotion::JumpToFirstLine),
+                },
                 'c' => {
                     let motion_type = match self.mode {
                         VimMode::Visual(mt) => mt,
@@ -1634,14 +1692,14 @@ impl VimFSA {
     fn dot_repeat_text_mut(&mut self) -> Option<&mut String> {
         match &mut self.dot_repeat_event {
             Some(VimEvent {
-                event_type: VimEventType::InsertText { ref mut text, .. },
+                event_type: VimEventType::InsertText { text, .. },
                 ..
             })
             | Some(VimEvent {
                 event_type:
                     VimEventType::Operation {
                         operator: VimOperator::Change,
-                        replacement_text: ref mut text,
+                        replacement_text: text,
                         ..
                     },
                 ..
@@ -1744,7 +1802,7 @@ pub struct VimState<'a> {
     pub showcmd: &'a str,
 }
 
-/// This struct is a wrapper around the VimFSA that turns it into a warpui::Entity. We want to keep
+/// This struct is a wrapper around the VimFSA that turns it into a warpui_core::Entity. We want to keep
 /// the VimFSA independent of our UI framework, so anything involving warpui should live here
 /// instead.
 #[derive(Default)]
@@ -1768,7 +1826,7 @@ impl VimModel {
     }
 
     pub fn keypress(&mut self, keystroke: &Keystroke, ctx: &mut ModelContext<Self>) {
-        if let Some(event) = self.fsa.keypress(keystroke.key.as_str()) {
+        if let Some(event) = self.fsa.keypress(keystroke.normalized().as_str()) {
             ctx.emit(event);
         }
     }
@@ -1885,6 +1943,9 @@ where
             VimEventType::GotoDefinition => self.goto_definition(ctx),
             VimEventType::FindReferences => self.find_references(ctx),
             VimEventType::ShowHover => self.show_hover(ctx),
+            VimEventType::CenterCursorVertically => self.center_cursor_vertically(ctx),
+            VimEventType::ScrollHalfPageDown => self.scroll_half_page_down(event.count, ctx),
+            VimEventType::ScrollHalfPageUp => self.scroll_half_page_up(event.count, ctx),
         };
     }
 }
@@ -2003,4 +2064,15 @@ pub trait VimHandler {
     fn find_references(&mut self, _ctx: &mut ViewContext<Self>) {}
     /// Show hover information for the symbol under cursor (gh).
     fn show_hover(&mut self, _ctx: &mut ViewContext<Self>) {}
+    /// Center the current line vertically in the viewport (zz).
+    fn center_cursor_vertically(&mut self, _ctx: &mut ViewContext<Self>) {}
+    /// Move the cursor down `count` half-pages and scroll the viewport (`<C-d>`).
+    fn scroll_half_page_down(&mut self, _count: u32, _ctx: &mut ViewContext<Self>) {}
+    /// Move the cursor up `count` half-pages and scroll the viewport (`<C-u>`).
+    fn scroll_half_page_up(&mut self, _count: u32, _ctx: &mut ViewContext<Self>) {}
 }
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+#[path = "vim_tests.rs"]
+mod tests;

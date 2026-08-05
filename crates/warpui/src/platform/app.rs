@@ -1,11 +1,8 @@
-use warpui_core::{
-    integration::TestDriver,
-    keymap::{CustomTag, Keystroke},
-    r#async::LocalBoxFuture,
-    AppContext, AssetProvider,
-};
-
+use warpui_core::r#async::LocalBoxFuture;
+use warpui_core::integration::TestDriver;
+use warpui_core::keymap::{CustomTag, Keystroke};
 pub use warpui_core::platform::app::*;
+use warpui_core::{AppContext, AssetProvider};
 
 use super::AsInnerMut;
 
@@ -64,6 +61,14 @@ impl AppBuilder {
         }
     }
 
+    /// Allows a headless frontend with microphone functionality to query the
+    /// platform's existing microphone authorization state.
+    pub fn enable_headless_microphone_access_query(&mut self) {
+        if let AppBackend::Headless(inner) = &mut self.inner {
+            inner.enable_microphone_access_query();
+        }
+    }
+
     /// Constructs a new application using the headless backend.
     pub fn new_headless(
         callbacks: AppCallbacks,
@@ -83,7 +88,7 @@ impl AppBuilder {
     /// [`Keystroke`]-based binding using the provided `custom_tag_to_keystroke` function.
     ///
     /// This can be useful in the cases where an application registers a binding with a
-    /// [`crate::keymap::Trigger::Custom`] for use in a Mac menu, but still wants to to register the
+    /// [`crate::keymap::Trigger::Custom`] for use in a Mac menu, but still wants to register the
     /// binding with its corresponding `Keystroke` on other platforms that don't support menus.
     pub fn convert_custom_triggers_to_keystroke_triggers(
         &mut self,

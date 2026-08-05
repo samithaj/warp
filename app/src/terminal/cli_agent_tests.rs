@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Local;
@@ -9,10 +8,11 @@ use warp_util::path::EscapeChar;
 use warpui::App;
 
 use super::{
-    build_diff_hunk_prompt, build_review_prompt, build_selection_line_range_prompt,
-    build_selection_substring_prompt, CLIAgent, UBER_TEAM_UID,
+    CLIAgent, UBER_TEAM_UID, build_diff_hunk_prompt, build_review_prompt,
+    build_selection_line_range_prompt, build_selection_substring_prompt,
 };
 use crate::ai::agent::{AgentReviewCommentBatch, DiffSetHunk};
+use crate::code::buffer_location::LocalOrRemotePath;
 use crate::code::editor::line::EditorLineLocation;
 use crate::code_review::comments::{
     AttachedReviewComment, AttachedReviewCommentTarget, CommentOrigin, LineDiffContent,
@@ -60,6 +60,10 @@ fn batch(comments: Vec<AttachedReviewComment>) -> AgentReviewCommentBatch {
     }
 }
 
+fn local_path(path: &str) -> LocalOrRemotePath {
+    LocalOrRemotePath::Local(path.into())
+}
+
 // ---------------------------------------------------------------------------
 // build_review_prompt tests
 // ---------------------------------------------------------------------------
@@ -70,7 +74,7 @@ fn test_build_review_prompt_current_line_is_1_indexed() {
     let comment = make_comment(
         "fix this",
         AttachedReviewCommentTarget::Line {
-            absolute_file_path: PathBuf::from("/repo/src/main.rs"),
+            absolute_file_path: local_path("/repo/src/main.rs"),
             line: EditorLineLocation::Current {
                 line_number: LineCount::from(0),
                 line_range: LineCount::from(0)..LineCount::from(1),
@@ -92,7 +96,7 @@ fn test_build_review_prompt_removed_line_is_1_indexed() {
     let comment = make_comment(
         "why was this deleted?",
         AttachedReviewCommentTarget::Line {
-            absolute_file_path: PathBuf::from("/repo/old.rs"),
+            absolute_file_path: local_path("/repo/old.rs"),
             line: EditorLineLocation::Removed {
                 line_number: LineCount::from(9),
                 line_range: LineCount::from(9)..LineCount::from(10),
@@ -114,7 +118,7 @@ fn test_build_review_prompt_collapsed_range_is_1_indexed_start() {
     let comment = make_comment(
         "check this hunk",
         AttachedReviewCommentTarget::Line {
-            absolute_file_path: PathBuf::from("/repo/lib.rs"),
+            absolute_file_path: local_path("/repo/lib.rs"),
             line: EditorLineLocation::Collapsed {
                 line_range: LineCount::from(4)..LineCount::from(10),
             },
@@ -132,7 +136,7 @@ fn test_build_review_prompt_file_level_comment() {
     let comment = make_comment(
         "needs refactoring",
         AttachedReviewCommentTarget::File {
-            absolute_file_path: PathBuf::from("/repo/src/utils.rs"),
+            absolute_file_path: local_path("/repo/src/utils.rs"),
         },
         false,
     );
@@ -147,7 +151,7 @@ fn test_build_review_prompt_deleted_file_comment() {
     let comment = make_comment(
         "why remove this?",
         AttachedReviewCommentTarget::File {
-            absolute_file_path: PathBuf::from("/repo/src/old.rs"),
+            absolute_file_path: local_path("/repo/src/old.rs"),
         },
         false,
     );
@@ -193,7 +197,7 @@ fn test_build_review_prompt_multiple_comments() {
     let c1 = make_comment(
         "first",
         AttachedReviewCommentTarget::Line {
-            absolute_file_path: PathBuf::from("/repo/a.rs"),
+            absolute_file_path: local_path("/repo/a.rs"),
             line: EditorLineLocation::Current {
                 line_number: LineCount::from(4),
                 line_range: LineCount::from(4)..LineCount::from(5),
@@ -222,7 +226,7 @@ fn test_build_review_prompt_exports_internal_markdown_without_punctuation_escape
 
 #[test]
 fn test_build_diff_hunk_prompt_format() {
-    let prompt = build_diff_hunk_prompt(Path::new("/repo/src/main.rs"), 10, 20, 3, 2);
+    let prompt = build_diff_hunk_prompt("/repo/src/main.rs", 10, 20, 3, 2);
     assert_eq!(
         prompt,
         "/repo/src/main.rs L10-L20 (+3 -2) -- run `git diff` to see the full context.",
@@ -258,6 +262,10 @@ fn test_detect_known_agents() {
                 ("opencode", CLIAgent::OpenCode),
                 ("copilot", CLIAgent::Copilot),
                 ("agent", CLIAgent::CursorCli),
+                ("goose", CLIAgent::Goose),
+                ("vibe", CLIAgent::Vibe),
+                ("agy", CLIAgent::Antigravity),
+                ("omp", CLIAgent::OhMyPi),
             ] {
                 assert_eq!(
                     CLIAgent::detect(command, None, None, ctx),
@@ -281,6 +289,26 @@ fn test_detect_with_arguments() {
                 CLIAgent::detect("gemini chat", None, None, ctx),
                 Some(CLIAgent::Gemini),
             );
+        });
+    });
+}
+
+#[test]
+fn test_detect_vibe_acp_binary() {
+    // The mistral-vibe package ships a `vibe-acp` ACP-mode binary alongside
+    // the user-facing `vibe` TUI. Both must be detected as the same agent.
+    App::test((), |mut app| async move {
+        app.update(|ctx| {
+            assert_eq!(
+                CLIAgent::detect("vibe-acp", None, None, ctx),
+                Some(CLIAgent::Vibe),
+            );
+            assert_eq!(
+                CLIAgent::detect("vibe-acp --some-flag", None, None, ctx),
+                Some(CLIAgent::Vibe),
+            );
+            // Distinct binary names should not bleed into Vibe.
+            assert_eq!(CLIAgent::detect("vibe-other", None, None, ctx), None);
         });
     });
 }
@@ -325,6 +353,12 @@ fn test_detect_with_alias() {
                 CLIAgent::detect("c --help", None, Some(&map), ctx),
                 Some(CLIAgent::Claude),
             );
+
+            let map = aliases(&[("o", "omp")]);
+            assert_eq!(
+                CLIAgent::detect("o", None, Some(&map), ctx),
+                Some(CLIAgent::OhMyPi),
+            );
         });
     });
 }
@@ -365,6 +399,10 @@ fn test_detect_with_env_var_prefix() {
                     ctx,
                 ),
                 Some(CLIAgent::OpenCode),
+            );
+            assert_eq!(
+                CLIAgent::detect("FOO=1 omp", Some(EscapeChar::Backslash), None, ctx,),
+                Some(CLIAgent::OhMyPi),
             );
         });
     });
@@ -530,4 +568,65 @@ fn test_detect_aifx_agent_run_claude_wrong_team() {
             );
         });
     });
+}
+
+#[test]
+fn test_oh_my_pi_supports_bash_mode() {
+    assert!(CLIAgent::OhMyPi.supports_bash_mode());
+}
+
+#[test]
+fn test_command_is_warp_tui_matches_binaries_and_launchers() {
+    // Direct binary names.
+    assert!(CLIAgent::command_is_warp_tui("warp", None));
+    assert!(CLIAgent::command_is_warp_tui("warp-preview", None));
+    assert!(CLIAgent::command_is_warp_tui("warp-dev", None));
+    assert!(CLIAgent::command_is_warp_tui("warp-tui", None));
+    assert!(CLIAgent::command_is_warp_tui("warp-tui-oss", None));
+    // The dev launcher script.
+    assert!(CLIAgent::command_is_warp_tui("./script/run-tui", None));
+    assert!(CLIAgent::command_is_warp_tui("script/run-tui", None));
+    // Absolute / relative paths to the binary.
+    assert!(CLIAgent::command_is_warp_tui(
+        "/workspace/warp/target/debug/warp-tui",
+        None,
+    ));
+    assert!(CLIAgent::command_is_warp_tui(
+        "./target/debug/warp-tui",
+        None
+    ));
+    assert!(CLIAgent::command_is_warp_tui(
+        "/Applications/WarpPreview.app/Contents/MacOS/warp-preview --resume abc",
+        None,
+    ));
+    // With arguments and leading whitespace.
+    assert!(CLIAgent::command_is_warp_tui("  warp --resume abc", None));
+}
+
+#[test]
+fn test_command_is_warp_tui_with_env_var_prefix() {
+    // Env-var assignments before the command are skipped when an escape char is
+    // provided (mirrors `CLIAgent::detect`).
+    assert!(CLIAgent::command_is_warp_tui(
+        "WARP_API_KEY=secret warp",
+        Some(EscapeChar::Backslash),
+    ));
+}
+
+#[test]
+fn test_command_is_warp_tui_negatives() {
+    assert!(!CLIAgent::command_is_warp_tui("vim", None));
+    assert!(!CLIAgent::command_is_warp_tui("htop", None));
+    assert!(!CLIAgent::command_is_warp_tui("claude", None));
+    // Lookalikes / substrings should not match.
+    assert!(!CLIAgent::command_is_warp_tui("warp-preview-wrapper", None));
+    assert!(!CLIAgent::command_is_warp_tui("mywarp-dev", None));
+    assert!(!CLIAgent::command_is_warp_tui("warp-tui-wrapper", None));
+    assert!(!CLIAgent::command_is_warp_tui("mywarp-tui", None));
+    assert!(!CLIAgent::command_is_warp_tui("", None));
+    // `cargo run` is a known non-match (the first token is `cargo`).
+    assert!(!CLIAgent::command_is_warp_tui(
+        "cargo run -p warp_tui",
+        None
+    ));
 }

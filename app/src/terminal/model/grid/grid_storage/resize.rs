@@ -1,6 +1,9 @@
+// The code in this file is adapted from the alacritty_terminal crate under the
+// Apache license; see: crates/warp_terminal/src/model/LICENSE-ALACRITTY.
+
 //! Grid resize and reflow.
 
-use std::cmp::{min, Ordering};
+use std::cmp::{Ordering, min};
 use std::mem;
 
 use crate::terminal::model::cell::{Cell, Flags};
@@ -218,7 +221,7 @@ impl GridStorage {
                     // `num_wrapped` can be completed correctly, without saturating at (0, 0) (which previously
                     // occurred, if the cursor isn't adjusted). Ultimately, the user-facing impact resulted in an
                     // incorrect cursor position comparison leading to incorrect block heights, since Warp
-                    // erronenously believed a command to be "empty" (when comparing the "end of prompt" cursor
+                    // erroneously believed a command to be "empty" (when comparing the "end of prompt" cursor
                     // to the "end of the command").
                     // Note that last_row is a wrapped line in this case (see `should_reflow` and `debug_assert` above)!
                     self.cursor.point.row += 1;
@@ -337,7 +340,12 @@ impl GridStorage {
 
             loop {
                 // Remove all cells which require reflowing.
-                let mut wrapped = match row.shrink(columns) {
+                let shrunk = row.shrink(columns);
+                if !reflow {
+                    reset_invalid_trailing_wide_char(&mut row, columns);
+                }
+
+                let mut wrapped = match shrunk {
                     Some(wrapped) if reflow => wrapped,
                     _ => {
                         let cursor_buffer_line =
@@ -472,4 +480,12 @@ impl GridStorage {
         // Clamp the saved cursor to the grid.
         self.saved_cursor.point.col = min(self.saved_cursor.point.col, columns - 1);
     }
+}
+
+fn reset_invalid_trailing_wide_char(row: &mut Row, columns: usize) {
+    if columns == 0 || !row[columns - 1].flags().contains(Flags::WIDE_CHAR) {
+        return;
+    }
+    let bg = row[columns - 1].bg;
+    row[columns - 1] = bg.into();
 }

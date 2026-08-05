@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use settings::{
-    macros::define_settings_group, RespectUserSyncSetting, SupportedPlatforms, SyncToCloud,
-};
+use settings::macros::define_settings_group;
+use settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
 use warp_core::ui::theme::AnsiColorIdentifier;
 
 #[derive(
@@ -32,6 +31,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Never,
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "general.new_tab_placement",
     description: "Where new tabs are placed in the tab bar.",
@@ -63,6 +63,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.tabs.tab_close_button_position",
     description: "Position of the close button on tabs.",
@@ -100,6 +101,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.tabs.workspace_decoration_visibility",
     description: "When workspace decorations such as the tab bar are visible.",
@@ -192,6 +194,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Never,
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.tabs.directory_tab_colors",
     max_table_depth: 0,
@@ -202,8 +205,7 @@ settings::macros::implement_setting_for_enum!(
 impl DirectoryTabColors {
     /// Returns the configured tab color for a directory using longest-prefix matching.
     /// Returns `None` if no configured directory is a prefix of `dir`.
-    pub fn color_for_directory(&self, dir: &Path) -> Option<DirectoryTabColor> {
-        let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    pub fn color_for_directory(&self, canonical_dir: &Path) -> Option<DirectoryTabColor> {
         self.0
             .iter()
             .filter_map(|(configured_path, color)| {
@@ -222,11 +224,17 @@ impl DirectoryTabColors {
     /// Returns a new value with the given directory's color updated.
     pub fn with_color(&self, path: &Path, color: DirectoryTabColor) -> Self {
         let mut map = self.0.clone();
-
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        map.insert(canonical.to_string_lossy().to_string(), color);
+        map.insert(canonical_directory_key(path), color);
         Self(map)
     }
+}
+
+/// Canonicalizes `path` into the string key used in [`DirectoryTabColors`].
+pub fn canonical_directory_key(path: &Path) -> String {
+    dunce::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
 }
 
 #[derive(
@@ -269,6 +277,10 @@ impl HeaderToolbarChipSelection {
             Self::Custom { right, .. } => right.clone(),
         }
     }
+
+    pub fn contains_item(&self, item: &super::header_toolbar_item::HeaderToolbarItemKind) -> bool {
+        self.left_items().contains(item) || self.right_items().contains(item)
+    }
 }
 
 settings::macros::implement_setting_for_enum!(
@@ -276,6 +288,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.tabs.header_toolbar_chip_selection",
     description: "Configuration for the header toolbar chips in the vertical tab panel header.",
@@ -307,6 +320,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.vertical_tabs.view_mode",
     description: "Display mode for the vertical tab bar.",
@@ -338,6 +352,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.vertical_tabs.display_granularity",
     description: "Granularity of rows displayed in the vertical tabs panel.",
@@ -369,6 +384,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.vertical_tabs.tab_item_mode",
     description: "Tab item display mode in vertical tabs.",
@@ -396,11 +412,198 @@ pub enum VerticalTabsPrimaryInfo {
     Branch,
 }
 
+/// How many lines of information a horizontal tab shows.
+///
+/// Mirrors `VerticalTabsViewMode` for the horizontal bar. `SingleLine` is the
+/// historical look; `TwoLine` adds a smaller secondary line so a tab can show
+/// both what the agent is called and what it is doing.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "How many lines of information tabs show.",
+    rename_all = "snake_case"
+)]
+pub enum TabLineCount {
+    #[default]
+    SingleLine,
+    TwoLine,
+}
+
+settings::macros::implement_setting_for_enum!(
+    TabLineCount,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.tabs.line_count",
+    description: "How many lines of information tabs show.",
+);
+
+/// The primary (first line) information shown on a tab.
+///
+/// The horizontal counterpart of `VerticalTabsPrimaryInfo`, with the extra
+/// `AgentSession` option: the name of the agent running in the tab, such as a
+/// renamed Claude Code session.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "Primary information displayed on tabs.",
+    rename_all = "snake_case"
+)]
+pub enum TabPrimaryInfo {
+    #[default]
+    AgentSession,
+    /// The latest instruction the user gave the agent.
+    UserInstruction,
+    Command,
+    WorkingDirectory,
+    Branch,
+}
+
+settings::macros::implement_setting_for_enum!(
+    TabPrimaryInfo,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.tabs.primary_info",
+    description: "The primary information displayed on tabs.",
+);
+
+/// What each task row in the project rail shows.
+///
+/// Deliberately the same vocabulary as the tab-line settings so the rail is a
+/// third view of one idea rather than a competing one; it resolves through the
+/// same `tab_info_text` helper.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "Information shown on each task row in the project rail.",
+    rename_all = "snake_case"
+)]
+pub enum RailTaskInfo {
+    #[default]
+    AgentSession,
+    UserInstruction,
+    Command,
+    WorkingDirectory,
+    Branch,
+}
+
+settings::macros::implement_setting_for_enum!(
+    RailTaskInfo,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.tabs.rail_task_info",
+    description: "Information shown on each task row in the project rail.",
+);
+
+/// The secondary (second line) information shown on a tab, used only when
+/// [`TabLineCount::TwoLine`] is active.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "Secondary information displayed on two-line tabs.",
+    rename_all = "snake_case"
+)]
+pub enum TabSecondaryInfo {
+    #[default]
+    Command,
+    /// The latest instruction the user gave the agent. Pairs with an
+    /// `AgentSession` primary to show "what it's called" over "what I asked".
+    UserInstruction,
+    WorkingDirectory,
+    Branch,
+    AgentSession,
+}
+
+settings::macros::implement_setting_for_enum!(
+    TabSecondaryInfo,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.tabs.secondary_info",
+    description: "The secondary information displayed on two-line tabs.",
+);
+
+impl TabSecondaryInfo {
+    /// The secondary line to actually use, given the primary line.
+    ///
+    /// Showing the same value twice is never useful, so a secondary choice that
+    /// collides with the primary falls back to a sensible alternative — the
+    /// same conflict-avoidance the vertical tabs apply via
+    /// `resolve_compact_subtitle`.
+    pub fn resolved_for(self, primary: TabPrimaryInfo) -> Self {
+        let conflicts = matches!(
+            (primary, self),
+            (TabPrimaryInfo::AgentSession, Self::AgentSession)
+                | (TabPrimaryInfo::UserInstruction, Self::UserInstruction)
+                | (TabPrimaryInfo::Command, Self::Command)
+                | (TabPrimaryInfo::WorkingDirectory, Self::WorkingDirectory)
+                | (TabPrimaryInfo::Branch, Self::Branch)
+        );
+        if !conflicts {
+            return self;
+        }
+        match primary {
+            TabPrimaryInfo::AgentSession => Self::UserInstruction,
+            TabPrimaryInfo::UserInstruction => Self::Command,
+            TabPrimaryInfo::Command => Self::WorkingDirectory,
+            TabPrimaryInfo::WorkingDirectory => Self::Command,
+            TabPrimaryInfo::Branch => Self::Command,
+        }
+    }
+}
+
 settings::macros::implement_setting_for_enum!(
     VerticalTabsPrimaryInfo,
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.vertical_tabs.primary_info",
     description: "The primary information displayed on vertical tabs.",
@@ -433,6 +636,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.vertical_tabs.compact_subtitle",
     description: "Subtitle shown on compact vertical tabs.",
@@ -444,6 +648,7 @@ define_settings_group!(TabSettings, settings: [
         default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.tabs.show_indicators_button",
         description: "Whether to show activity indicators on tabs.",
@@ -453,6 +658,7 @@ define_settings_group!(TabSettings, settings: [
         default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "code.editor.show_code_review_button",
         description: "Whether to show the code review button on tabs.",
@@ -462,6 +668,7 @@ define_settings_group!(TabSettings, settings: [
         default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "code.editor.show_code_review_diff_stats",
         description: "Whether to show lines added/removed counts on the code review button.",
@@ -471,6 +678,7 @@ define_settings_group!(TabSettings, settings: [
         default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.tabs.preserve_active_tab_color",
         description: "Whether to preserve the active tab's color when switching tabs.",
@@ -480,15 +688,59 @@ define_settings_group!(TabSettings, settings: [
         default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.vertical_tabs.enabled",
         description: "Whether to display tabs vertically instead of horizontally.",
+    },
+    rail_show_tasks: RailShowTasks {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.tabs.rail_show_tasks",
+        description: "List each project's tasks under it in the project rail, each with its own status.",
+        feature_flag: warp_core::features::FeatureFlag::Projects,
+    },
+    use_project_layout: UseProjectLayout {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.project_layout.enabled",
+        description: "Group sessions by project: a project rail on the left, with that project's tasks as tabs along the top.",
+        feature_flag: warp_core::features::FeatureFlag::Projects,
+    },
+    show_vertical_tab_panel_in_restored_windows: ShowVerticalTabPanelInRestoredWindows {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.vertical_tabs.show_panel_in_restored_windows",
+        description: "When restoring a window, open the vertical tabs panel even if it was closed when the session was saved.",
+    },
+    hide_title_bar_search_bar_in_vertical_tabs: HideTitleBarSearchBarInVerticalTabs {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.vertical_tabs.hide_title_bar_search_bar",
+        description: "When using the vertical tab layout, hide the search bar in the title bar. Search stays available via the command palette and keyboard shortcuts.",
     },
     use_latest_user_prompt_as_conversation_title_in_tab_names: UseLatestUserPromptAsConversationTitleInTabNames {
         type: bool,
         default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.vertical_tabs.use_latest_prompt_as_title",
         description: "Whether vertical tab names for agent conversations use the latest user prompt.",
@@ -503,6 +755,7 @@ define_settings_group!(TabSettings, settings: [
         default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.vertical_tabs.show_pr_link",
         description: "Whether to show PR links on vertical tabs.",
@@ -512,6 +765,7 @@ define_settings_group!(TabSettings, settings: [
         default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.vertical_tabs.show_diff_stats",
         description: "Whether to show diff stats on vertical tabs.",
@@ -521,16 +775,49 @@ define_settings_group!(TabSettings, settings: [
         default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.vertical_tabs.show_details_on_hover",
         description: "Whether to show a details sidecar when hovering over a vertical tab.",
     },
+    rail_task_info: RailTaskInfo,
+    tab_line_count: TabLineCount,
+    tab_primary_info: TabPrimaryInfo,
+    tab_secondary_info: TabSecondaryInfo,
     header_toolbar_chip_selection: HeaderToolbarChipSelection,
     new_tab_placement: NewTabPlacement,
     workspace_decoration_visibility: WorkspaceDecorationVisibility,
     close_button_position: TabCloseButtonPosition,
     directory_tab_colors: DirectoryTabColors,
 ]);
+
+/// Whether the vertical-tabs sidebar layout is active.
+///
+/// Single source of truth for the vertical-vs-horizontal tab layout decision,
+/// so no render site can disagree with another. In project mode
+/// (`FeatureFlag::Projects`, the Herdr-style Projects × Tasks layout) the left
+/// rail is owned by the project list and tasks live on the horizontal top tab
+/// bar, so the vertical tabs sidebar is suppressed.
+pub fn vertical_tabs_layout_active(ctx: &warpui::AppContext) -> bool {
+    use warp_core::features::FeatureFlag;
+    use warpui::SingletonEntity as _;
+
+    FeatureFlag::VerticalTabs.is_enabled()
+        && *TabSettings::as_ref(ctx).use_vertical_tabs
+        && !project_layout_active(ctx)
+}
+
+/// Whether the Projects × Tasks layout is active: a project rail on the left,
+/// with the selected project's tasks on the horizontal top tab bar.
+///
+/// Single source of truth for the feature's gating — the flag plus the user
+/// setting — so the rail, the tab projection, and every navigation path agree.
+pub fn project_layout_active(ctx: &warpui::AppContext) -> bool {
+    use warp_core::features::FeatureFlag;
+    use warpui::SingletonEntity as _;
+
+    FeatureFlag::Projects.is_enabled() && *TabSettings::as_ref(ctx).use_project_layout
+}
 
 #[cfg(test)]
 #[path = "tab_settings_tests.rs"]

@@ -1,34 +1,28 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use chrono::{DateTime, Local, TimeZone as _};
 use futures::Future;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
-
 use warp_core::command::ExitCode;
+use warp_errors::report_error;
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 
-use super::{
-    model::block::{AgentInteractionMetadata, Block, SerializedAIMetadata, SerializedBlock},
-    shell::ShellType,
-};
-use crate::{
-    cloud_object::{
-        model::{persistence::CloudModel, view::CloudViewModel},
-        Space,
-    },
-    server::ids::{ClientId, HashableId as _, SyncId},
-    terminal::model::session::{Session, SessionId},
-    util::dedupe_from_last,
-    workflows::{
-        local_workflows::LocalWorkflows, workflow::Workflow, WorkflowId, WorkflowSource,
-        WorkflowType,
-    },
-};
+use super::model::block::{AgentInteractionMetadata, Block, SerializedAIMetadata, SerializedBlock};
+use super::shell::ShellType;
+use crate::cloud_object::Space;
+use crate::cloud_object::model::persistence::CloudModel;
+use crate::cloud_object::model::view::CloudViewModel;
+use crate::server::ids::{ClientId, HashableId as _, SyncId};
+use crate::terminal::model::session::{Session, SessionId};
+use crate::util::dedupe_from_last;
+use crate::workflows::local_workflows::LocalWorkflows;
+use crate::workflows::workflow::Workflow;
+use crate::workflows::{WorkflowId, WorkflowSource, WorkflowType};
 
 mod up_arrow;
 pub(crate) use up_arrow::UpArrowHistoryConfig;
+pub use up_arrow::prompt_history_for_terminal_view;
 
 /// Data model for a history command persisted to sqlite, used as an intermediate representation
 /// between the sqlite schema (sqlite::model::Command) and the [`History`] model.
@@ -489,17 +483,6 @@ impl History {
         }
     }
 
-    /// Returns an iterator over a tuple of (count, &HistoryEntry) for all commands in the history.
-    /// where count is the number of times the command has been run.
-    pub fn command_summaries(&self, hostname: String) -> Vec<(u32, &HistoryEntry)> {
-        self.persisted_commands_summary
-            .iter()
-            .filter(|(shell_host, _)| shell_host.hostname == hostname)
-            .flat_map(|(_, summaries)| summaries.values())
-            .map(|summary| (summary.count, &summary.most_recent_entry))
-            .collect()
-    }
-
     pub fn all_live_session_ids(&self) -> HashSet<SessionId> {
         self.session_id_to_shell_host.keys().cloned().collect()
     }
@@ -614,7 +597,7 @@ impl History {
             }
             Some(ReadHistoryFileState::Done) => {
                 let Some(history_file_commands) = self.history_file_commands.get(&host) else {
-                    log::error!(
+                    report_error!(
                         "History file commands should exist if history file has been read."
                     );
                     return;
@@ -954,13 +937,13 @@ impl History {
         };
 
         for entry in session_commands.iter_mut().rev() {
-            if let Some(entry_start_ts) = &entry.start_ts {
-                if entry_start_ts.timestamp_millis() == command_start_ts.timestamp_millis() {
-                    let entry = Arc::make_mut(entry);
-                    entry.exit_code = Some(exit_code);
-                    entry.completed_ts = Some(command_completed_ts);
-                    break;
-                }
+            if let Some(entry_start_ts) = &entry.start_ts
+                && entry_start_ts.timestamp_millis() == command_start_ts.timestamp_millis()
+            {
+                let entry = Arc::make_mut(entry);
+                entry.exit_code = Some(exit_code);
+                entry.completed_ts = Some(command_completed_ts);
+                break;
             }
         }
     }

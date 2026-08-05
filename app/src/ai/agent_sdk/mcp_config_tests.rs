@@ -1,4 +1,4 @@
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use warp_cli::mcp::MCPSpec;
 
 use super::build_mcp_servers_from_specs;
@@ -217,9 +217,10 @@ fn validation_rejects_invalid_entries() {
     .to_string();
 
     let err = build_mcp_servers_from_specs(&[MCPSpec::Json(spec)]).unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("must have exactly one of: 'warp_id', 'command', or 'url'"));
+    assert!(
+        err.to_string()
+            .contains("must have exactly one of: 'warp_id', 'command', or 'url'")
+    );
 
     // warp_id must be a UUID string.
     let spec = json!({ "mcpServers": { "bad": { "warp_id": "not-a-uuid" } } }).to_string();
@@ -260,6 +261,7 @@ fn validation_rejects_invalid_entries() {
 
 #[test]
 fn serializes_mcp_servers_as_object_not_string() {
+    use crate::ai::agent::UserQueryMode;
     use crate::ai::ambient_agents::AgentConfigSnapshot;
     use crate::server::server_api::ai::SpawnAgentRequest;
 
@@ -269,19 +271,25 @@ fn serializes_mcp_servers_as_object_not_string() {
         .unwrap();
 
     let request = SpawnAgentRequest {
-        prompt: "hello".to_string(),
+        prompt: Some("hello".to_string()),
+        mode: UserQueryMode::Normal,
         config: Some(AgentConfigSnapshot {
             mcp_servers: Some(mcp_servers),
             ..Default::default()
         }),
         title: None,
         team: None,
+        agent_identity_uid: None,
         skill: None,
         attachments: vec![],
         interactive: None,
         parent_run_id: None,
         runtime_skills: vec![],
         referenced_attachments: vec![],
+        conversation_id: None,
+        initial_snapshot_token: None,
+        snapshot_disabled: None,
+        orchestration_handoff: None,
     };
 
     let value = serde_json::to_value(&request).unwrap();

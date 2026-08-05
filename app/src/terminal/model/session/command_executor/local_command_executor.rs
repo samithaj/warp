@@ -1,20 +1,21 @@
-use super::{CommandExecutor, CommandOutput, ExecuteCommandOptions};
-use crate::safe_warn;
-use crate::terminal::shell::{Shell, ShellType};
-use anyhow::{anyhow, Result};
-use async_trait::async_trait;
-use command::r#async::Command;
-use parking_lot::Mutex;
 use std::any::Any;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
+use anyhow::{Result, anyhow};
+use async_trait::async_trait;
+use command::r#async::Command;
+use parking_lot::Mutex;
+
+use super::{CommandExecutor, CommandOutput, ExecuteCommandOptions};
+use crate::safe_warn;
+use crate::terminal::shell::{Shell, ShellType};
+
 #[cfg(unix)]
 fn kill_all_processes_in_process_group(pid: u32) -> Result<(), nix::Error> {
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
     // Killing a negative PID kills all processes in this process group
     kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL)
@@ -173,7 +174,7 @@ impl LocalCommandExecutor {
 
         let mut command_process = command_builder.build(command, shell_config_flag);
 
-        // This sets then enviornment variables, including the PATH var.
+        // This sets then environment variables, including the PATH var.
         // We need to run the command with the PATH var set because if the
         // user opened Warp through a parent process that didn't have the PATH var set
         // (i.e. outside of a shell, for example opening the app via Finder),

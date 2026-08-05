@@ -1,83 +1,81 @@
-use super::{
-    agent_assisted_environment_modal::{
-        AgentAssistedEnvironmentModal, AgentAssistedEnvironmentModalEvent,
-    },
-    delete_environment_confirmation_dialog::{
-        DeleteEnvironmentConfirmationDialog, DeleteEnvironmentConfirmationDialogEvent,
-    },
-    editor_text_colors,
-    settings_page::{
-        MatchData, PageType, SettingsPageEvent, SettingsPageMeta, SettingsPageViewHandle,
-        SettingsWidget, CONTENT_FONT_SIZE,
-    },
-    update_environment_form::{
-        EnvironmentFormInitArgs, EnvironmentFormValues, GithubAuthRedirectTarget,
-        UpdateEnvironmentForm, UpdateEnvironmentFormEvent,
-    },
-    SettingsSection,
-};
-use crate::{
-    ai::cloud_environments::{self, CloudAmbientAgentEnvironment},
-    appearance::Appearance,
-    cloud_object::{
-        model::persistence::{CloudModel, CloudModelEvent},
-        CloudObjectLocation, GenericStringObjectFormat, JsonObjectType, Owner, Space,
-    },
-    drive::CloudObjectTypeAndId,
-    editor::{EditorView, PropagateAndNoOpNavigationKeys, SingleLineEditorOptions, TextOptions},
-    root_view::CreateEnvironmentArg,
-    server::{
-        cloud_objects::update_manager::{
-            ObjectOperation, OperationSuccessType, UpdateManager, UpdateManagerEvent,
-        },
-        ids::{ClientId, ServerId, SyncId},
-    },
-    terminal::view::init_environment::mode_selector::{
-        EnvironmentSetupMode, EnvironmentSetupModeSelector, EnvironmentSetupModeSelectorEvent,
-    },
-    themes::theme::Fill as ThemeFill,
-    ui_components::{blended_colors, buttons::icon_button_with_color, icons::Icon},
-    util::time_format::format_approx_duration_from_now_utc,
-    view_components::{
-        render_copyable_text_field, CopyButtonPlacement, CopyableTextFieldConfig, DismissibleToast,
-        COPY_FEEDBACK_DURATION,
-    },
-    workspace::{ToastStack, WorkspaceAction},
-    workspaces::user_workspaces::UserWorkspaces,
-};
+use std::collections::HashMap;
+
 use instant::Instant;
 use pathfinder_geometry::vector::vec2f;
-use std::collections::HashMap;
 use warp_core::ui::color::blend::Blend;
 use warp_core::ui::theme::color::internal_colors;
 use warp_editor::editor::NavigationKey;
 use warp_graphql::scalars::time::ServerTimestamp;
+use warpui::elements::{
+    Align, Border, ChildAnchor, Clipped, ConstrainedBox, Container, CornerRadius,
+    CrossAxisAlignment, Element, Empty, Expanded, Flex, Hoverable, MainAxisAlignment, MainAxisSize,
+    MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius,
+    Shrinkable, SizeConstraintCondition, SizeConstraintSwitch, Stack, Text,
+};
+use warpui::fonts::{Properties, Weight};
+use warpui::prelude::ChildView;
+use warpui::ui_components::button::ButtonVariant;
+use warpui::ui_components::components::{UiComponent, UiComponentStyles};
+use warpui::windowing::state::ApplicationStage;
+use warpui::windowing::{self, WindowManager};
 use warpui::{
-    elements::{
-        Align, Border, ChildAnchor, Clipped, ConstrainedBox, Container, CornerRadius,
-        CrossAxisAlignment, Element, Empty, Expanded, Flex, Hoverable, MainAxisAlignment,
-        MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement,
-        ParentOffsetBounds, Radius, Shrinkable, SizeConstraintCondition, SizeConstraintSwitch,
-        Stack, Text,
-    },
-    fonts::{Properties, Weight},
-    prelude::ChildView,
-    ui_components::{
-        button::ButtonVariant,
-        components::{UiComponent, UiComponentStyles},
-    },
-    windowing::{self, state::ApplicationStage, WindowManager},
     AppContext, Entity, FocusContext, ModelHandle, SingletonEntity, TypedActionView, View,
     ViewContext, ViewHandle,
 };
 
+use super::agent_assisted_environment_modal::{
+    AgentAssistedEnvironmentModal, AgentAssistedEnvironmentModalEvent,
+};
+use super::delete_environment_confirmation_dialog::{
+    DeleteEnvironmentConfirmationDialog, DeleteEnvironmentConfirmationDialogEvent,
+};
+use super::settings_page::{
+    CONTENT_FONT_SIZE, MatchData, PageType, SettingsPageEvent, SettingsPageMeta,
+    SettingsPageViewHandle, SettingsWidget,
+};
+use super::update_environment_form::{
+    EnvironmentFormInitArgs, EnvironmentFormValues, UpdateEnvironmentForm,
+    UpdateEnvironmentFormEvent,
+};
+use super::{SettingsSection, editor_text_colors};
+use crate::ai::ambient_agents::github_auth_url::GithubAuthRedirectTarget;
+use crate::ai::cloud_environments::{self, CloudAmbientAgentEnvironment};
+use crate::appearance::Appearance;
+use crate::cloud_object::model::persistence::{CloudModel, CloudModelEvent};
+use crate::cloud_object::{
+    CloudObjectLocation, CloudObjectLookup as _, GenericStringObjectFormat, JsonObjectType, Owner,
+    Space,
+};
+use crate::drive::CloudObjectTypeAndId;
+use crate::editor::{
+    EditorView, PropagateAndNoOpNavigationKeys, SingleLineEditorOptions, TextOptions,
+};
+use crate::root_view::CreateEnvironmentArg;
+use crate::server::cloud_objects::update_manager::{
+    ObjectOperation, OperationSuccessType, UpdateManager, UpdateManagerEvent,
+};
+use crate::server::ids::{ClientId, ServerId, SyncId};
+use crate::terminal::view::init_environment::mode_selector::{
+    EnvironmentSetupMode, EnvironmentSetupModeSelector, EnvironmentSetupModeSelectorEvent,
+};
+use crate::themes::theme::Fill as ThemeFill;
+use crate::ui_components::blended_colors;
+use crate::ui_components::buttons::icon_button_with_color;
+use crate::ui_components::icons::Icon;
+use crate::util::time_format::format_approx_duration_from_now_utc;
+use crate::view_components::{
+    COPY_FEEDBACK_DURATION, CopyButtonPlacement, CopyableTextFieldConfig, DismissibleToast,
+    render_copyable_text_field,
+};
+use crate::workspace::{ToastStack, WorkspaceAction};
+use crate::workspaces::user_workspaces::UserWorkspaces;
+
 mod new_environment_button;
 use new_environment_button::NewEnvironmentButtonView;
-
 #[cfg(not(target_family = "wasm"))]
 #[allow(unused_imports)] // IntegrationsClient trait is used in fetch_github_repos
 use {
-    crate::server::server_api::{integrations::IntegrationsClient, ServerApiProvider},
+    crate::server::server_api::{ServerApiProvider, integrations::IntegrationsClient},
     warp_graphql::queries::user_github_info::UserGithubInfoResult,
 };
 
@@ -146,7 +144,7 @@ impl EnvironmentDisplayData {
             id: env.id,
             name: model.name.clone(),
             description: model.description.clone(),
-            docker_image: model.base_image.to_string(),
+            docker_image: model.base_image_display(),
             github_repos: model
                 .github_repos
                 .iter()
@@ -272,7 +270,7 @@ impl EnvironmentsPageView {
                         name: model.name.clone(),
                         description: model.description.clone().unwrap_or_default(),
                         selected_repos: model.github_repos.clone(),
-                        docker_image: model.base_image.to_string(),
+                        docker_image: model.base_image_display(),
                         setup_commands: model.setup_commands.clone(),
                     }
                 });
@@ -308,7 +306,7 @@ impl EnvironmentsPageView {
         placeholder: &'static str,
         ctx: &mut ViewContext<Self>,
     ) -> ViewHandle<EditorView> {
-        let editor = ctx.add_typed_action_view(|ctx| {
+        ctx.add_typed_action_view(|ctx| {
             let appearance = Appearance::as_ref(ctx);
             let options = SingleLineEditorOptions {
                 text: TextOptions {
@@ -324,8 +322,7 @@ impl EnvironmentsPageView {
             let mut editor = EditorView::single_line(options, ctx);
             editor.set_placeholder_text(placeholder, ctx);
             editor
-        });
-        editor
+        })
     }
 
     fn update_search_editor_text_colors(&mut self, ctx: &mut ViewContext<Self>) {
@@ -647,34 +644,26 @@ impl EnvironmentsPageView {
         // Check if this is a successful create for our pending create
         if let (ObjectOperation::Create { .. }, OperationSuccessType::Success) =
             (&result.operation, &result.success_type)
+            && let Some(pending_client_id) = self.pending_create_client_id.take()
         {
-            if let Some(pending_client_id) = self.pending_create_client_id.take() {
-                // Check if the client_id in the result matches our pending client_id
-                if let Some(result_client_id) = &result.client_id {
-                    if *result_client_id == pending_client_id {
-                        self.show_success_toast(
-                            "Successfully created environment".to_string(),
-                            ctx,
-                        );
-                    }
-                }
+            // Check if the client_id in the result matches our pending client_id
+            if let Some(result_client_id) = &result.client_id
+                && *result_client_id == pending_client_id
+            {
+                self.show_success_toast("Successfully created environment".to_string(), ctx);
             }
         }
 
         // Check if this is a successful delete for our pending delete
         if let (ObjectOperation::Delete { .. }, OperationSuccessType::Success) =
             (&result.operation, &result.success_type)
+            && let Some(pending_env_id) = self.pending_delete_env_id.take()
         {
-            if let Some(pending_env_id) = self.pending_delete_env_id.take() {
-                // Check if the server_id matches our pending environment
-                if let Some(server_id) = &result.server_id {
-                    if server_id.uid() == pending_env_id.uid() {
-                        self.show_success_toast(
-                            "Environment deleted successfully".to_string(),
-                            ctx,
-                        );
-                    }
-                }
+            // Check if the server_id matches our pending environment
+            if let Some(server_id) = &result.server_id
+                && server_id.uid() == pending_env_id.uid()
+            {
+                self.show_success_toast("Environment deleted successfully".to_string(), ctx);
             }
         }
 
@@ -1450,8 +1439,7 @@ impl EnvironmentsPageWidget {
                 icon: Icon::Github,
                 title: "Quick setup",
                 badge: Some("Suggested"),
-                subtitle:
-                    "Select the GitHub repositories you’d like to work with and we’ll suggest a base image and config",
+                subtitle: "Select the GitHub repositories you’d like to work with and we’ll suggest a base image and config",
                 action_button: github_button,
                 compact_action_button: github_button_compact,
                 icon_size,
@@ -1464,8 +1452,7 @@ impl EnvironmentsPageWidget {
                 icon: Icon::Terminal,
                 title: "Use the agent",
                 badge: None,
-                subtitle:
-                    "Choose a locally set up project and we’ll help you set up an environment based on it",
+                subtitle: "Choose a locally set up project and we’ll help you set up an environment based on it",
                 action_button: local_repos_button,
                 compact_action_button: local_repos_button_compact,
                 icon_size,
@@ -1792,25 +1779,25 @@ impl EnvironmentsPageWidget {
             );
 
             // Description (if present) - lighter than other details
-            if let Some(description) = &env_description {
-                if !description.is_empty() {
-                    content_column.add_child(
-                        Text::new(
-                            description.clone(),
-                            appearance.ui_font_family(),
-                            appearance.ui_font_size(),
-                        )
-                        .soft_wrap(true)
-                        .with_color(
-                            theme
-                                .background()
-                                .blend(&theme.foreground().with_opacity(80))
-                                .into(),
-                        )
-                        .with_selectable(true)
-                        .finish(),
-                    );
-                }
+            if let Some(description) = &env_description
+                && !description.is_empty()
+            {
+                content_column.add_child(
+                    Text::new(
+                        description.clone(),
+                        appearance.ui_font_family(),
+                        appearance.ui_font_size(),
+                    )
+                    .soft_wrap(true)
+                    .with_color(
+                        theme
+                            .background()
+                            .blend(&theme.foreground().with_opacity(80))
+                            .into(),
+                    )
+                    .with_selectable(true)
+                    .finish(),
+                );
             }
 
             let mut details_parts = vec![format!("Image: {}", env_docker_image)];
@@ -2041,13 +2028,9 @@ impl SettingsPageMeta for EnvironmentsPageView {
     }
 }
 
-use crate::pane_group::{
-    focus_state::PaneFocusHandle,
-    pane::{
-        view::{HeaderContent, HeaderRenderContext},
-        BackingView,
-    },
-};
+use crate::pane_group::focus_state::PaneFocusHandle;
+use crate::pane_group::pane::BackingView;
+use crate::pane_group::pane::view::{HeaderContent, HeaderRenderContext};
 
 impl BackingView for EnvironmentsPageView {
     type PaneHeaderOverflowMenuAction = EnvironmentsPageAction;

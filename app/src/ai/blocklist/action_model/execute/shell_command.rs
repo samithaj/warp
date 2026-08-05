@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use chrono::{DateTime, Local};
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use futures::{select, FutureExt};
+use futures::{FutureExt, select};
 use futures_lite::pin;
 use itertools::Itertools;
 use parking_lot::FairMutex;
@@ -15,30 +16,24 @@ use warp_util::path::ShellFamily;
 use warpui::r#async::{Spawnable, Timer};
 use warpui::{Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
 
+use super::{ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput};
 use crate::ai::agent::{
-    AIAgentActionId, AIAgentActionType, AIAgentPtyWriteMode, ReadShellCommandOutputResult,
-    RequestCommandOutputResult, ShellCommandDelay, ShellCommandError,
+    AIAgentActionId, AIAgentActionResultType, AIAgentActionType, AIAgentPtyWriteMode,
+    ReadShellCommandOutputResult, RequestCommandOutputResult, ShellCommandDelay, ShellCommandError,
     TransferShellCommandControlToUserResult, WriteToLongRunningShellCommandResult,
 };
-use crate::ai::blocklist::permissions::CommandExecutionPermission;
 use crate::ai::blocklist::BlocklistAIPermissions;
+use crate::ai::blocklist::permissions::CommandExecutionPermission;
 use crate::ai::execution_profiles::WriteToPtyPermission;
+use crate::terminal::TerminalModel;
 use crate::terminal::event::BlockMetadataReceivedEvent;
 use crate::terminal::model::block::{
-    formatted_terminal_contents_for_input, Block, BlockId, CURSOR_MARKER,
+    Block, BlockId, CURSOR_MARKER, formatted_terminal_contents_for_input,
 };
+use crate::terminal::model::session::active_session::ActiveSession;
+use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
 use crate::terminal::shell::ShellType;
-use crate::{
-    ai::agent::AIAgentActionResultType,
-    terminal::{
-        model::session::active_session::ActiveSession,
-        model_events::{ModelEvent, ModelEventDispatcher},
-        TerminalModel,
-    },
-};
-use crate::{send_telemetry_from_ctx, TelemetryEvent};
-
-use super::{ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput};
+use crate::{TelemetryEvent, send_telemetry_from_ctx};
 
 pub struct ShellCommandExecutor {
     active_session: ModelHandle<ActiveSession>,
@@ -79,7 +74,12 @@ impl ShellCommandExecutor {
         }
     }
 
-    fn handle_terminal_model_event(&mut self, event: &ModelEvent, _ctx: &mut ModelContext<Self>) {
+    fn handle_terminal_model_event(
+        &mut self,
+        _: ModelHandle<ModelEventDispatcher>,
+        event: &ModelEvent,
+        _ctx: &mut ModelContext<Self>,
+    ) {
         // We wait for precmd for the block _after_ the requested command's block so that
         // downstream checks for current working directory are fresh. The precmd hook is when
         // the shell relays current working directory to warp.
@@ -139,12 +139,9 @@ impl ShellCommandExecutor {
                         ctx
                     );
                 } else if let CommandExecutionPermission::Denied(reason) = autoexecution_permission
+                    && AppExecutionMode::as_ref(ctx).is_autonomous()
                 {
-                    if AppExecutionMode::as_ref(ctx).is_autonomous() {
-                        log::warn!(
-                            "Command denied during autonomous execution, reason: {reason:?}"
-                        );
-                    }
+                    log::warn!("Command denied during autonomous execution, reason: {reason:?}");
                 }
                 autoexecution_permission.is_allowed()
             }
@@ -211,7 +208,7 @@ impl ShellCommandExecutor {
         &mut self,
         input: ExecuteActionInput,
         ctx: &mut ModelContext<Self>,
-    ) -> impl Into<AnyActionExecution> {
+    ) -> impl Into<AnyActionExecution> + use<> {
         let model = self.terminal_model.lock();
 
         // Determine the action we want to take based on the input.
@@ -237,6 +234,17 @@ impl ShellCommandExecutor {
                     .is_active_and_long_running()
                 {
                     // If there is an active block, we can't execute another command.
+                    return ActionExecution::Sync(AIAgentActionResultType::RequestCommandOutput(
+                        RequestCommandOutputResult::CancelledBeforeExecution,
+                    ));
+                }
+                // If another conversation has taken over the agent view since this command
+                // was requested, cancel instead of executing.
+                let is_displaced_by_other_conversation = model
+                    .block_list()
+                    .active_conversation_id()
+                    .is_some_and(|active_id| active_id != input.conversation_id);
+                if is_displaced_by_other_conversation {
                     return ActionExecution::Sync(AIAgentActionResultType::RequestCommandOutput(
                         RequestCommandOutputResult::CancelledBeforeExecution,
                     ));
@@ -291,12 +299,16 @@ impl ShellCommandExecutor {
                 if block.finished() {
                     let output: String = block.output_with_secrets_unobfuscated();
                     let exit_code = block.exit_code();
+                    let start_ts = block.start_ts().cloned();
+                    let completed_ts = block.completed_ts().cloned();
                     return ActionExecution::Sync(
                         AIAgentActionResultType::WriteToLongRunningShellCommand(
                             WriteToLongRunningShellCommandResult::CommandFinished {
                                 block_id: block.id().clone(),
                                 output,
                                 exit_code,
+                                start_ts,
+                                completed_ts,
                             },
                         ),
                     );
@@ -344,12 +356,16 @@ impl ShellCommandExecutor {
                     let command = block.command_with_secrets_unobfuscated(false);
                     let output: String = block.output_with_secrets_unobfuscated();
                     let exit_code = block.exit_code();
+                    let start_ts = block.start_ts().cloned();
+                    let completed_ts = block.completed_ts().cloned();
                     return ActionExecution::Sync(AIAgentActionResultType::ReadShellCommandOutput(
                         ReadShellCommandOutputResult::CommandFinished {
                             command,
                             block_id: block_id.clone(),
                             output,
                             exit_code,
+                            start_ts,
+                            completed_ts,
                         },
                     ));
                 }
@@ -435,6 +451,8 @@ impl ShellCommandExecutor {
                                                 block_id: block.id().clone(),
                                                 output: block.output_with_secrets_unobfuscated(),
                                                 exit_code: block.exit_code(),
+                                                start_ts: block.start_ts().cloned(),
+                                                completed_ts: block.completed_ts().cloned(),
                                             }
                                         } else {
                                             let grid_contents = if model.is_alt_screen_active() {
@@ -496,7 +514,7 @@ impl ShellCommandExecutor {
         &mut self,
         block_selector: BlockSelector,
         delay: Option<ShellCommandDelay>,
-    ) -> impl Spawnable<Output = ActionResult> {
+    ) -> impl Spawnable<Output = ActionResult> + use<> {
         // Create a channel to notify us when we receive block metadata.
         let (block_metadata_received_tx, block_metadata_received_rx) = oneshot::channel();
         self.block_finished_senders
@@ -570,13 +588,16 @@ impl ShellCommandExecutor {
             // At this point, we've either received block metadata or we've timed out.
             // Check the current state of the block and produce a result accordingly.
             let model = terminal_model.lock();
-            let result = match block_selector.get_block(&model) {
+
+            match block_selector.get_block(&model) {
                 Some(block) => {
                     if block.finished() {
                         ActionResult::CommandFinished {
                             block_id: block.id().clone(),
                             output: block.output_with_secrets_unobfuscated(),
                             exit_code: block.exit_code(),
+                            start_ts: block.start_ts().cloned(),
+                            completed_ts: block.completed_ts().cloned(),
                         }
                     } else {
                         let grid_contents = if model.is_alt_screen_active() {
@@ -603,9 +624,7 @@ impl ShellCommandExecutor {
                     }
                 }
                 None => ActionResult::BlockNotFound,
-            };
-
-            result
+            }
         }
     }
 
@@ -650,10 +669,10 @@ impl ShellCommandExecutor {
             .cloned();
         drop(terminal_model);
 
-        if let Some(selector) = matching_selector {
-            if let Some(sender) = self.force_refresh_senders.remove(&selector) {
-                let _ = sender.send(());
-            }
+        if let Some(selector) = matching_selector
+            && let Some(sender) = self.force_refresh_senders.remove(&selector)
+        {
+            let _ = sender.send(());
         }
     }
 
@@ -693,11 +712,15 @@ fn action_result_for_requested_command(
             block_id,
             output,
             exit_code,
+            start_ts,
+            completed_ts,
         } => AIAgentActionResultType::RequestCommandOutput(RequestCommandOutputResult::Completed {
             command,
             block_id,
             output,
             exit_code,
+            start_ts,
+            completed_ts,
         }),
         ActionResult::LongRunningCommandSnapshot {
             block_id,
@@ -731,11 +754,15 @@ fn action_result_for_write_to_long_running_shell_command(
             block_id,
             output,
             exit_code,
+            start_ts,
+            completed_ts,
         } => AIAgentActionResultType::WriteToLongRunningShellCommand(
             WriteToLongRunningShellCommandResult::CommandFinished {
                 block_id,
                 output,
                 exit_code,
+                start_ts,
+                completed_ts,
             },
         ),
         ActionResult::LongRunningCommandSnapshot {
@@ -772,12 +799,16 @@ fn action_result_for_read_shell_command_output(
             output,
             exit_code,
             block_id,
+            start_ts,
+            completed_ts,
         } => AIAgentActionResultType::ReadShellCommandOutput(
             ReadShellCommandOutputResult::CommandFinished {
                 command,
                 block_id,
                 output,
                 exit_code,
+                start_ts,
+                completed_ts,
             },
         ),
         ActionResult::LongRunningCommandSnapshot {
@@ -814,11 +845,15 @@ fn action_result_for_transfer_shell_command_control_to_user(
             block_id,
             output,
             exit_code,
+            start_ts,
+            completed_ts,
         } => AIAgentActionResultType::TransferShellCommandControlToUser(
             TransferShellCommandControlToUserResult::CommandFinished {
                 block_id,
                 output,
                 exit_code,
+                start_ts,
+                completed_ts,
             },
         ),
         ActionResult::LongRunningCommandSnapshot {
@@ -882,6 +917,8 @@ enum ActionResult {
         block_id: BlockId,
         output: String,
         exit_code: ExitCode,
+        start_ts: Option<DateTime<Local>>,
+        completed_ts: Option<DateTime<Local>>,
     },
     LongRunningCommandSnapshot {
         block_id: BlockId,
@@ -893,3 +930,7 @@ enum ActionResult {
     Cancelled,
     BlockNotFound,
 }
+
+#[cfg(test)]
+#[path = "shell_command_tests.rs"]
+mod tests;

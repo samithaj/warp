@@ -1,15 +1,17 @@
 use std::collections::HashSet;
 
 use ai::agent::action_result::{AIAgentActionResultType, RequestComputerUseResult};
-use futures::{future::BoxFuture, FutureExt};
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use warpui::{Entity, EntityId, ModelContext, SingletonEntity};
 
+use super::{ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput};
 use crate::ai::agent::{AIAgentActionId, AIAgentActionType};
 use crate::ai::ambient_agents::AmbientAgentTaskId;
+use crate::ai::blocklist::BlocklistAIHistoryModel;
+use crate::features::FeatureFlag;
 use crate::send_telemetry_from_ctx;
 use crate::server::telemetry::TelemetryEvent;
-
-use super::{ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput};
 
 pub struct RequestComputerUseExecutor {
     terminal_view_id: EntityId,
@@ -59,7 +61,7 @@ impl RequestComputerUseExecutor {
         &mut self,
         input: ExecuteActionInput,
         ctx: &mut ModelContext<Self>,
-    ) -> impl Into<AnyActionExecution> {
+    ) -> impl Into<AnyActionExecution> + use<> {
         let ExecuteActionInput {
             action,
             conversation_id,
@@ -70,9 +72,14 @@ impl RequestComputerUseExecutor {
 
         // If we're executing, that implies that computer use has been approved.
         let is_autoexecuted = self.autoexecuted_actions.remove(&action.id);
+        let server_conversation_id = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .and_then(|c| c.server_conversation_token())
+            .map(|t| t.as_str().to_string());
         send_telemetry_from_ctx!(
             TelemetryEvent::ComputerUseApproved {
-                conversation_id,
+                client_conversation_id: conversation_id,
+                server_conversation_id,
                 is_autoexecuted,
                 ambient_agent_task_id: self.ambient_agent_task_id,
             },
@@ -80,12 +87,28 @@ impl RequestComputerUseExecutor {
         );
 
         let screenshot_params = request.screenshot_params;
+        // Build the actor here, in the synchronous (main-thread) body of `execute()`, before moving
+        // it into the async future below. On macOS this constructs the keycode cache via Carbon
+        // Text Input Source APIs that must run on the main thread; keep it out of the spawned
+        // future (which runs on a background executor thread) to avoid a libdispatch main-thread
+        // assertion. See also `use_computer.rs`.
         let mut actor = computer_use::create_actor();
         let platform = actor.platform();
+        // Gate per-window targeting behind the client feature flag. When off, the actor forces the
+        // legacy full-screen path so results are identical to the pre-existing implementation. The
+        // OS-capability check is folded into the request setting rather than reported in the result.
+        let background_enabled = FeatureFlag::BackgroundComputerUse.is_enabled();
         ActionExecution::Async {
             execute_future: Box::pin(async move {
                 let result = actor
-                    .perform_actions(&[], computer_use::Options { screenshot_params })
+                    .perform_actions(
+                        &[],
+                        computer_use::Options {
+                            screenshot_params,
+                            background_enabled,
+                            pointer_sink: None,
+                        },
+                    )
                     .await;
                 (result, platform)
             }),
@@ -93,6 +116,7 @@ impl RequestComputerUseExecutor {
                 (
                     Ok(computer_use::ActionResult {
                         screenshot: Some(screenshot),
+                        windows,
                         ..
                     }),
                     Some(platform),
@@ -100,6 +124,7 @@ impl RequestComputerUseExecutor {
                     RequestComputerUseResult::Approved {
                         screenshot,
                         platform,
+                        windows,
                     },
                 ),
                 (
