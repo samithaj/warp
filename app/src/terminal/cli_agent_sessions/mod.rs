@@ -162,6 +162,15 @@ pub struct CLIAgentSession {
     /// notification. Codex's OSC 9 fallback never sets it, so this is the
     /// single source of truth for whether the session is plugin-backed.
     pub received_rich_notification: bool,
+    /// When the session *entered* its current `Blocked` state, or `None` when
+    /// it is not blocked. Deliberately a session field rather than a payload on
+    /// `CLIAgentSessionStatus::Blocked`: the status derives `PartialEq`, and a
+    /// timestamp inside the variant would make two otherwise identical blocked
+    /// states unequal and leak a clock into `to_conversation_status`.
+    ///
+    /// `instant::Instant` (not `std::time::Instant`) because the app also
+    /// builds for wasm; see the workspace's `disallowed-types` lint.
+    pub blocked_since: Option<instant::Instant>,
 }
 
 impl CLIAgentSession {
@@ -177,6 +186,39 @@ impl CLIAgentSession {
     /// an actual rich notification arrives.
     pub fn supports_rich_status(&self) -> bool {
         self.received_rich_notification
+    }
+
+    /// How long the session has been waiting on the user, or `None` when it is
+    /// not blocked. Measured from when the session *first* entered `Blocked`,
+    /// so a second permission prompt arriving while the first is unanswered
+    /// does not restart the clock — the rail's escalation and the nag engine
+    /// both want the age of the wait, not the age of the last event.
+    // The read side lands with the rail's orange→red escalation and the nag
+    // engine; the stamp has to exist first for either to have anything to read.
+    #[allow(dead_code)]
+    pub fn blocked_duration(&self) -> Option<std::time::Duration> {
+        self.blocked_since.map(|since| since.elapsed())
+    }
+
+    /// Stamps or clears [`Self::blocked_since`] for a transition from the
+    /// current status to `new_status`. Must be called *before* `self.status` is
+    /// overwritten, since the decision depends on the state being left.
+    fn track_blocked_since(&mut self, new_status: &CLIAgentSessionStatus) {
+        let was_blocked = matches!(self.status, CLIAgentSessionStatus::Blocked { .. });
+        match new_status {
+            // Blocked → Blocked keeps the original stamp: repeated prompts are
+            // the same unanswered wait from the user's point of view.
+            CLIAgentSessionStatus::Blocked { .. } => {
+                if !was_blocked {
+                    self.blocked_since = Some(instant::Instant::now());
+                }
+            }
+            // Any exit from Blocked ends the wait; clearing unconditionally
+            // also keeps a never-blocked session's stamp at `None`.
+            CLIAgentSessionStatus::InProgress
+            | CLIAgentSessionStatus::Success
+            | CLIAgentSessionStatus::Failed { .. } => self.blocked_since = None,
+        }
     }
 
     /// Clears state populated by `PermissionRequest`. Called whenever the
@@ -265,6 +307,7 @@ impl CLIAgentSession {
             CLIAgentEventType::Unknown(_) => return None,
         };
 
+        self.track_blocked_since(&new_status);
         self.status = new_status.clone();
         Some(new_status)
     }
@@ -427,6 +470,7 @@ impl CLIAgentSessionsModel {
                 .as_deref()
                 .is_some_and(is_valid_session_id);
             // Upgrade existing session with plugin context.
+            session.track_blocked_since(&CLIAgentSessionStatus::InProgress);
             session.status = CLIAgentSessionStatus::InProgress;
             session.listener = Some(listener);
             session.plugin_version = plugin_version;
@@ -459,6 +503,7 @@ impl CLIAgentSessionsModel {
                 draft_text: None,
                 custom_command_prefix: None,
                 received_rich_notification: false,
+                blocked_since: None,
             },
             ctx,
         );

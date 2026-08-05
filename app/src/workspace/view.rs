@@ -23125,16 +23125,37 @@ impl Workspace {
     }
 
     /// The agent status of a single tab, matching what the tab itself displays:
-    /// a long-running shell command reads as in-progress, otherwise the focused
-    /// session's active conversation status (ignoring empty/passive ones).
+    /// a CLI agent's own protocol status first, then a long-running shell
+    /// command as in-progress, otherwise the focused session's active
+    /// conversation status (ignoring empty/passive ones).
     fn tab_conversation_status(tab: &TabData, ctx: &AppContext) -> Option<ConversationStatus> {
         let terminal_view = tab.pane_group.as_ref(ctx).focused_session_view(ctx)?;
         let terminal_view_ref = terminal_view.as_ref(ctx);
+        // A user-typed `claude` blocked on a permission prompt IS a
+        // long-running command, so the long-running check must not come first:
+        // it buried every plain CLI pane's Blocked under InProgress, and the
+        // project header could never say "waiting on you". Only plugin-backed
+        // sessions with rich status get a say here — a session that cannot
+        // really know it is blocked must not claim to be (same gating as the
+        // per-row badge in `agent_icon.rs`).
+        let cli_status = CLIAgentSessionsModel::as_ref(ctx)
+            .session(terminal_view_ref.id())
+            .filter(|session| session.listener.is_some() && session.supports_rich_status())
+            .map(|session| session.status.to_conversation_status());
+        if let Some(status @ ConversationStatus::Blocked { .. }) = cli_status {
+            return Some(status);
+        }
         if terminal_view_ref.is_long_running() {
             return Some(ConversationStatus::InProgress);
         }
-        let conversation =
-            BlocklistAIHistoryModel::as_ref(ctx).active_conversation(terminal_view_ref.id())?;
+        let Some(conversation) =
+            BlocklistAIHistoryModel::as_ref(ctx).active_conversation(terminal_view_ref.id())
+        else {
+            // No conversation to consult (a plain CLI pane): the agent's own
+            // non-blocked status is still the truth worth aggregating —
+            // Success here is what lets a finished agent read as done.
+            return cli_status;
+        };
         if conversation.is_empty() || conversation.is_entirely_passive() {
             return None;
         }

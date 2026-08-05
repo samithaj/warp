@@ -11995,6 +11995,7 @@ impl TerminalView {
                                                         draft_text: None,
                                                         custom_command_prefix: custom_command_prefix.clone(),
                                                         received_rich_notification: false,
+                                                        blocked_since: None,
                                                     },
                                                     ctx,
                                                 );
