@@ -6984,6 +6984,16 @@ impl Workspace {
                 .into_item()
         }];
         if priorities.can_move_up(project) {
+            // Same action as "Add to priorities": `with_added_to_top` promotes
+            // an already-ranked project rather than duplicating it. Worth its
+            // own entry because promoting is the common edit — a project just
+            // became urgent — and stepping it up one rank at a time is the
+            // part of ranking that gets tedious first.
+            items.push(
+                MenuItemFields::new("Move to top")
+                    .with_on_select_action(WorkspaceAction::AddProjectToPriorities(target.clone()))
+                    .into_item(),
+            );
             items.push(
                 MenuItemFields::new("Move up")
                     .with_on_select_action(WorkspaceAction::MoveProjectUpInPriorities(
