@@ -2214,6 +2214,13 @@ pub(crate) fn initialize_app(
     ctx.add_singleton_model(|_| {
         crate::terminal::cli_agent_sessions::session_scan::ClaudeSessionScanModel::default()
     });
+    // Digested transcript text for the session-search popup's content search.
+    // Registered beside the scan for the same reason it is: both are caches of
+    // Claude's own on-disk state that must never be built on the render path.
+    // Starts empty; the popup fills it when it opens.
+    ctx.add_singleton_model(|_| {
+        crate::terminal::cli_agent_sessions::transcript_digest::TranscriptDigestModel::default()
+    });
     // ActiveAgentViewsModel is used to track active agent conversations and notify listeners when they change.
     ctx.add_singleton_model(|_| ActiveAgentViewsModel::new());
     ctx.add_singleton_model(AgentNotificationsModel::new);

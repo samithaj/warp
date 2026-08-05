@@ -7,6 +7,10 @@ pub(crate) mod plugin_manager;
 /// state. Unconditional (unlike `transcript_naming`) so the rail's projection
 /// needs no `cfg`; the filesystem work inside it is what is gated.
 pub mod session_scan;
+/// Literal substring search inside the transcripts `session_scan` discovers.
+/// Unconditional for the same reason as `session_scan`: the palette's data
+/// source and the model's state exist everywhere, only the reading is gated.
+pub mod transcript_digest;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod transcript_naming;
 

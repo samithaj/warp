@@ -3047,10 +3047,14 @@ impl Workspace {
             me.handle_palette_event(event, ctx);
         });
 
-        // `Normal` and not `CtrlTab`: this popup is driven by typing, and the
-        // ctrl-tab mode hides the search bar.
-        let session_search_palette =
-            ctx.add_typed_action_view(|ctx| CommandPalette::new(NavigationMode::Normal, ctx));
+        // `SessionSearch` and not `CtrlTab`: this popup is driven by typing, and
+        // the ctrl-tab mode hides the search bar. It renders like `Normal` for
+        // exactly that reason, and differs only in what the mode switches on —
+        // the debounced transcript-content search, its footer, and the
+        // suppressed "no results" placeholder, none of which the two ordinary
+        // palettes should carry.
+        let session_search_palette = ctx
+            .add_typed_action_view(|ctx| CommandPalette::new(NavigationMode::SessionSearch, ctx));
         ctx.subscribe_to_view(&session_search_palette, |me, _, event, ctx| {
             me.handle_palette_event(event, ctx);
         });
@@ -15490,6 +15494,12 @@ impl Workspace {
         self.refresh_claude_session_scan(ctx);
 
         let candidates = self.agent_session_candidates(ctx);
+        // The same list, handed to the content search as its corpus: a popup
+        // that can name a session should be able to look inside it. Set here,
+        // once per open, for the same reason the candidates are — walking the
+        // tabs and resolving a project per directory is far too much to redo
+        // between keystrokes.
+        self.set_transcript_digest_corpus(&candidates, ctx);
 
         self.session_search_palette.update(ctx, |view, ctx| {
             view.reset(ctx);
@@ -15525,6 +15535,40 @@ impl Workspace {
         });
 
         ctx.notify();
+    }
+
+    /// Hands the transcript digest the sessions it may look inside.
+    ///
+    /// The corpus is the popup's own candidate list, minus nothing: the digest
+    /// drops the agents it cannot read (only Claude keeps a per-cwd transcript
+    /// store) rather than having that rule restated at every call site.
+    /// Replacing it also drops whatever the previous popup published, so a
+    /// reopened popup cannot show hits from a corpus it no longer offers.
+    fn set_transcript_digest_corpus(
+        &self,
+        candidates: &[AgentSessionCandidate],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        use crate::terminal::cli_agent_sessions::transcript_digest::{
+            DigestTarget, TranscriptDigestModel,
+        };
+
+        if !ctx.has_singleton_model::<TranscriptDigestModel>() {
+            return;
+        }
+        let corpus: Vec<DigestTarget> = candidates
+            .iter()
+            .map(|candidate| DigestTarget {
+                agent: candidate.agent,
+                session_id: candidate.session_id.clone(),
+                project_name: candidate.project_name.clone(),
+                task_name: candidate.task_name.clone(),
+                cwd: candidate.cwd.clone(),
+            })
+            .collect();
+        TranscriptDigestModel::handle(ctx).update(ctx, |digest, ctx| {
+            digest.set_corpus(corpus, ctx);
+        });
     }
 
     /// Every CLI-agent session the popup can offer, from all three sources:
