@@ -59,7 +59,10 @@ pub fn resume_command(agent: CLIAgent, session_id: &str) -> Option<String> {
         // Gemini has no resume support upstream yet; the rest have no
         // verified resume-by-id verb. Listed exhaustively so adding a
         // variant forces a decision here.
-        CLIAgent::Gemini
+        // `WarpTui` is Warp's own TUI front-end rather than a third-party CLI
+        // with a resume verb, so it has no command to prefill either.
+        CLIAgent::WarpTui
+        | CLIAgent::Gemini
         | CLIAgent::Amp
         | CLIAgent::Droid
         | CLIAgent::Copilot
@@ -82,7 +85,8 @@ pub fn continue_command(agent: CLIAgent) -> Option<String> {
         CLIAgent::Claude => Some(format!("{prefix} --continue")),
         CLIAgent::CursorCli => Some(format!("{prefix} --continue")),
         CLIAgent::OpenCode => Some(format!("{prefix} --continue")),
-        CLIAgent::Codex
+        CLIAgent::WarpTui
+        | CLIAgent::Codex
         | CLIAgent::Gemini
         | CLIAgent::Amp
         | CLIAgent::Droid

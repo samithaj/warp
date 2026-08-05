@@ -1,11 +1,79 @@
 use super::*;
 
 #[test]
-fn tui_uses_distinct_secure_storage_service_name() {
-    let launch_mode = LaunchMode::Tui {
-        mount: Box::new(|_| {}),
+fn app_api_key_requires_validation() {
+    let app = LaunchMode::App {
+        args: Default::default(),
+        api_key: Some("app-api-key".to_owned()),
+    };
+
+    assert!(matches!(
+        app.auth_initialization(),
+        AuthInitialization::PendingApiKey(api_key) if api_key == "app-api-key"
+    ));
+}
+
+#[test]
+fn tui_api_key_requires_validation() {
+    let tui = LaunchMode::Tui {
+        entrypoint: TuiEntryPoint::Interactive {
+            mount: Box::new(|_| {}),
+            api_key: Some("tui-api-key".to_owned()),
+        },
+    };
+
+    assert!(matches!(
+        tui.auth_initialization(),
+        AuthInitialization::PendingApiKey(api_key) if api_key == "tui-api-key"
+    ));
+}
+
+#[test]
+fn command_line_api_key_requires_validation() {
+    let command_line = LaunchMode::CommandLine {
+        command: CliCommand::Whoami,
+        global_options: GlobalOptions {
+            api_key: Some("cli-api-key".to_owned()),
+            ..Default::default()
+        },
+        debug: false,
+        is_sandboxed: false,
+        computer_use_override: None,
+    };
+
+    assert!(matches!(
+        command_line.auth_initialization(),
+        AuthInitialization::PendingApiKey(api_key) if api_key == "cli-api-key"
+    ));
+}
+
+#[test]
+fn startup_without_api_key_loads_persisted_auth() {
+    let app = LaunchMode::App {
+        args: Default::default(),
         api_key: None,
     };
+
+    assert!(matches!(
+        app.auth_initialization(),
+        AuthInitialization::Persisted
+    ));
+}
+
+#[test]
+fn tui_uses_distinct_secure_storage_service_name() {
+    let launch_mode = LaunchMode::Tui {
+        entrypoint: TuiEntryPoint::Interactive {
+            mount: Box::new(|_| {}),
+            api_key: None,
+        },
+    };
+    assert!(matches!(
+        &launch_mode,
+        LaunchMode::Tui {
+            entrypoint: TuiEntryPoint::Interactive { .. }
+        }
+    ));
 
     assert_eq!(
         launch_mode.secure_storage_service_name("dev.warp.Warp-Dev"),
@@ -29,8 +97,10 @@ fn app_keeps_default_secure_storage_service_name() {
 #[test]
 fn launch_modes_select_expected_logging_frontend() {
     let tui = LaunchMode::Tui {
-        mount: Box::new(|_| {}),
-        api_key: None,
+        entrypoint: TuiEntryPoint::Interactive {
+            mount: Box::new(|_| {}),
+            api_key: None,
+        },
     };
     let app = LaunchMode::App {
         args: Default::default(),
