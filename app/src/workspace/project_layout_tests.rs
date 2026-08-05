@@ -211,3 +211,42 @@ fn scanned_names_beat_the_cached_handle_title() {
         format!("{} · 61f785ca", CLIAgent::Claude.display_name())
     );
 }
+
+/// A dormant or scanned row is never labelled blank either. The handle store
+/// writes whatever title a plugin event carried, verbatim, so an empty or
+/// whitespace-only one reaches here and has to fall through to the id floor
+/// rather than draw an empty row.
+#[test]
+fn a_dormant_row_is_never_labelled_blank() {
+    const BLANKS: [&str; 4] = ["", " ", "   ", "\n\t "];
+    let floor = format!("{} · 61f785ca", CLIAgent::Claude.display_name());
+
+    for scanned in BLANKS {
+        for cached in BLANKS {
+            assert_eq!(
+                dormant_label(
+                    Some(scanned),
+                    Some(cached),
+                    CLIAgent::Claude,
+                    "61f785ca-1c31-4671-9d0e-2b0f5b7d1234"
+                ),
+                floor,
+                "blank labels ({scanned:?}, {cached:?}) should fall through to the id floor"
+            );
+        }
+    }
+
+    // A blank scan result must not shadow a cached title that does say
+    // something — the fall-through is per candidate, not all-or-nothing.
+    for blank in BLANKS {
+        assert_eq!(
+            dormant_label(
+                Some(blank),
+                Some("  Fix the parser "),
+                CLIAgent::Claude,
+                "61f785ca"
+            ),
+            "Fix the parser"
+        );
+    }
+}

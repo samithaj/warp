@@ -44,6 +44,8 @@ pub(super) struct WorkspaceMouseStates {
     pub(super) title_bar_search_bar: MouseStateHandle,
     /// The rail header's "+" button, which starts a new project.
     pub(super) rail_new_project_button: MouseStateHandle,
+    /// The rail header's filter button, which hides agent-less shell rows.
+    pub(super) rail_hide_shells_button: MouseStateHandle,
     #[cfg(target_family = "wasm")]
     pub(super) warp_logo: MouseStateHandle,
 }

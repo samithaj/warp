@@ -355,6 +355,7 @@ use crate::settings::{
     PrivacySettings, SelectionSettings, Settings, SshSettings, ThemeSettings, active_theme_kind,
     respect_system_theme,
 };
+use crate::settings_view::appearance_page::AppearancePageAction;
 use crate::settings_view::environments_page::EnvironmentsPage;
 use crate::settings_view::handoff_environment_creation_modal::{
     HandoffEnvironmentCreationModal, HandoffEnvironmentCreationModalEvent,
@@ -362,7 +363,9 @@ use crate::settings_view::handoff_environment_creation_modal::{
 use crate::settings_view::keybindings::{KeybindingChangedEvent, KeybindingChangedNotifier};
 use crate::settings_view::mcp_servers_page::MCPServersSettingsPage;
 use crate::settings_view::pane_manager::SettingsPaneManager;
-use crate::settings_view::{SettingsSection, SettingsView, SettingsViewEvent, flags};
+use crate::settings_view::{
+    SettingsAction, SettingsSection, SettingsView, SettingsViewEvent, flags,
+};
 #[cfg(all(target_os = "windows", feature = "local_tty"))]
 use crate::shell_indicator::ShellIndicatorType;
 use crate::tab::{
@@ -515,6 +518,9 @@ use crate::workspace::one_time_modal_model::OneTimeModalModel;
 use crate::workspace::project_key::ProjectKey;
 use crate::workspace::project_layout::{self, ProjectId, ProjectLayout};
 use crate::workspace::project_priorities::{ProjectPriorities, RailProjectRow, rail_project_rows};
+use crate::workspace::rail_shells::{
+    RailLiveRow, RailShellFilter, hidden_shells_label, visible_live_rows,
+};
 use crate::workspace::rail_triage::{
     self, ProjectTriage, RailChip, RailTask, RailUrgency, TaskTriage, chip_counts,
     next_chip_target, rail_task_order,
@@ -4260,6 +4266,7 @@ impl Workspace {
             TabSettingsChangedEvent::TabPrimaryInfo { .. }
             | TabSettingsChangedEvent::TabSecondaryInfo { .. }
             | TabSettingsChangedEvent::RailShowTasks { .. }
+            | TabSettingsChangedEvent::RailHideShellsWithoutAgents { .. }
             | TabSettingsChangedEvent::RailTaskInfo { .. } => {
                 // Tab text is derived at render time, so a repaint is enough.
                 ctx.notify();
@@ -23835,6 +23842,39 @@ impl Workspace {
             ));
         }
 
+        // The shell filter, next to the chips whose counts it explains. Filled
+        // funnel while filtering, hollow while not, so the rail says at a
+        // glance whether it is showing everything — a rail that quietly hides
+        // rows with no visible sign is worse than a noisy one. Hidden along
+        // with the task rows themselves: with nothing listed there is nothing
+        // to filter.
+        let tab_settings = TabSettings::as_ref(ctx);
+        let hide_shells = *tab_settings.rail_hide_shells_without_agents;
+        if *tab_settings.rail_show_tasks {
+            header_row.add_child(
+                self.render_tab_bar_icon_button(
+                    appearance,
+                    if hide_shells {
+                        icons::Icon::FilterFunnelFilled
+                    } else {
+                        icons::Icon::FilterFunnel
+                    },
+                    &self.mouse_states.rail_hide_shells_button,
+                    // Routed through the Appearance page's own toggle so the
+                    // button, the Settings switch and the command palette all
+                    // write the setting through one place.
+                    WorkspaceAction::DispatchToSettingsTab(SettingsAction::AppearancePageToggle(
+                        AppearancePageAction::ToggleRailHideShellsWithoutAgents,
+                    )),
+                    "Hide shells without agents".to_string(),
+                    None,
+                    hide_shells,
+                    false,
+                )
+                .finish(),
+            );
+        }
+
         // Reuses `OpenRepository` (the same action the top-level "Open
         // repository" entrypoint dispatches) rather than a new action: it
         // already does everything a new rail row needs — folder picker,
@@ -24039,6 +24079,11 @@ impl Workspace {
         };
         let selected = self.selected_project.clone();
         let show_tasks = *TabSettings::as_ref(ctx).rail_show_tasks;
+        // Plain shells are the rail's noise floor: in a rail whose job is
+        // "which agent needs me?", a column of `zsh` rows crowds out the
+        // answer. Dormant rows are not filtered — they exist only because a
+        // session does.
+        let hide_shells = *TabSettings::as_ref(ctx).rail_hide_shells_without_agents;
         // Rank sorts the rail into two bands. The order is a pure function of
         // this list, never of agent activity: a sidebar earns its keep through
         // spatial memory, so a project must not move because one of its agents
@@ -24180,11 +24225,52 @@ impl Workspace {
             if !show_tasks {
                 continue;
             }
+            // Which of this project's live rows survive the shell filter. The
+            // rule lives in `rail_shells` as a pure function; everything the
+            // exemptions need is resolved here, where the active tab and the
+            // MRU order are known.
+            let live_rows: Vec<RailLiveRow> = tasks
+                .iter()
+                .map(|(index, _)| RailLiveRow {
+                    tab_index: *index,
+                    // Resolved only while filtering: it repeats the conversation
+                    // and handle lookups the row's label already does, and a
+                    // rail that is not filtering must not pay for them.
+                    has_agent: hide_shells
+                        && self.tabs.get(*index).is_some_and(|tab| {
+                            crate::workspace::tab_title::pane_has_agent(
+                                tab.pane_group.as_ref(ctx),
+                                ctx,
+                            )
+                        }),
+                })
+                .collect();
+            let visible_rows = visible_live_rows(
+                &live_rows,
+                RailShellFilter {
+                    hide_shells,
+                    active_tab: Some(self.active_tab_index),
+                    // Only the selected project is kept from collapsing to a
+                    // bare header, and it keeps the tab the user was last in.
+                    fallback_row: is_selected
+                        .then(|| {
+                            self.mru_tab_index(
+                                &tasks.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+                            )
+                        })
+                        .flatten(),
+                },
+            );
             // One row per task, each with its own status. The project row's
             // aggregate can only say "something here needs you"; these say
             // which one.
             for (index, task_triage) in tasks {
                 let index = *index;
+                // Filtered rather than pre-collected so every row below keeps
+                // reading from the one triage pass, in rail order.
+                if !visible_rows.visible.contains(&index) {
+                    continue;
+                }
                 let Some(tab) = self.tabs.get(index) else {
                     continue;
                 };
@@ -24298,6 +24384,28 @@ impl Workspace {
                 })
                 .finish();
                 column.add_child(task_row);
+            }
+
+            // What the filter took away, said out loud. Deliberately inert: it
+            // is a count, not a target — clicking would have to either pick one
+            // arbitrary shell (surprising) or expand into per-project state the
+            // rail deliberately keeps none of. The header toggle is the way
+            // back, and it is one click away.
+            if let Some(label) = hidden_shells_label(visible_rows.hidden_shells) {
+                column.add_child(
+                    Container::new(
+                        Text::new_inline(label, font_family, 11.)
+                            .with_color(rank_color.into())
+                            .finish(),
+                    )
+                    .with_padding_left(10.)
+                    .with_padding_right(10.)
+                    .with_padding_top(2.)
+                    .with_padding_bottom(2.)
+                    .with_margin_left(ROW_SIDE_MARGIN + TASK_ROW_INDENT)
+                    .with_margin_right(ROW_SIDE_MARGIN)
+                    .finish(),
+                );
             }
 
             // Dormant tasks: sessions with no open tab, listed after the live
@@ -24752,6 +24860,12 @@ impl Workspace {
 
         if *tab_settings.use_project_layout {
             context.set.insert(flags::PROJECT_LAYOUT_CONTEXT_FLAG);
+        }
+
+        if *tab_settings.rail_hide_shells_without_agents {
+            context
+                .set
+                .insert(flags::RAIL_HIDE_SHELLS_WITHOUT_AGENTS_FLAG);
         }
 
         if session_settings
