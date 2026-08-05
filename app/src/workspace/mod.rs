@@ -17,6 +17,7 @@ mod native_modal;
 mod one_time_modal_model;
 pub mod project_key;
 pub mod project_layout;
+pub mod project_priorities;
 mod registry;
 pub mod rewind_confirmation_dialog;
 pub mod sync_inputs;
@@ -1013,6 +1014,63 @@ pub fn init(app: &mut AppContext) {
     // Tab/group pinning bindings (keyless by default; gated on `PinnedTabs`).
     // Pin/unpin are split into separate entries so the palette label tracks
     // the active tab/group's current state.
+    // Project priority bindings (keyless by default; gated on `Projects`).
+    // These carry no target, so they act on the rail's selected project — the
+    // Command Palette re-dispatches a stored action verbatim and cannot supply
+    // a row's identity, unlike the rail's own right-click menu. Add/remove are
+    // split so the palette label tracks the project's current rank state.
+    app.register_editable_bindings([
+        EditableBinding::new(
+            "workspace:add_project_to_priorities",
+            "Add project to priorities",
+            WorkspaceAction::AddProjectToPriorities(None),
+        )
+        .with_enabled(|| FeatureFlag::Projects.is_enabled())
+        .with_group(bindings::BindingGroup::Navigation.as_str())
+        .with_context_predicate(
+            id!("Workspace")
+                & id!(flags::PROJECT_LAYOUT_CONTEXT_FLAG)
+                & id!("Workspace_SelectedProjectRankable")
+                & !id!("Workspace_SelectedProjectRanked"),
+        ),
+        EditableBinding::new(
+            "workspace:remove_project_from_priorities",
+            "Remove project from priorities",
+            WorkspaceAction::RemoveProjectFromPriorities(None),
+        )
+        .with_enabled(|| FeatureFlag::Projects.is_enabled())
+        .with_group(bindings::BindingGroup::Navigation.as_str())
+        .with_context_predicate(
+            id!("Workspace")
+                & id!(flags::PROJECT_LAYOUT_CONTEXT_FLAG)
+                & id!("Workspace_SelectedProjectRanked"),
+        ),
+        EditableBinding::new(
+            "workspace:move_project_up_in_priorities",
+            "Move project up in priorities",
+            WorkspaceAction::MoveProjectUpInPriorities(None),
+        )
+        .with_enabled(|| FeatureFlag::Projects.is_enabled())
+        .with_group(bindings::BindingGroup::Navigation.as_str())
+        .with_context_predicate(
+            id!("Workspace")
+                & id!(flags::PROJECT_LAYOUT_CONTEXT_FLAG)
+                & id!("Workspace_SelectedProjectRanked"),
+        ),
+        EditableBinding::new(
+            "workspace:move_project_down_in_priorities",
+            "Move project down in priorities",
+            WorkspaceAction::MoveProjectDownInPriorities(None),
+        )
+        .with_enabled(|| FeatureFlag::Projects.is_enabled())
+        .with_group(bindings::BindingGroup::Navigation.as_str())
+        .with_context_predicate(
+            id!("Workspace")
+                & id!(flags::PROJECT_LAYOUT_CONTEXT_FLAG)
+                & id!("Workspace_SelectedProjectRanked"),
+        ),
+    ]);
+
     app.register_editable_bindings([
         EditableBinding::new(
             "workspace:pin_active_tab",

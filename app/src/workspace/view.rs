@@ -504,7 +504,9 @@ use crate::workspace::cross_window_tab_drag::{
 use crate::workspace::header_toolbar_editor::{HeaderToolbarEditorEvent, HeaderToolbarEditorModal};
 use crate::workspace::header_toolbar_item::HeaderToolbarItemKind;
 use crate::workspace::one_time_modal_model::OneTimeModalModel;
+use crate::workspace::project_key::ProjectKey;
 use crate::workspace::project_layout::{self, ProjectId, ProjectLayout};
+use crate::workspace::project_priorities::{ProjectPriorities, RailProjectRow, rail_project_rows};
 use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::TabCloseButtonPosition;
@@ -1176,6 +1178,9 @@ pub struct Workspace {
     header_toolbar_editor_modal: ViewHandle<HeaderToolbarEditorModal>,
     header_toolbar_context_menu: ViewHandle<Menu<WorkspaceAction>>,
     show_header_toolbar_context_menu: Option<Vector2F>,
+    project_rail_context_menu: ViewHandle<Menu<WorkspaceAction>>,
+    /// Where the project rail's context menu is anchored, when open.
+    show_project_rail_context_menu: Option<Vector2F>,
     theme_creator_modal: ViewHandle<ThemeCreatorModal>,
     theme_deletion_modal: ViewHandle<ThemeDeletionModal>,
     suggested_agent_mode_workflow_modal: ViewHandle<SuggestedAgentModeWorkflowModal>,
@@ -3545,6 +3550,8 @@ impl Workspace {
             header_toolbar_editor_modal: Self::build_header_toolbar_editor_modal(ctx),
             header_toolbar_context_menu: Self::build_header_toolbar_context_menu(ctx),
             show_header_toolbar_context_menu: None,
+            project_rail_context_menu: Self::build_project_rail_context_menu(ctx),
+            show_project_rail_context_menu: None,
             is_user_menu_open: false,
             tab_bar_pinned_by_popup: false,
             user_menu,
@@ -3886,6 +3893,11 @@ impl Workspace {
             | TabSettingsChangedEvent::RailShowTasks { .. }
             | TabSettingsChangedEvent::RailTaskInfo { .. } => {
                 // Tab text is derived at render time, so a repaint is enough.
+                ctx.notify();
+            }
+            TabSettingsChangedEvent::ProjectPriorities { .. } => {
+                // The rail's banding is derived from the list at render time,
+                // so a repaint is the whole update.
                 ctx.notify();
             }
             TabSettingsChangedEvent::TabLineCount { .. } => {
@@ -6537,6 +6549,104 @@ impl Workspace {
             .update(ctx, |menu, ctx| menu.set_items(items, ctx));
         self.show_header_toolbar_context_menu = Some(position);
         ctx.focus(&self.header_toolbar_context_menu);
+        ctx.notify();
+    }
+
+    fn build_project_rail_context_menu(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Menu<WorkspaceAction>> {
+        // `prevent_interaction_with_other_elements` is load-bearing here: the
+        // menu floats over a clickable project row, and without it the click
+        // that dismisses the menu falls through and re-selects the project.
+        let menu = ctx.add_typed_action_view(|_| {
+            Menu::new()
+                .with_drop_shadow()
+                .prevent_interaction_with_other_elements()
+        });
+        ctx.subscribe_to_view(&menu, |me, _, event, ctx| {
+            if let MenuEvent::Close { .. } = event {
+                me.show_project_rail_context_menu = None;
+                ctx.notify();
+            }
+        });
+        menu
+    }
+
+    /// Opens the project rail's right-click menu for `project`.
+    ///
+    /// The items are contextual to the project's current place in the priority
+    /// list: add or remove (never both), and move up/down only where the move
+    /// exists. `ProjectId::Other` is unrankable — no stable identity across
+    /// restarts — so it gets no menu at all rather than one whose every entry
+    /// would do nothing.
+    fn show_project_rail_context_menu(
+        &mut self,
+        project: &ProjectId,
+        position: Vector2F,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !FeatureFlag::Projects.is_enabled() {
+            return;
+        }
+        let ProjectId::Key(_) = project else {
+            return;
+        };
+        let priorities = TabSettings::as_ref(ctx).project_priorities.value().clone();
+        let target = Some(project.clone());
+        let mut items = vec![if priorities.contains(project) {
+            MenuItemFields::new("Remove from priorities")
+                .with_on_select_action(WorkspaceAction::RemoveProjectFromPriorities(target.clone()))
+                .into_item()
+        } else {
+            MenuItemFields::new("Add to priorities")
+                .with_on_select_action(WorkspaceAction::AddProjectToPriorities(target.clone()))
+                .into_item()
+        }];
+        if priorities.can_move_up(project) {
+            items.push(
+                MenuItemFields::new("Move up")
+                    .with_on_select_action(WorkspaceAction::MoveProjectUpInPriorities(
+                        target.clone(),
+                    ))
+                    .into_item(),
+            );
+        }
+        if priorities.can_move_down(project) {
+            items.push(
+                MenuItemFields::new("Move down")
+                    .with_on_select_action(WorkspaceAction::MoveProjectDownInPriorities(target))
+                    .into_item(),
+            );
+        }
+        self.project_rail_context_menu
+            .update(ctx, |menu, ctx| menu.set_items(items, ctx));
+        self.show_project_rail_context_menu = Some(position);
+        ctx.focus(&self.project_rail_context_menu);
+        ctx.notify();
+    }
+
+    /// Applies `update` to the priority list for `target`, or for the rail's
+    /// selected project when `target` is `None` (the Command Palette path,
+    /// which cannot carry a row identity).
+    ///
+    /// Unrankable buckets ([`ProjectId::Other`]) and a rail with nothing
+    /// selected both fall through as no-ops.
+    fn update_project_priorities(
+        &mut self,
+        target: Option<&ProjectId>,
+        ctx: &mut ViewContext<Self>,
+        update: impl FnOnce(&ProjectPriorities, &ProjectKey) -> ProjectPriorities,
+    ) {
+        if !FeatureFlag::Projects.is_enabled() {
+            return;
+        }
+        let Some(ProjectId::Key(key)) = target.or(self.selected_project.as_ref()).cloned() else {
+            return;
+        };
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            let updated = update(settings.project_priorities.value(), &key);
+            report_if_error!(settings.project_priorities.set_value(updated, ctx));
+        });
         ctx.notify();
     }
 
@@ -23184,6 +23294,53 @@ impl Workspace {
         working
     }
 
+    /// The thin "unranked" divider between the rail's two project bands: a
+    /// hairline, the label, a hairline. Rendered only when both bands have
+    /// rows, so it always marks a real boundary.
+    fn render_rail_band_divider(
+        font_size: f32,
+        side_margin: f32,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        const DIVIDER_LABEL: &str = "UNRANKED";
+        let theme = appearance.theme();
+        let rule = || {
+            Expanded::new(
+                1.,
+                ConstrainedBox::new(
+                    Rect::new()
+                        .with_background_color(theme.outline().into_solid())
+                        .finish(),
+                )
+                .with_height(1.)
+                .finish(),
+            )
+            .finish()
+        };
+        Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(6.)
+                .with_child(rule())
+                .with_child(
+                    Text::new_inline(
+                        DIVIDER_LABEL.to_string(),
+                        appearance.ui_font_family(),
+                        font_size,
+                    )
+                    .with_color(theme.disabled_ui_text_color().into())
+                    .finish(),
+                )
+                .with_child(rule())
+                .finish(),
+        )
+        .with_margin_left(side_margin + 10.)
+        .with_margin_right(side_margin + 10.)
+        .with_padding_top(8.)
+        .with_padding_bottom(4.)
+        .finish()
+    }
+
     /// Renders the project rail (Herdr-style Projects × Tasks layout): one
     /// clickable row per open project. Clicking a project dispatches
     /// `WorkspaceAction::SelectProject`, which activates that project's
@@ -23191,11 +23348,20 @@ impl Workspace {
     /// the top tab bar to it). The selected project row is highlighted, and rows
     /// highlight on hover. Only shown when the feature is enabled and more than
     /// one project is open.
+    ///
+    /// Projects are laid out in two bands: those the user has ranked (in rank
+    /// order, each showing its 1-based rank), then the "unranked" divider, then
+    /// everything else in first-seen order. Right-clicking a row manages its
+    /// rank.
     fn render_project_rail(&self, ctx: &AppContext) -> Box<dyn Element> {
         const ROW_CORNER_RADIUS: f32 = 6.;
         const ROW_SIDE_MARGIN: f32 = 6.;
         const PROJECT_STATUS_ICON_SIZE: f32 = 10.;
         const TASK_ICON_SIZE: f32 = 14.;
+        /// Width of the rank gutter. Fixed rather than intrinsic so every
+        /// project name starts at the same x, ranked or not.
+        const RANK_GUTTER_WIDTH: f32 = 14.;
+        const RANK_FONT_SIZE: f32 = 10.;
         // Matches TAB_GROUP_MEMBER_INDENT, so nesting reads the same as the
         // vertical tabs' grouped members.
         const TASK_ROW_INDENT: f32 = 12.;
@@ -23208,6 +23374,9 @@ impl Workspace {
         let font_family = appearance.ui_font_family();
         let text_color = theme.main_text_color(theme.background());
         let muted_color = theme.sub_text_color(theme.background());
+        // Fainter than the task labels: the rank is a reference number, not
+        // something to read down the list.
+        let rank_color = theme.disabled_ui_text_color();
         let selected_bg = internal_colors::fg_overlay_2(theme);
         let hover_bg = internal_colors::fg_overlay_1(theme);
         // Dormant rows come from the durable handle store plus the on-disk scan
@@ -23226,6 +23395,18 @@ impl Workspace {
         };
         let selected = self.selected_project.clone();
         let show_tasks = *TabSettings::as_ref(ctx).rail_show_tasks;
+        // Rank sorts the rail into two bands. The order is a pure function of
+        // this list, never of agent activity: a sidebar earns its keep through
+        // spatial memory, so a project must not move because one of its agents
+        // changed state.
+        let priorities = TabSettings::as_ref(ctx).project_priorities.value().clone();
+        let projects = layout.projects();
+        let rows = rail_project_rows(projects, &priorities);
+        // Reserve the gutter only once something is ranked, so a user who
+        // never opens the feature sees exactly today's rail.
+        let has_ranked_band = rows
+            .iter()
+            .any(|row| matches!(row, RailProjectRow::Project { rank: Some(_), .. }));
 
         // Header stays put; only the project/task list scrolls.
         let header = Container::new(
@@ -23240,7 +23421,23 @@ impl Workspace {
 
         let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Start);
 
-        for entry in layout.projects() {
+        for row in rows {
+            let (entry, rank) = match row {
+                RailProjectRow::UnrankedDivider => {
+                    column.add_child(Self::render_rail_band_divider(
+                        RANK_FONT_SIZE,
+                        ROW_SIDE_MARGIN,
+                        appearance,
+                    ));
+                    continue;
+                }
+                // Indices come from the same slice `rows` was built from, so
+                // this cannot miss; skipping beats panicking on the render path.
+                RailProjectRow::Project { index, rank } => match projects.get(index) {
+                    Some(entry) => (entry, rank),
+                    None => continue,
+                },
+            };
             let is_selected = selected.as_ref() == Some(&entry.id);
             let mouse_state = self
                 .project_rail_mouse_states
@@ -23250,22 +23447,40 @@ impl Workspace {
                 .clone();
             let label = entry.display_name.clone();
             let dispatch_id = entry.id.clone();
+            // The click closure takes ownership of `dispatch_id`, so the
+            // right-click path needs its own copy of the row's identity.
+            let menu_id = entry.id.clone();
             // Surfaces the project's aggregate agent status, so a project that
             // is blocked on the user is visible without selecting it.
             let status = self.project_status(&layout.visible_tab_indices(&entry.id), ctx);
             let row = Hoverable::new(mouse_state, move |state| {
-                let mut row_content = Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_child(
-                        Expanded::new(
-                            1.,
-                            Text::new_inline(label, font_family, 13.)
-                                .with_clip(ClipConfig::ellipsis())
-                                .with_color(text_color.into())
+                let mut row_content =
+                    Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+                if has_ranked_band {
+                    // Ranks read 1-based; the stored rank is the list index.
+                    // An unranked row still gets the (empty) gutter so the
+                    // names in both bands stay on one left edge.
+                    let rank_label = rank.map(|rank| (rank + 1).to_string()).unwrap_or_default();
+                    row_content.add_child(
+                        ConstrainedBox::new(
+                            Text::new_inline(rank_label, font_family, RANK_FONT_SIZE)
+                                .with_color(rank_color.into())
                                 .finish(),
                         )
+                        .with_width(RANK_GUTTER_WIDTH)
                         .finish(),
                     );
+                }
+                row_content.add_child(
+                    Expanded::new(
+                        1.,
+                        Text::new_inline(label, font_family, 13.)
+                            .with_clip(ClipConfig::ellipsis())
+                            .with_color(text_color.into())
+                            .finish(),
+                    )
+                    .finish(),
+                );
                 if let Some(status) = &status {
                     row_content.add_child(render_status_element(
                         status,
@@ -23291,6 +23506,12 @@ impl Workspace {
             .with_cursor(Cursor::PointingHand)
             .on_click(move |ctx, _, _| {
                 ctx.dispatch_typed_action(WorkspaceAction::SelectProject(dispatch_id.clone()));
+            })
+            .on_right_click(move |ctx, _, position| {
+                ctx.dispatch_typed_action(WorkspaceAction::ShowProjectRailContextMenu {
+                    project: menu_id.clone(),
+                    position,
+                });
             })
             .finish();
             column.add_child(row);
@@ -24744,6 +24965,29 @@ impl TypedActionView for Workspace {
             }
             SetActiveTabName(name) => self.set_active_tab_name(name, ctx),
             SelectProject(project) => self.select_project(project, ctx),
+            ShowProjectRailContextMenu { project, position } => {
+                self.show_project_rail_context_menu(project, *position, ctx)
+            }
+            AddProjectToPriorities(project) => self.update_project_priorities(
+                project.as_ref(),
+                ctx,
+                ProjectPriorities::with_added_to_top,
+            ),
+            RemoveProjectFromPriorities(project) => self.update_project_priorities(
+                project.as_ref(),
+                ctx,
+                ProjectPriorities::with_removed,
+            ),
+            MoveProjectUpInPriorities(project) => self.update_project_priorities(
+                project.as_ref(),
+                ctx,
+                ProjectPriorities::with_moved_up,
+            ),
+            MoveProjectDownInPriorities(project) => self.update_project_priorities(
+                project.as_ref(),
+                ctx,
+                ProjectPriorities::with_moved_down,
+            ),
             ActivateTaskByPaneGroupId(pane_group_id) => {
                 self.activate_tab_by_pane_group_id(*pane_group_id, ctx)
             }
@@ -27208,6 +27452,22 @@ impl View for Workspace {
             }
         }
 
+        // Priority commands act on the rail's selected project, so they are
+        // only offered when there is one and it has a stable identity to rank
+        // (`ProjectId::Other` never does). Splitting add from remove lets the
+        // palette label track the project's current state, the way pin/unpin
+        // does for tabs.
+        if let Some(project @ ProjectId::Key(_)) = self.selected_project.as_ref() {
+            context.set.insert("Workspace_SelectedProjectRankable");
+            if TabSettings::as_ref(app)
+                .project_priorities
+                .value()
+                .contains(project)
+            {
+                context.set.insert("Workspace_SelectedProjectRanked");
+            }
+        }
+
         // "Remove from group" is valid when there's an unambiguous target: a
         // 2+ multi-selection that shares one group, or—failing that—an active
         // tab that's in a group. Mirrors the multi-tab right-click menu, which
@@ -27537,6 +27797,18 @@ impl View for Workspace {
         if let Some(position) = self.show_header_toolbar_context_menu {
             stack.add_positioned_overlay_child(
                 ChildView::new(&self.header_toolbar_context_menu).finish(),
+                OffsetPositioning::offset_from_parent(
+                    position,
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::TopLeft,
+                    ChildAnchor::TopLeft,
+                ),
+            );
+        }
+
+        if let Some(position) = self.show_project_rail_context_menu {
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.project_rail_context_menu).finish(),
                 OffsetPositioning::offset_from_parent(
                     position,
                     ParentOffsetBounds::WindowByPosition,

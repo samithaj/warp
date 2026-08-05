@@ -153,6 +153,27 @@ pub enum WorkspaceAction {
     /// Activates the task clicked in the project rail, identified by its pane
     /// group so it cannot go stale if tabs close between paint and click.
     ActivateTaskByPaneGroupId(EntityId),
+    /// Opens the project rail's right-click menu for one project row.
+    ShowProjectRailContextMenu {
+        project: ProjectId,
+        position: Vector2F,
+    },
+    /// Puts a project at the top of the priority list (rank 1), promoting it
+    /// if it is already ranked.
+    ///
+    /// `None` targets the rail's selected project. That is how the Command
+    /// Palette reaches these: it re-dispatches a stored action verbatim and so
+    /// cannot supply a row's identity, while the context menu always can.
+    AddProjectToPriorities(Option<ProjectId>),
+    /// Removes a project from the priority list, dropping it into the
+    /// unranked band. `None` targets the selected project.
+    RemoveProjectFromPriorities(Option<ProjectId>),
+    /// Moves a project one rank towards the top. `None` targets the selected
+    /// project. A no-op for an unranked or already-top project.
+    MoveProjectUpInPriorities(Option<ProjectId>),
+    /// Moves a project one rank towards the bottom. `None` targets the
+    /// selected project. A no-op for an unranked or already-last project.
+    MoveProjectDownInPriorities(Option<ProjectId>),
     /// Resumes a dormant agent task from the project rail: opens a tab at the
     /// handle's stored cwd with the agent's resume command prefilled — never
     /// executed. Identified by task identity (agent + session id), so the
@@ -1055,6 +1076,13 @@ impl WorkspaceAction {
             | ToggleTabSelectionRightClickMenu { .. }
             | ToggleTabGroupRightClickMenu { .. }
             | ToggleVerticalTabsPaneContextMenu { .. }
+            | ShowProjectRailContextMenu { .. }
+            // Priorities live in settings, which persist themselves; no
+            // window layout changes, so there is no app state to save.
+            | AddProjectToPriorities(_)
+            | RemoveProjectFromPriorities(_)
+            | MoveProjectUpInPriorities(_)
+            | MoveProjectDownInPriorities(_)
             | OpenNewSessionMenu { .. }
             | ToggleTabConfigsMenu
             | ToggleNewSessionMenu { .. }
