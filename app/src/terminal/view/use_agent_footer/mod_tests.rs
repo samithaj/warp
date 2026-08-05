@@ -368,6 +368,7 @@ fn cli_agent_footer_renders_for_viewer_of_shared_cloud_agent_session() {
                         custom_command_prefix: None,
                         received_rich_notification: false,
                         blocked_since: None,
+                        success_seen: false,
                         should_auto_toggle_input: false,
                     },
                     ctx,

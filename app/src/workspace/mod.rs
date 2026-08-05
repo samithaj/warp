@@ -18,6 +18,7 @@ mod one_time_modal_model;
 pub mod project_key;
 pub mod project_layout;
 pub mod project_priorities;
+pub mod rail_triage;
 mod registry;
 pub mod rewind_confirmation_dialog;
 pub mod sync_inputs;

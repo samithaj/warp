@@ -11996,6 +11996,7 @@ impl TerminalView {
                                                         custom_command_prefix: custom_command_prefix.clone(),
                                                         received_rich_notification: false,
                                                         blocked_since: None,
+                                                        success_seen: false,
                                                     },
                                                     ctx,
                                                 );

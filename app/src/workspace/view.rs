@@ -51,6 +51,7 @@ use autoupdate::AutoupdateStage;
 #[cfg(target_os = "macos")]
 use command::blocking::Command;
 use futures::Future;
+use futures::stream::AbortHandle;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 pub(crate) use onboarding::OnboardingTutorial;
@@ -76,7 +77,7 @@ use warp_core::ui::Icon;
 use warp_core::ui::color::coloru_with_opacity;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::phenomenon::PhenomenonStyle;
-use warp_core::ui::theme::{AnsiColors, Fill};
+use warp_core::ui::theme::{AnsiColors, Fill, WarpTheme};
 use warp_core::user_preferences::GetUserPreferences as _;
 use warp_editor::editor::NavigationKey;
 use warp_errors::{report_error, report_if_error};
@@ -87,6 +88,7 @@ use warp_util::standardized_path::StandardizedPath;
 use warpui::accessibility::{
     AccessibilityContent, AccessibilityVerbosity, ActionAccessibilityContent, WarpA11yRole,
 };
+use warpui::r#async::Timer;
 use warpui::clipboard::ClipboardContent;
 #[cfg(target_family = "wasm")]
 use warpui::elements::Percentage;
@@ -101,7 +103,7 @@ use warpui::elements::{
     ScrollbarWidth, Shrinkable, SizeConstraintCondition, SizeConstraintSwitch, Stack, Text,
     resizable_state_handle,
 };
-use warpui::fonts::{Properties, Weight};
+use warpui::fonts::{FamilyId, Properties, Weight};
 use warpui::geometry::vector::{Vector2F, vec2f};
 use warpui::keymap::Context;
 use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback};
@@ -213,7 +215,7 @@ use crate::ai::blocklist::{
 use crate::ai::cloud_agent_settings::CloudAgentSettings;
 #[cfg(target_family = "wasm")]
 use crate::ai::conversation_details_panel::ConversationDetailsPanel;
-use crate::ai::conversation_status_ui::render_status_element;
+use crate::ai::conversation_status_ui::{StatusElementStyle, render_status_element};
 use crate::ai::conversation_utils;
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentModel};
 use crate::ai::execution_profiles::ExecutionProfileId;
@@ -391,7 +393,9 @@ use crate::terminal::cli_agent_sessions::plugin_manager::{PluginModalKind, plugi
 use crate::terminal::cli_agent_sessions::session_scan::{
     self, ClaudeSessionScanModel, ScannedSession,
 };
-use crate::terminal::cli_agent_sessions::{CLIAgentSessionsModel, CLIAgentSessionsModelEvent};
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentSession, CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
+};
 use crate::terminal::enable_auto_reload_modal::{
     EnableAutoReloadModal, EnableAutoReloadModalEvent,
 };
@@ -507,6 +511,10 @@ use crate::workspace::one_time_modal_model::OneTimeModalModel;
 use crate::workspace::project_key::ProjectKey;
 use crate::workspace::project_layout::{self, ProjectId, ProjectLayout};
 use crate::workspace::project_priorities::{ProjectPriorities, RailProjectRow, rail_project_rows};
+use crate::workspace::rail_triage::{
+    self, ProjectTriage, RailChip, RailTask, RailUrgency, TaskTriage, chip_counts,
+    next_chip_target, rail_task_order,
+};
 use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::TabCloseButtonPosition;
@@ -588,6 +596,13 @@ const RAIL_MIN_WIDTH: f32 = 120.;
 /// The rail is a navigation aid, never the main event: cap it at half the
 /// window so it cannot crowd out the terminal.
 const RAIL_MAX_WIDTH_RATIO: f32 = 0.5;
+/// How often the rail repaints so its wait ages ("3m") stay honest.
+///
+/// Coarse on purpose: ages render in whole minutes, so this is already twice
+/// as often as the smallest visible change, and the rail is redrawn for free
+/// on every real agent event anyway. Only runs while something is blocked —
+/// see `Workspace::rail_wait_age_refresh`.
+const RAIL_WAIT_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The hover area height for states where the tab bar is revealed on hover.
 const TAB_BAR_HOVER_HEIGHT: f32 = 12.;
@@ -1095,6 +1110,21 @@ pub struct Workspace {
     /// Hover/click state for the rail's dormant task rows, keyed by task
     /// identity (agent + session id) — a dormant task has no pane group.
     rail_dormant_mouse_states: RefCell<HashMap<(CLIAgent, String), MouseStateHandle>>,
+    /// Hover/click state for the rail header's jump-chips, one per chip kind.
+    /// Created once and persisted, per the MouseStateHandle rule — a handle
+    /// built inline while rendering registers no mouse interaction at all.
+    rail_chip_mouse_states: RefCell<HashMap<RailChip, MouseStateHandle>>,
+    /// Keeps the rail's wait ages ("3m") current while some agent is waiting.
+    ///
+    /// Lifecycle, all of it driven from
+    /// [`Self::sync_rail_wait_age_refresh`]: armed when a session enters
+    /// `Blocked`, self-reschedules every
+    /// [`RAIL_WAIT_AGE_REFRESH_INTERVAL`] for as long as anything is still
+    /// blocked, and aborted the moment nothing is — the rail is otherwise a
+    /// pure function of models that already notify, so a permanently ticking
+    /// repaint would be waste. Dropping the workspace drops the handle and
+    /// cancels the spawn with it.
+    rail_wait_age_refresh: Option<AbortHandle>,
     /// Scroll position of the project rail. Held here rather than rebuilt each
     /// render so the scroll offset survives repaints.
     project_rail_scroll_state: ClippedScrollStateHandle,
@@ -3476,6 +3506,8 @@ impl Workspace {
             project_rail_mouse_states: RefCell::default(),
             rail_task_mouse_states: RefCell::default(),
             rail_dormant_mouse_states: RefCell::default(),
+            rail_chip_mouse_states: RefCell::default(),
+            rail_wait_age_refresh: None,
             project_rail_scroll_state: ClippedScrollStateHandle::new(),
             project_rail_resizable_state: resizable_state_handle(RAIL_DEFAULT_WIDTH),
             tab_rename_editor: Self::tab_rename_editor(ctx),
@@ -3819,6 +3851,48 @@ impl Workspace {
         {
             ctx.notify();
         }
+        // Status changes are the only thing that can start or end a wait, so
+        // this is the one place the refresh timer needs re-evaluating.
+        self.sync_rail_wait_age_refresh(ctx);
+    }
+
+    /// Arms or disarms the rail's wait-age refresh to match reality.
+    ///
+    /// Idempotent: an already-armed timer is left alone rather than restarted,
+    /// so a burst of status events cannot stack up ticks.
+    fn sync_rail_wait_age_refresh(&mut self, ctx: &mut ViewContext<Self>) {
+        let needed = project_layout_active(ctx) && CLIAgentSessionsModel::as_ref(ctx).any_blocked();
+        match (needed, self.rail_wait_age_refresh.is_some()) {
+            (true, false) => self.schedule_rail_wait_age_refresh(ctx),
+            (false, true) => {
+                if let Some(handle) = self.rail_wait_age_refresh.take() {
+                    handle.abort();
+                }
+            }
+            (true, true) | (false, false) => {}
+        }
+    }
+
+    /// One tick of the wait-age refresh, rescheduling itself while the wait
+    /// lasts.
+    ///
+    /// Self-rescheduling `Timer::after` + `AbortHandle`, per the `Heartbeat`
+    /// pattern (`terminal/shared_session/network/heartbeat.rs`) — the async
+    /// runtime here has no interval primitive. The interval is deliberately
+    /// coarse: the ages render in whole minutes, so a repaint every 30s is
+    /// already twice as often as the smallest visible change.
+    fn schedule_rail_wait_age_refresh(&mut self, ctx: &mut ViewContext<Self>) {
+        let handle = ctx.spawn(
+            async move { Timer::after(RAIL_WAIT_AGE_REFRESH_INTERVAL).await },
+            |me, _, ctx| {
+                // The tick has fired, so the stored handle is spent whatever
+                // happens next; clearing it first is what lets `sync` re-arm.
+                me.rail_wait_age_refresh = None;
+                ctx.notify();
+                me.sync_rail_wait_age_refresh(ctx);
+            },
+        );
+        self.rail_wait_age_refresh = Some(handle.abort_handle());
     }
 
     /// Handle session settings changes.
@@ -23234,6 +23308,34 @@ impl Workspace {
         }
     }
 
+    /// The CLI agent session behind a tab's focused pane, if it is one whose
+    /// status can be trusted.
+    ///
+    /// Only plugin-backed sessions with rich status qualify — a session that
+    /// cannot really know it is blocked must not claim to be (the same gating
+    /// as the per-row badge in `agent_icon.rs`). Shared by the header
+    /// aggregate and the rail's row triage so the two can never disagree
+    /// about which sessions count.
+    fn tab_rich_cli_session<'a>(tab: &TabData, ctx: &'a AppContext) -> Option<&'a CLIAgentSession> {
+        let terminal_view = tab.pane_group.as_ref(ctx).focused_session_view(ctx)?;
+        let terminal_view_id = terminal_view.as_ref(ctx).id();
+        CLIAgentSessionsModel::as_ref(ctx)
+            .session(terminal_view_id)
+            .filter(|session| session.listener.is_some() && session.supports_rich_status())
+    }
+
+    /// Everything the rail's triage needs from one tab: the status its badge
+    /// shows, plus the two facts only a CLI agent session knows — how long it
+    /// has been waiting, and whether its result has been looked at.
+    fn tab_triage(tab: &TabData, ctx: &AppContext) -> TaskTriage {
+        let session = Self::tab_rich_cli_session(tab, ctx);
+        TaskTriage {
+            status: Self::tab_conversation_status(tab, ctx),
+            blocked_for: session.and_then(CLIAgentSession::blocked_duration),
+            has_unseen_success: session.is_some_and(CLIAgentSession::has_unseen_success),
+        }
+    }
+
     /// The agent status of a single tab, matching what the tab itself displays:
     /// a CLI agent's own protocol status first, then a long-running shell
     /// command as in-progress, otherwise the focused session's active
@@ -23248,9 +23350,7 @@ impl Workspace {
         // sessions with rich status get a say here — a session that cannot
         // really know it is blocked must not claim to be (same gating as the
         // per-row badge in `agent_icon.rs`).
-        let cli_status = CLIAgentSessionsModel::as_ref(ctx)
-            .session(terminal_view_ref.id())
-            .filter(|session| session.listener.is_some() && session.supports_rich_status())
+        let cli_status = Self::tab_rich_cli_session(tab, ctx)
             .map(|session| session.status.to_conversation_status());
         if let Some(status @ ConversationStatus::Blocked { .. }) = cli_status {
             return Some(status);
@@ -23279,19 +23379,234 @@ impl Workspace {
     /// input) wins over one that is merely working — with many projects open,
     /// "which project is waiting on me?" is the question the rail should answer
     /// at a glance. Projects with no agent activity get no indicator.
-    fn project_status(&self, indices: &[usize], ctx: &AppContext) -> Option<ConversationStatus> {
-        let mut working = None;
-        for tab in indices.iter().filter_map(|index| self.tabs.get(*index)) {
-            match Self::tab_conversation_status(tab, ctx) {
-                Some(
-                    status @ (ConversationStatus::Blocked { .. }
-                    | ConversationStatus::WaitingForEvents),
-                ) => return Some(status),
-                Some(status @ ConversationStatus::InProgress) => working = Some(status),
-                _ => {}
+    ///
+    /// The precedence itself lives in [`RailUrgency`], which also carries the
+    /// escalation and the "unseen result" state the badge alone cannot express;
+    /// the returned aggregate bundles the winning status with the *worst*
+    /// child's wait so the header can render both without three parallel
+    /// `Option`s having to be kept in step.
+    ///
+    /// This is the sole replacement for the old `project_status`, whose one
+    /// caller was the rail's project row.
+    fn project_triage(tasks: &[(usize, TaskTriage)]) -> ProjectTriage {
+        rail_triage::project_triage(tasks.iter().map(|(_, triage)| triage))
+    }
+
+    /// One triage pass over every task row the rail knows about, in the same
+    /// order [`ProjectLayout::projects`] lists the projects.
+    ///
+    /// The row tints, the project-header aggregates and the header chips all
+    /// read from this one pass, so they cannot disagree with each other — and
+    /// no tab is inspected more than once per frame. Computed even when task
+    /// rows are hidden, because the chips count tasks the rail is not drawing.
+    fn rail_task_triage(
+        &self,
+        layout: &ProjectLayout,
+        ctx: &AppContext,
+    ) -> Vec<Vec<(usize, TaskTriage)>> {
+        layout
+            .projects()
+            .iter()
+            .map(|entry| {
+                layout
+                    .visible_tab_indices(&entry.id)
+                    .into_iter()
+                    .filter_map(|index| Some((index, Self::tab_triage(self.tabs.get(index)?, ctx))))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The color a triaged rail row wears, or `None` to leave it as it renders
+    /// today.
+    ///
+    /// Drawn from the same theme roles the status badges already use
+    /// (`ConversationStatus::status_icon_and_color`), so the rail follows a
+    /// user's theme instead of hard-coding the mock's hexes. Only the red
+    /// escalation is genuinely new: a blocked row is yellow and a finished one
+    /// green in the shared palette already.
+    fn rail_urgency_color(urgency: RailUrgency, theme: &WarpTheme) -> Option<ColorU> {
+        match urgency {
+            RailUrgency::Overdue => Some(theme.ansi_fg_red()),
+            RailUrgency::Waiting => Some(theme.ansi_fg_yellow()),
+            RailUrgency::Unseen => Some(theme.ansi_fg_green()),
+            // Working needs nothing from the user, so it keeps the ordinary
+            // row color; the spinning badge alone says "busy".
+            RailUrgency::Running => None,
+        }
+    }
+
+    /// The rail's "Projects" title row, with the two jump-chips.
+    ///
+    /// The chips are navigation affordances, not a second list: the waiting
+    /// chip counts every agent waiting on the user *anywhere* — including the
+    /// unranked band, which is the escape hatch for "the rank-8 project is on
+    /// fire" — and the done chip does the same for finished-but-unseen
+    /// results. Clicking one activates the next such task going down the rail,
+    /// wrapping, so repeated clicks walk the whole set. A chip whose count is
+    /// zero is not rendered: an empty counter is noise, and its absence is
+    /// itself the signal that nothing needs attention.
+    fn render_rail_header(
+        &self,
+        rows: &[RailProjectRow],
+        task_triage: &[Vec<(usize, TaskTriage)>],
+        ctx: &AppContext,
+    ) -> Box<dyn Element> {
+        const CHIP_FONT_SIZE: f32 = 10.;
+
+        let appearance = Appearance::as_ref(ctx);
+        let theme = appearance.theme();
+        let font_family = appearance.ui_font_family();
+        let muted_color = theme.sub_text_color(theme.background());
+
+        // The chips see every task the rail knows about, in render order —
+        // including projects whose task rows are collapsed, since a hidden row
+        // is exactly the one a jump chip has to be able to reach.
+        let by_project: Vec<Vec<RailTask>> = task_triage
+            .iter()
+            .map(|project| {
+                project
+                    .iter()
+                    .map(|(tab_index, triage)| RailTask {
+                        tab_index: *tab_index,
+                        urgency: triage.urgency(),
+                    })
+                    .collect()
+            })
+            .collect();
+        let tasks = rail_task_order(rows, &by_project);
+        let counts = chip_counts(&tasks);
+
+        let mut header_row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.)
+            .with_child(
+                Expanded::new(
+                    1.,
+                    Text::new_inline("Projects".to_string(), font_family, 11.)
+                        .with_color(muted_color.into())
+                        .finish(),
+                )
+                .finish(),
+            );
+
+        // Word labels rather than the mock's emoji: the rail's UI font renders
+        // ⏳/✅ inconsistently across platforms, and a chip that falls back to a
+        // tofu box is worse than one that just says what it counts.
+        for (chip, label, color) in [
+            (RailChip::Blocked, "waiting", theme.ansi_fg_yellow()),
+            (RailChip::Unseen, "done", theme.ansi_fg_green()),
+        ] {
+            let count = counts.get(chip);
+            if count == 0 {
+                continue;
+            }
+            // Cycling starts from the active tab, so consecutive clicks walk
+            // the set instead of bouncing between the same two rows.
+            let Some(target) = next_chip_target(&tasks, chip, Some(self.active_tab_index)) else {
+                continue;
+            };
+            let Some(pane_group_id) = self.tabs.get(target).map(|tab| tab.pane_group.id()) else {
+                continue;
+            };
+            let mouse_state = self
+                .rail_chip_mouse_states
+                .borrow_mut()
+                .entry(chip)
+                .or_default()
+                .clone();
+            header_row.add_child(Self::render_rail_chip(
+                format!("{count} {label}"),
+                color,
+                pane_group_id,
+                mouse_state,
+                font_family,
+                CHIP_FONT_SIZE,
+            ));
+        }
+
+        Container::new(header_row.finish())
+            .with_padding_left(12.)
+            .with_padding_right(8.)
+            .with_padding_top(10.)
+            .with_padding_bottom(6.)
+            .finish()
+    }
+
+    /// One header jump-chip: a small tinted pill that activates a task's tab
+    /// and focuses its pane.
+    ///
+    /// Dispatches the very action the rail's task rows use, so a chip jump and
+    /// a row click land the user in exactly the same place.
+    fn render_rail_chip(
+        label: String,
+        color: ColorU,
+        pane_group_id: EntityId,
+        mouse_state: MouseStateHandle,
+        font_family: FamilyId,
+        font_size: f32,
+    ) -> Box<dyn Element> {
+        Hoverable::new(mouse_state, move |state| {
+            Container::new(
+                Text::new_inline(label.clone(), font_family, font_size)
+                    .with_color(color)
+                    .finish(),
+            )
+            .with_padding_left(6.)
+            .with_padding_right(6.)
+            .with_padding_top(1.)
+            .with_padding_bottom(1.)
+            .with_background(coloru_with_opacity(
+                color,
+                if state.is_hovered() { 24 } else { 12 },
+            ))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::ActivateTaskByPaneGroupId(pane_group_id));
+        })
+        .finish()
+    }
+
+    /// The rail's header badge: the status's own icon, but the rail's triage
+    /// color.
+    ///
+    /// The shared status palette knows exactly one "blocked" yellow, so it
+    /// cannot express the orange→red escalation on its own. Overriding only
+    /// the color (never the icon) keeps an escalated header recognizably the
+    /// same badge, just louder.
+    fn render_rail_status_badge(
+        triage: &ProjectTriage,
+        icon_size: f32,
+        appearance: &Appearance,
+    ) -> Option<Box<dyn Element>> {
+        struct RailStatusBadge {
+            status: ConversationStatus,
+            color: ColorU,
+        }
+        impl StatusElementStyle for RailStatusBadge {
+            fn status_icon_and_color(&self, theme: &WarpTheme) -> (icons::Icon, ColorU) {
+                (
+                    StatusElementStyle::status_icon_and_color(&self.status, theme).0,
+                    self.color,
+                )
             }
         }
-        working
+
+        let status = triage.status.clone()?;
+        match triage
+            .urgency
+            .and_then(|urgency| Self::rail_urgency_color(urgency, appearance.theme()))
+        {
+            Some(color) => Some(render_status_element(
+                &RailStatusBadge { status, color },
+                icon_size,
+                appearance,
+            )),
+            None => Some(render_status_element(&status, icon_size, appearance)),
+        }
     }
 
     /// The thin "unranked" divider between the rail's two project bands: a
@@ -23407,22 +23722,17 @@ impl Workspace {
         let has_ranked_band = rows
             .iter()
             .any(|row| matches!(row, RailProjectRow::Project { rank: Some(_), .. }));
+        // One triage pass feeds the row tints, the header badges and the
+        // chips, indexed the same way `rows` indexes `projects`.
+        let task_triage = self.rail_task_triage(&layout, ctx);
 
         // Header stays put; only the project/task list scrolls.
-        let header = Container::new(
-            Text::new_inline("Projects".to_string(), font_family, 11.)
-                .with_color(muted_color.into())
-                .finish(),
-        )
-        .with_padding_left(12.)
-        .with_padding_top(10.)
-        .with_padding_bottom(6.)
-        .finish();
+        let header = self.render_rail_header(&rows, &task_triage, ctx);
 
         let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Start);
 
         for row in rows {
-            let (entry, rank) = match row {
+            let (project_index, entry, rank) = match row {
                 RailProjectRow::UnrankedDivider => {
                     column.add_child(Self::render_rail_band_divider(
                         RANK_FONT_SIZE,
@@ -23434,10 +23744,15 @@ impl Workspace {
                 // Indices come from the same slice `rows` was built from, so
                 // this cannot miss; skipping beats panicking on the render path.
                 RailProjectRow::Project { index, rank } => match projects.get(index) {
-                    Some(entry) => (entry, rank),
+                    Some(entry) => (index, entry, rank),
                     None => continue,
                 },
             };
+            // `task_triage` is indexed the same way, having been built from
+            // the same `projects` slice.
+            let tasks = task_triage
+                .get(project_index)
+                .map_or(&[][..], Vec::as_slice);
             let is_selected = selected.as_ref() == Some(&entry.id);
             let mouse_state = self
                 .project_rail_mouse_states
@@ -23451,8 +23766,16 @@ impl Workspace {
             // right-click path needs its own copy of the row's identity.
             let menu_id = entry.id.clone();
             // Surfaces the project's aggregate agent status, so a project that
-            // is blocked on the user is visible without selecting it.
-            let status = self.project_status(&layout.visible_tab_indices(&entry.id), ctx);
+            // is blocked on the user is visible without selecting it, plus the
+            // wait age of its worst child so a collapsed rail still says how
+            // long the oldest fire has been burning.
+            let triage = Self::project_triage(tasks);
+            let header_age = triage.wait_age();
+            let header_age_color = triage
+                .urgency
+                .and_then(|urgency| Self::rail_urgency_color(urgency, theme))
+                .map(Fill::from)
+                .unwrap_or(muted_color);
             let row = Hoverable::new(mouse_state, move |state| {
                 let mut row_content =
                     Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
@@ -23481,12 +23804,21 @@ impl Workspace {
                     )
                     .finish(),
                 );
-                if let Some(status) = &status {
-                    row_content.add_child(render_status_element(
-                        status,
-                        PROJECT_STATUS_ICON_SIZE,
-                        appearance,
-                    ));
+                if let Some(age) = header_age.clone() {
+                    row_content.add_child(
+                        Container::new(
+                            Text::new_inline(age, font_family, RANK_FONT_SIZE)
+                                .with_color(header_age_color.into())
+                                .finish(),
+                        )
+                        .with_margin_right(4.)
+                        .finish(),
+                    );
+                }
+                if let Some(badge) =
+                    Self::render_rail_status_badge(&triage, PROJECT_STATUS_ICON_SIZE, appearance)
+                {
+                    row_content.add_child(badge);
                 }
                 let mut container = Container::new(row_content.finish())
                     .with_padding_left(10.)
@@ -23522,10 +23854,20 @@ impl Workspace {
             // One row per task, each with its own status. The project row's
             // aggregate can only say "something here needs you"; these say
             // which one.
-            for index in layout.visible_tab_indices(&entry.id) {
+            for (index, task_triage) in tasks {
+                let index = *index;
                 let Some(tab) = self.tabs.get(index) else {
                     continue;
                 };
+                // The row's color state, from the same pass the header read:
+                // orange while an agent waits on the user, red once the wait
+                // passes the escalation threshold, green for a result nobody
+                // has looked at, and today's rendering for everything else.
+                let task_tint = task_triage
+                    .urgency()
+                    .and_then(|urgency| Self::rail_urgency_color(urgency, theme))
+                    .map(Fill::from);
+                let task_age = task_triage.wait_age();
                 let pane_group = tab.pane_group.as_ref(ctx);
                 let pane_group_id = tab.pane_group.id();
                 let is_active = index == self.active_tab_index;
@@ -23567,15 +23909,33 @@ impl Workspace {
                             // instruction spills onto another line instead of
                             // being cut off.
                             Text::new(task_label, font_family, 12.)
-                                .with_color(if is_active {
-                                    text_color.into()
-                                } else {
-                                    muted_color.into()
+                                // The tint outranks the active/inactive
+                                // shading: "this agent is waiting on you" is
+                                // the more urgent thing for the label to say
+                                // than "this is the row you are standing on",
+                                // which the row background already says.
+                                .with_color(match &task_tint {
+                                    Some(tint) => (*tint).into(),
+                                    None if is_active => text_color.into(),
+                                    None => muted_color.into(),
                                 })
                                 .finish(),
                         )
                         .finish(),
                     );
+                    // The wait age rides on the row rather than only the
+                    // header, so a glance down the rail ranks the fires
+                    // without having to open any of them.
+                    if let Some(age) = task_age.clone() {
+                        row_content.add_child(
+                            Text::new_inline(age, font_family, 10.)
+                                .with_color(match &task_tint {
+                                    Some(tint) => (*tint).into(),
+                                    None => muted_color.into(),
+                                })
+                                .finish(),
+                        );
+                    }
                     let mut container = Container::new(row_content.finish())
                         .with_padding_left(10.)
                         .with_padding_right(10.)
