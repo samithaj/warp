@@ -382,6 +382,7 @@ impl View {
                 | (PaletteMode::Files, QueryFilter::Files)
                 | (PaletteMode::Conversations, QueryFilter::Conversations)
                 | (PaletteMode::WarpDrive, QueryFilter::Drive)
+                | (PaletteMode::SessionSearch, QueryFilter::AgentSessions)
         )
     }
 
@@ -720,9 +721,15 @@ impl View {
     ) {
         // Tab navigations don't appear in the main command palette to avoid confusion with session
         // navigations, so they can't evict real recent items from SelectedItems.
+        //
+        // Agent sessions are excluded for the same reason and one more: their
+        // data source only exists while the session-search popup is open, so
+        // `query_result_from_summary` cannot rebuild one — a remembered session
+        // would occupy a recent slot and then render as nothing at all.
         if !matches!(
             result_action,
             CommandPaletteItemAction::NavigateToTab { .. }
+                | CommandPaletteItemAction::ResumeAgentSession { .. }
         ) {
             let selected_items_handle = SelectedItems::handle(ctx);
             selected_items_handle.update(ctx, |selected_items, _ctx| {
@@ -771,6 +778,27 @@ impl View {
                     source: _,
                 }) => {
                     self.close(ctx, Some(result_action.result_type()));
+                    return;
+                }
+                Some(WorkspaceAction::TogglePalette {
+                    mode: mode @ PaletteMode::SessionSearch,
+                    source,
+                }) => {
+                    // Not a filter switch like the arms above: session search
+                    // lives in its own palette instance, and this one has no
+                    // data source for it.
+                    //
+                    // The open is deferred so it lands *after* this palette's
+                    // close. Dispatching it inline would run the workspace's
+                    // `open_palette` first and its `close_palette` second,
+                    // and the close clears the flag the open just set — the
+                    // popup would never appear.
+                    let action = WorkspaceAction::TogglePalette {
+                        mode: *mode,
+                        source: *source,
+                    };
+                    self.close(ctx, Some(result_action.result_type()));
+                    ctx.dispatch_typed_action_deferred(action);
                     return;
                 }
                 _ => {}
@@ -992,6 +1020,16 @@ impl View {
                         terminal_view_id,
                     });
                 }
+            }
+            CommandPaletteItemAction::ResumeAgentSession { agent, session_id } => {
+                // The workspace owns the activate-existing-tab vs. new-tab
+                // decision (and the feature-flag gate), so this dispatches the
+                // same action the project rail's rows do rather than deciding
+                // anything here.
+                ctx.dispatch_typed_action(&WorkspaceAction::ResumeDormantAgentTask {
+                    agent,
+                    session_id,
+                });
             }
             CommandPaletteItemAction::NoOp => {
                 // No-op action (used for non-interactable separator items that don't do anything on click).
