@@ -75,10 +75,11 @@ use crate::workspace::view::{
     LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME, LEFT_PANEL_WARP_DRIVE_BINDING_NAME,
     NEW_AGENT_TAB_BINDING_NAME, NEW_AMBIENT_AGENT_TAB_BINDING_NAME, NEW_FILE_BINDING_NAME,
     NEW_PROJECT_BINDING_NAME, NEW_TAB_BINDING_NAME, NEW_TERMINAL_TAB_BINDING_NAME,
-    OPEN_GLOBAL_SEARCH_BINDING_NAME, TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME,
-    TOGGLE_NOTIFICATION_MAILBOX_BINDING_NAME, TOGGLE_PROJECT_EXPLORER_BINDING_NAME,
-    TOGGLE_RIGHT_PANEL_BINDING_NAME, TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME,
-    TOGGLE_VERTICAL_TABS_PANEL_BINDING_NAME, TOGGLE_WARP_DRIVE_BINDING_NAME,
+    OPEN_GLOBAL_SEARCH_BINDING_NAME, SESSION_SEARCH_BINDING_NAME,
+    TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME, TOGGLE_NOTIFICATION_MAILBOX_BINDING_NAME,
+    TOGGLE_PROJECT_EXPLORER_BINDING_NAME, TOGGLE_RIGHT_PANEL_BINDING_NAME,
+    TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME, TOGGLE_VERTICAL_TABS_PANEL_BINDING_NAME,
+    TOGGLE_WARP_DRIVE_BINDING_NAME,
 };
 
 pub fn init(app: &mut AppContext) {
@@ -1232,6 +1233,27 @@ pub fn init(app: &mut AppContext) {
         .with_group(bindings::BindingGroup::Navigation.as_str())
         .with_context_predicate(id!("Workspace"))
         .with_custom_action(CustomAction::NavigationPalette),
+        // Gated on the same flag `resume_dormant_agent_task` returns early on:
+        // without it every row in the popup would render and then do nothing
+        // when picked.
+        //
+        // `cmd-shift-K` was freed from `editor_view:clear_lines` for this (its
+        // documented `ctrl-u` keeps working). On Linux/Windows `ctrl-shift-K`
+        // is still `terminal:clear_blocks`, whose predicate is deeper, so the
+        // chord only reaches this binding outside a terminal with blocks.
+        EditableBinding::new(
+            SESSION_SEARCH_BINDING_NAME,
+            BindingDescription::new("Find an agent session"),
+            WorkspaceAction::TogglePalette {
+                mode: PaletteMode::SessionSearch,
+                source: PaletteSource::Keybinding,
+            },
+        )
+        .with_group(bindings::BindingGroup::Navigation.as_str())
+        .with_context_predicate(id!("Workspace"))
+        .with_mac_key_binding("cmd-shift-K")
+        .with_linux_or_windows_key_binding("ctrl-shift-K")
+        .with_enabled(|| FeatureFlag::ResumeProjectTasks.is_enabled()),
         EditableBinding::new(
             "workspace:toggle_launch_config_palette",
             "Launch configuration palette",

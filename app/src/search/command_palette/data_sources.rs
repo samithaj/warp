@@ -6,11 +6,12 @@ use warp_core::features::FeatureFlag;
 use warpui::keymap::BindingId;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
 
-use super::{conversations, warp_drive};
+use super::{agent_sessions, conversations, warp_drive};
 use crate::drive::settings::WarpDriveSettings;
 use crate::search::QueryFilter;
 use crate::search::action::CommandBindingDataSource;
 use crate::search::binding_source::BindingSource;
+use crate::search::command_palette::agent_sessions::AgentSessionCandidate;
 use crate::search::command_palette::mixer::{CommandPaletteItemAction, ItemSummary};
 use crate::search::command_palette::new_session::NewSessionDataSource;
 use crate::search::command_palette::repos::RepoDataSource;
@@ -31,6 +32,7 @@ pub struct DataSourceStore {
     all_conversation_data_source: ModelHandle<conversations::DataSource>,
     repo_data_source: ModelHandle<RepoDataSource>,
     tabs_data_source: Option<ModelHandle<tabs::DataSource>>,
+    agent_sessions_data_source: Option<ModelHandle<agent_sessions::DataSource>>,
 }
 
 impl DataSourceStore {
@@ -67,6 +69,7 @@ impl DataSourceStore {
             all_conversation_data_source,
             repo_data_source,
             tabs_data_source: None,
+            agent_sessions_data_source: None,
         }
     }
 
@@ -175,6 +178,37 @@ impl DataSourceStore {
             mixer.update(ctx, |mixer, ctx| {
                 mixer.reset(ctx);
                 mixer.add_sync_source(tabs_data_source.clone(), HashSet::from([QueryFilter::Tabs]));
+                ctx.notify();
+            });
+        }
+    }
+
+    /// Resets the [`CommandPaletteMixer`] to the single source relevant for the
+    /// session-search popup: the CLI-agent sessions assembled when it opened.
+    ///
+    /// Kept to one synchronous source on purpose. An async source would withhold
+    /// these instant, in-memory results for up to the mixer's initial-results
+    /// timeout while the palette still shows the previous query's rows, and
+    /// would block Enter while loading.
+    pub fn reset_session_search_mixer(
+        &mut self,
+        mixer: ModelHandle<CommandPaletteMixer>,
+        candidates: Vec<AgentSessionCandidate>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.agent_sessions_data_source.is_none() {
+            self.agent_sessions_data_source =
+                Some(ctx.add_model(|_| agent_sessions::DataSource::new()));
+        }
+
+        if let Some(agent_sessions_data_source) = &self.agent_sessions_data_source {
+            agent_sessions_data_source.update(ctx, |source, _| source.set_candidates(candidates));
+            mixer.update(ctx, |mixer, ctx| {
+                mixer.reset(ctx);
+                mixer.add_sync_source(
+                    agent_sessions_data_source.clone(),
+                    HashSet::from([QueryFilter::AgentSessions]),
+                );
                 ctx.notify();
             });
         }
@@ -304,6 +338,13 @@ impl DataSourceStore {
 
             ItemSummary::Tab { .. } => {
                 // Tabs are only shown in the ctrl_tab palette, not in recent commands.
+                None
+            }
+
+            ItemSummary::AgentSession { .. } => {
+                // Agent sessions are only shown in the session-search popup,
+                // whose candidate list exists only while it is open, so there is
+                // nothing to reconstruct one from here.
                 None
             }
         }
