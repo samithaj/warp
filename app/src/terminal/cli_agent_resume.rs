@@ -4,6 +4,15 @@
 //! exact command line that re-enters that agent's session. Used by the project
 //! rail's task rows (prefill, never auto-run) and by "Copy command".
 //!
+//! "Never auto-run" is a property of how the command is delivered, and the
+//! obvious-looking delivery is the wrong one: `TerminalView::set_pending_command`
+//! marks the input as a *pending command*, meaning "the user submitted this and
+//! it has not reached the shell yet", which `execute_pending_command` then runs
+//! on the next `BootstrapPrecmdDone` or `BlockCompleted`. Resuming used it and
+//! consequently executed on its own — most visibly with a deferred shell, whose
+//! bootstrap fires moments after the tab is opened. Use
+//! `TerminalView::prefill_command`, which inserts the text and arms nothing.
+//!
 //! Safety contract:
 //! - Session ids arrive from external sources (plugin hook JSON, rollout
 //!   files, `~/.cursor/chats` metadata) and are untrusted. Every id must pass
