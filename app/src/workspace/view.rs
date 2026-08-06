@@ -105,7 +105,7 @@ use warpui::elements::{
 use warpui::fonts::{FamilyId, Properties, Weight};
 use warpui::geometry::vector::{Vector2F, vec2f};
 use warpui::keymap::Context;
-use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback};
+use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback, ModalButton};
 use warpui::notification::{NotificationSendError, RequestPermissionsOutcome, UserNotification};
 use warpui::platform::{
     Cursor, FilePickerConfiguration, FullscreenState, SystemTheme, TerminationMode,
@@ -351,7 +351,9 @@ use crate::server::telemetry::{
     OpenedWarpAISource, PaletteSource, SharingDialogSource, TabRenameEvent, TierLimitHitEvent,
     WarpDriveSource,
 };
-use crate::session_management::{SessionNavigationData, SessionSource, TabNavigationData};
+use crate::session_management::{
+    RunningSessionSummary, SessionNavigationData, SessionSource, TabNavigationData,
+};
 use crate::settings::cloud_preferences::CloudPreferencesSettings;
 use crate::settings::{
     AISettings, AISettingsChangedEvent, AccessibilitySettings, AliasExpansionSettings,
@@ -361,7 +363,6 @@ use crate::settings::{
     PrivacySettings, SelectionSettings, Settings, SshSettings, ThemeSettings, active_theme_kind,
     respect_system_theme,
 };
-use crate::settings_view::appearance_page::AppearancePageAction;
 use crate::settings_view::environments_page::EnvironmentsPage;
 use crate::settings_view::handoff_environment_creation_modal::{
     HandoffEnvironmentCreationModal, HandoffEnvironmentCreationModalEvent,
@@ -369,9 +370,7 @@ use crate::settings_view::handoff_environment_creation_modal::{
 use crate::settings_view::keybindings::{KeybindingChangedEvent, KeybindingChangedNotifier};
 use crate::settings_view::mcp_servers_page::MCPServersSettingsPage;
 use crate::settings_view::pane_manager::SettingsPaneManager;
-use crate::settings_view::{
-    SettingsAction, SettingsSection, SettingsView, SettingsViewEvent, flags,
-};
+use crate::settings_view::{SettingsSection, SettingsView, SettingsViewEvent, flags};
 #[cfg(all(target_os = "windows", feature = "local_tty"))]
 use crate::shell_indicator::ShellIndicatorType;
 use crate::tab::{
@@ -522,8 +521,9 @@ use crate::workspace::one_time_modal_model::OneTimeModalModel;
 use crate::workspace::project_key::ProjectKey;
 use crate::workspace::project_layout::{self, ProjectId, ProjectLayout};
 use crate::workspace::project_priorities::{ProjectPriorities, RailProjectRow, rail_project_rows};
-use crate::workspace::rail_shells::{
-    RailLiveRow, RailShellFilter, hidden_shells_label, visible_live_rows,
+use crate::workspace::rail_clear_shells::{
+    RailShellRow, clear_shells_detail, clear_shells_prompt, cleared_shells_label, projects_of,
+    shells_to_clear,
 };
 use crate::workspace::rail_triage::{
     self, ProjectTriage, RailChip, RailTask, RailUrgency, TaskTriage, chip_counts,
@@ -743,6 +743,10 @@ pub(crate) const NEW_PROJECT_BINDING_NAME: &str = "workspace:new_project";
 /// same binding's action, so its tooltip shows whatever shortcut the user has
 /// assigned).
 pub(crate) const SESSION_SEARCH_BINDING_NAME: &str = "workspace:open_session_search";
+/// Closes the shells with no agent on them (the rail header's trash can
+/// dispatches this same binding's action, so its tooltip shows whatever
+/// shortcut the user has assigned — by default, none).
+pub(crate) const CLEAR_SHELLS_BINDING_NAME: &str = "workspace:clear_shells_without_agents";
 
 // Editable left panel toolbelt keybindings.
 pub(crate) const LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME: &str =
@@ -4293,7 +4297,6 @@ impl Workspace {
             TabSettingsChangedEvent::TabPrimaryInfo { .. }
             | TabSettingsChangedEvent::TabSecondaryInfo { .. }
             | TabSettingsChangedEvent::RailShowTasks { .. }
-            | TabSettingsChangedEvent::RailHideShellsWithoutAgents { .. }
             | TabSettingsChangedEvent::RailTaskInfo { .. } => {
                 // Tab text is derived at render time, so a repaint is enough.
                 ctx.notify();
@@ -6188,6 +6191,190 @@ impl Workspace {
             }),
             None => log::warn!("No terminal view to prefill after resuming a dormant agent task"),
         }
+    }
+
+    /// One [`RailShellRow`] per live tab, with every reason *not* to close it
+    /// already resolved.
+    ///
+    /// Deliberately computed on demand rather than per frame: `pane_has_agent`
+    /// repeats the conversation and handle lookups a row's label already does,
+    /// and `pane_sessions` walks every pane, so the rail must not pay for any
+    /// of it on each repaint merely to keep a button enabled.
+    fn rail_shell_rows(&self, ctx: &AppContext) -> Vec<RailShellRow> {
+        let layout = ProjectLayout::compute(&self.tabs, ctx);
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(tab_index, tab)| {
+                let pane_group = tab.pane_group.as_ref(ctx);
+                let sessions: Vec<_> = pane_group
+                    .pane_sessions(tab.pane_group.id(), tab.pane_group.window_id(ctx), ctx)
+                    .collect();
+                RailShellRow {
+                    tab_index,
+                    has_agent: crate::workspace::tab_title::pane_has_agent(pane_group, ctx),
+                    // The same source of truth the quit warning counts
+                    // processes with, one level down: `RunningSessionSummary`
+                    // is what `UnsavedStateSummary` asks, and asking it
+                    // directly keeps this read-only (no auto-save side effect,
+                    // no `&mut AppContext`).
+                    is_busy: !RunningSessionSummary::new(&sessions)
+                        .long_running_cmds
+                        .is_empty(),
+                    // Two counts rather than one because they exclude different
+                    // things: the tree length rules out splits, while the
+                    // terminal-view count reaches `pane_contents` and so also
+                    // rules out an off-tree child agent pane or a swapped-in
+                    // replacement — neither of which the agent check above
+                    // would see, since their conversations hang off a
+                    // different view. The last condition is what makes the
+                    // pane a terminal at all: a code or notebook pane (whose
+                    // unsaved edits nothing here has vouched for) has no
+                    // focused session view.
+                    is_lone_terminal: pane_group.pane_count() == 1
+                        && pane_group.terminal_views(ctx).len() == 1
+                        && pane_group.focused_session_view(ctx).is_some(),
+                    is_shared: pane_group.is_terminal_pane_being_shared(ctx),
+                    project: layout
+                        .project_of_tab(tab_index)
+                        .map(ProjectId::display_name)
+                        .unwrap_or_default(),
+                }
+            })
+            .collect()
+    }
+
+    /// Closes every plain shell in this window, after asking.
+    ///
+    /// Confirm-then-close rather than a filter: a mis-click on a filter costs a
+    /// second click, a mis-click here costs tabs. The dialog names the count
+    /// and the projects so the user can recognise what is about to disappear,
+    /// and it is built the same way `close_tabs` builds its quit warning — a
+    /// platform-native alert, so this reads as the same weight of decision as
+    /// closing a tab with a process in it.
+    ///
+    /// Scoped to this window: `self.tabs` is per-window, so a second window's
+    /// shells are that window's button to press.
+    fn clear_shells_without_agents(&mut self, ctx: &mut ViewContext<Self>) {
+        if !FeatureFlag::Projects.is_enabled() {
+            return;
+        }
+        let rows = self.rail_shell_rows(ctx);
+        let selection = shells_to_clear(&rows, Some(self.active_tab_index));
+        if selection.is_empty() {
+            // Not a confirmation — there is nothing to confirm. But a button
+            // that does nothing visible reads as broken, so say why.
+            let window_id = ctx.window_id();
+            WorkspaceToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                toast_stack.add_ephemeral_toast(
+                    DismissibleToast::default("No shells without agents to close.".to_owned()),
+                    window_id,
+                    ctx,
+                );
+            });
+            return;
+        }
+
+        // Identified by pane group, never by index: tabs can open and close
+        // while the dialog is up, and an index would then name a different tab.
+        let targets: Vec<EntityId> = selection
+            .iter()
+            .filter_map(|index| self.tabs.get(*index).map(|tab| tab.pane_group.id()))
+            .collect();
+        let prompt = clear_shells_prompt(selection.len());
+        let detail = clear_shells_detail(&projects_of(&rows, &selection));
+        let confirm_self = ctx.handle();
+        let dialog = AlertDialogWithCallbacks::for_app(
+            prompt,
+            detail,
+            vec![
+                ModalButton::for_app("Close", move |ctx| {
+                    if let Some(workspace) = confirm_self.upgrade(ctx) {
+                        workspace.update(ctx, |workspace, ctx| {
+                            workspace.close_shells_by_pane_group_id(&targets, ctx);
+                        });
+                    }
+                }),
+                ModalButton::for_app("Cancel", |_ctx| { /* Dismissing is the whole action. */ }),
+            ],
+            |_ctx| { /* Nothing to suppress: this modal is only ever asked for. */ },
+        );
+
+        // Same two-platform split as `close_tabs`: macOS gets the real native
+        // sheet, Linux and Windows get the in-window stand-in.
+        if cfg!(all(not(target_family = "wasm"), target_os = "macos")) {
+            AppContext::show_native_platform_modal(ctx, dialog);
+        } else if cfg!(all(
+            not(target_family = "wasm"),
+            any(target_os = "linux", windows)
+        )) {
+            self.show_native_modal(dialog, ctx);
+        }
+    }
+
+    /// Closes the confirmed shells, re-checking each one first.
+    ///
+    /// The re-check is not paranoia: a command can start, an agent can attach
+    /// or the user can switch tabs while the dialog is up, and every one of
+    /// those makes a tab ineligible after it was counted.
+    ///
+    /// Closes through [`PaneGroup::close_pane`] rather than closing the tab
+    /// directly so the close takes the repo's own undo path: with a single
+    /// visible pane, `close_pane` emits `Event::Exited { add_to_undo_stack:
+    /// true }`, which this workspace turns into `close_tab` and so into an
+    /// entry on the undo-close stack.
+    ///
+    /// The toast counts the tabs this dispatched a close for, which is the most
+    /// it can honestly claim: `Event::Exited` is delivered after this update
+    /// finishes, so `self.tabs` still holds every closing tab when the count is
+    /// taken and there is no survivor set to recount against.
+    fn close_shells_by_pane_group_id(
+        &mut self,
+        pane_group_ids: &[EntityId],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let rows = self.rail_shell_rows(ctx);
+        let still_eligible: Vec<EntityId> = shells_to_clear(&rows, Some(self.active_tab_index))
+            .iter()
+            .filter_map(|index| self.tabs.get(*index).map(|tab| tab.pane_group.id()))
+            .collect();
+        let closing: Vec<EntityId> = pane_group_ids
+            .iter()
+            .filter(|pane_group_id| still_eligible.contains(pane_group_id))
+            .copied()
+            .collect();
+
+        for pane_group_id in &closing {
+            let Some(pane_group) = self
+                .tabs
+                .iter()
+                .find(|tab| tab.pane_group.id() == *pane_group_id)
+                .map(|tab| tab.pane_group.clone())
+            else {
+                continue;
+            };
+            // Safe by construction rather than by check: `is_lone_terminal`
+            // required `focused_session_view` — which *is*
+            // `terminal_view_from_pane_id(focused_pane_id(..))` — to resolve,
+            // so this group's focused pane is its one terminal pane.
+            let pane_id = pane_group.as_ref(ctx).focused_pane_id(ctx);
+            pane_group.update(ctx, |pane_group, ctx| {
+                pane_group.close_pane(pane_id, ctx);
+            });
+        }
+
+        let closed = closing.len();
+        if closed == 0 {
+            return;
+        }
+        let window_id = ctx.window_id();
+        WorkspaceToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            toast_stack.add_ephemeral_toast(
+                DismissibleToast::default(cleared_shells_label(closed)),
+                window_id,
+                ctx,
+            );
+        });
     }
 
     /// The directory a new tab should open in so it becomes a task under the
@@ -24162,32 +24349,24 @@ impl Workspace {
             );
         }
 
-        // The shell filter, next to the chips whose counts it explains. Filled
-        // funnel while filtering, hollow while not, so the rail says at a
-        // glance whether it is showing everything — a rail that quietly hides
-        // rows with no visible sign is worse than a noisy one. Hidden along
-        // with the task rows themselves: with nothing listed there is nothing
-        // to filter.
-        let hide_shells = *tab_settings.rail_hide_shells_without_agents;
-        if controls.shell_filter {
+        // Clearing the shells, in the slot the funnel used to occupy. A trash
+        // can rather than a filter glyph because it no longer hides anything —
+        // it closes tabs — and never a lit "on" state: this is a one-shot
+        // command, not a mode the rail can be left in.
+        //
+        // Always enabled, never greyed out on an empty selection: deciding that
+        // would mean running the whole agent/busy/shared scan on every repaint,
+        // and the click path says "no shells without agents to close" for free.
+        if controls.clear_shells {
             header_row.add_child(
                 self.render_tab_bar_icon_button(
                     appearance,
-                    if hide_shells {
-                        icons::Icon::FilterFunnelFilled
-                    } else {
-                        icons::Icon::FilterFunnel
-                    },
-                    &self.mouse_states.rail_hide_shells_button,
-                    // Routed through the Appearance page's own toggle so the
-                    // button, the Settings switch and the command palette all
-                    // write the setting through one place.
-                    WorkspaceAction::DispatchToSettingsTab(SettingsAction::AppearancePageToggle(
-                        AppearancePageAction::ToggleRailHideShellsWithoutAgents,
-                    )),
-                    "Hide shells without agents".to_string(),
-                    None,
-                    hide_shells,
+                    icons::Icon::Trash,
+                    &self.mouse_states.rail_clear_shells_button,
+                    WorkspaceAction::ClearShellsWithoutAgents,
+                    "Clear shells without agents".to_string(),
+                    keybinding_name_to_display_string(CLEAR_SHELLS_BINDING_NAME, ctx),
+                    false,
                     false,
                 )
                 .finish(),
@@ -24398,11 +24577,6 @@ impl Workspace {
         };
         let selected = self.selected_project.clone();
         let show_tasks = *TabSettings::as_ref(ctx).rail_show_tasks;
-        // Plain shells are the rail's noise floor: in a rail whose job is
-        // "which agent needs me?", a column of `zsh` rows crowds out the
-        // answer. Dormant rows are not filtered — they exist only because a
-        // session does.
-        let hide_shells = *TabSettings::as_ref(ctx).rail_hide_shells_without_agents;
         // Rank sorts the rail into two bands. The order is a pure function of
         // this list, never of agent activity: a sidebar earns its keep through
         // spatial memory, so a project must not move because one of its agents
@@ -24544,52 +24718,11 @@ impl Workspace {
             if !show_tasks {
                 continue;
             }
-            // Which of this project's live rows survive the shell filter. The
-            // rule lives in `rail_shells` as a pure function; everything the
-            // exemptions need is resolved here, where the active tab and the
-            // MRU order are known.
-            let live_rows: Vec<RailLiveRow> = tasks
-                .iter()
-                .map(|(index, _)| RailLiveRow {
-                    tab_index: *index,
-                    // Resolved only while filtering: it repeats the conversation
-                    // and handle lookups the row's label already does, and a
-                    // rail that is not filtering must not pay for them.
-                    has_agent: hide_shells
-                        && self.tabs.get(*index).is_some_and(|tab| {
-                            crate::workspace::tab_title::pane_has_agent(
-                                tab.pane_group.as_ref(ctx),
-                                ctx,
-                            )
-                        }),
-                })
-                .collect();
-            let visible_rows = visible_live_rows(
-                &live_rows,
-                RailShellFilter {
-                    hide_shells,
-                    active_tab: Some(self.active_tab_index),
-                    // Only the selected project is kept from collapsing to a
-                    // bare header, and it keeps the tab the user was last in.
-                    fallback_row: is_selected
-                        .then(|| {
-                            self.mru_tab_index(
-                                &tasks.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
-                            )
-                        })
-                        .flatten(),
-                },
-            );
             // One row per task, each with its own status. The project row's
             // aggregate can only say "something here needs you"; these say
             // which one.
             for (index, task_triage) in tasks {
                 let index = *index;
-                // Filtered rather than pre-collected so every row below keeps
-                // reading from the one triage pass, in rail order.
-                if !visible_rows.visible.contains(&index) {
-                    continue;
-                }
                 let Some(tab) = self.tabs.get(index) else {
                     continue;
                 };
@@ -24703,28 +24836,6 @@ impl Workspace {
                 })
                 .finish();
                 column.add_child(task_row);
-            }
-
-            // What the filter took away, said out loud. Deliberately inert: it
-            // is a count, not a target — clicking would have to either pick one
-            // arbitrary shell (surprising) or expand into per-project state the
-            // rail deliberately keeps none of. The header toggle is the way
-            // back, and it is one click away.
-            if let Some(label) = hidden_shells_label(visible_rows.hidden_shells) {
-                column.add_child(
-                    Container::new(
-                        Text::new_inline(label, font_family, 11.)
-                            .with_color(rank_color.into())
-                            .finish(),
-                    )
-                    .with_padding_left(10.)
-                    .with_padding_right(10.)
-                    .with_padding_top(2.)
-                    .with_padding_bottom(2.)
-                    .with_margin_left(ROW_SIDE_MARGIN + TASK_ROW_INDENT)
-                    .with_margin_right(ROW_SIDE_MARGIN)
-                    .finish(),
-                );
             }
 
             // Dormant tasks: sessions with no open tab, listed after the live
@@ -25179,12 +25290,6 @@ impl Workspace {
 
         if *tab_settings.use_project_layout {
             context.set.insert(flags::PROJECT_LAYOUT_CONTEXT_FLAG);
-        }
-
-        if *tab_settings.rail_hide_shells_without_agents {
-            context
-                .set
-                .insert(flags::RAIL_HIDE_SHELLS_WITHOUT_AGENTS_FLAG);
         }
 
         if session_settings
@@ -26123,6 +26228,7 @@ impl TypedActionView for Workspace {
             ResumeDormantAgentTask { agent, session_id } => {
                 self.resume_dormant_agent_task(*agent, session_id.clone(), ctx)
             }
+            ClearShellsWithoutAgents => self.clear_shells_without_agents(ctx),
             SetActiveTabColor(color) => {
                 // When the active tab is in a group, redirect to the group's color.
                 // The tab color selection menu is hidden when a tab is part of a group
