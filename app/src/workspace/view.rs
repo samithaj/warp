@@ -5700,7 +5700,7 @@ impl Workspace {
                 .active_session_view(ctx)
             {
                 Some(terminal_view) => terminal_view.update(ctx, |terminal, ctx| {
-                    terminal.set_pending_command(&command, ctx);
+                    terminal.prefill_command(&command, ctx);
                 }),
                 None => log::warn!("No terminal view to prefill when resuming in place"),
             }
@@ -5737,7 +5737,7 @@ impl Workspace {
             .active_session_view(ctx)
         {
             Some(terminal_view) => terminal_view.update(ctx, |terminal, ctx| {
-                terminal.set_pending_command(&command, ctx);
+                terminal.prefill_command(&command, ctx);
             }),
             None => log::warn!("No terminal view to prefill after resuming a dormant agent task"),
         }
