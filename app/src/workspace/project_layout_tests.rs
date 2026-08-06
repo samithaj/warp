@@ -141,6 +141,10 @@ fn scanned(session_id: &str, label: Option<&str>, modified_secs: u64) -> Scanned
     ScannedSession {
         session_id: session_id.to_owned(),
         cwd: "/repos/orbit".to_owned(),
+        // The rail consumes the resolved label; which candidate produced it is
+        // the scan model's business, so these rows carry none.
+        #[cfg(not(target_family = "wasm"))]
+        names: Default::default(),
         label: label.map(str::to_owned),
         modified: SystemTime::UNIX_EPOCH + Duration::from_secs(modified_secs),
     }
