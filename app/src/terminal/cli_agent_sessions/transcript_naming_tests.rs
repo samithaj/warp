@@ -4,17 +4,23 @@ use super::*;
 
 const CWD: &str = "/Users/example/dev/poa-agent";
 
-fn label(head: &str) -> Option<String> {
-    label_from_transcript_head(head, Path::new(CWD))
+fn names(text: &str) -> TranscriptNames {
+    names_from_transcript_text(text, Path::new(CWD))
 }
 
-fn tail_label(tail: &str) -> Option<String> {
-    label_from_transcript_tail(tail, Path::new(CWD))
+/// The label for a session whose titles collide with nothing — the common case,
+/// and the one that exercises the cascade in its preferred order.
+fn label(text: &str) -> Option<String> {
+    names(text).resolve(|_| true)
+}
+
+fn tail_title(tail: &str) -> Option<String> {
+    last_title_from_tail(tail, Path::new(CWD))
 }
 
 /// A golden transcript shaped like the real thing (Claude Code 2.1.221, the
 /// version these record shapes were read off on this machine):
-/// `ai-title` + its `agent-name` mirror up front, the head `cwd`/`slug`
+/// `ai-title` + its `agent-name` sibling up front, the head `cwd`/`slug`
 /// carrier, the first prompt behind an injected `<command-name>` wrapper, and
 /// a renamed `ai-title` appended at the very end the way `/rename` writes one.
 const GOLDEN_TRANSCRIPT: &str = concat!(
@@ -37,18 +43,102 @@ const GOLDEN_TRANSCRIPT: &str = concat!(
 );
 
 #[test]
-fn last_ai_title_wins_over_earlier_ones_and_prompts() {
-    let head = concat!(
-        r#"{"type":"user","message":{"role":"user","content":"first prompt text"}}"#,
+fn every_candidate_is_reported_from_one_pass() {
+    let names = names(GOLDEN_TRANSCRIPT);
+    assert_eq!(names.last_title.as_deref(), Some("Ingest reliability work"));
+    assert_eq!(names.first_title.as_deref(), Some("Initial working title"));
+    assert_eq!(
+        names.prompt.as_deref(),
+        Some("add retries to the ingest DAG")
+    );
+    assert_eq!(names.slug.as_deref(), Some("quietly humming otter"));
+}
+
+#[test]
+fn a_unique_last_title_wins_so_a_genuine_rename_survives() {
+    // 29 of the 44 measured title changes were to a value no other session
+    // claims — real `/rename`s, which must keep showing the new name.
+    assert_eq!(
+        label(GOLDEN_TRANSCRIPT).as_deref(),
+        Some("Ingest reliability work")
+    );
+}
+
+#[test]
+fn a_shared_last_title_falls_back_to_the_first_title() {
+    // The broadcast case: `/rename` wrote this name into 13 transcripts across
+    // 6 projects, each carrying its own sessionId. The first title survived in
+    // all 13, so it is the next candidate.
+    let resolved = names(GOLDEN_TRANSCRIPT)
+        .resolve(|title| title != "Ingest reliability work")
+        .expect("the first title should stand in");
+    assert_eq!(resolved, "Initial working title");
+}
+
+#[test]
+fn a_shared_first_title_too_falls_back_to_the_prompt() {
+    // 29 files have a *first* title that is itself shared, so the chain has to
+    // go one step further. A prompt is written once at session start and cannot
+    // be cross-written, which is what makes it the floor.
+    let resolved = names(GOLDEN_TRANSCRIPT)
+        .resolve(|_| false)
+        .expect("the prompt should stand in");
+    assert_eq!(resolved, "add retries to the ingest DAG");
+}
+
+#[test]
+fn without_uniqueness_the_first_title_is_preferred_over_the_last() {
+    // No scan has run, so a collision cannot be detected. The last title was
+    // the corrupt field in 13 of 13 measured files; the first was correct in
+    // all 13, so it is the safer of the two.
+    assert_eq!(
+        names(GOLDEN_TRANSCRIPT)
+            .resolve_without_uniqueness()
+            .as_deref(),
+        Some("Initial working title")
+    );
+}
+
+#[test]
+fn agent_name_records_are_never_a_name_source() {
+    // `agentName` is not a mirror of `aiTitle`: one measured file held
+    // `aiTitle` "Set up UAT test data for customer grade scenarios" while its
+    // `agentName` was a different session's name at the same moment. It was
+    // contaminated in 13 of 13 files, so it contributes nothing at any tier.
+    let only_agent_name = concat!(
+        r#"{"type":"agent-name","agentName":"unified-trading-handoff-setup"}"#,
         "\n",
-        r#"{"type":"ai-title","aiTitle":"Early working title"}"#,
+    );
+    assert_eq!(names(only_agent_name), TranscriptNames::default());
+    assert_eq!(tail_title(only_agent_name), None);
+    assert_eq!(label(only_agent_name), None);
+
+    // Even as the newest record of all, it must not displace the real title.
+    let after_a_title = concat!(
+        r#"{"type":"ai-title","aiTitle":"Import client repayment data into MIFOS"}"#,
         "\n",
-        r#"{"type":"ai-title","aiTitle":"Add Jira search and fix orbit dashboard startup"}"#,
+        r#"{"type":"agent-name","agentName":"unified-trading-handoff-setup"}"#,
         "\n",
     );
     assert_eq!(
-        label(head).as_deref(),
-        Some("Add Jira search and fix orbit dashboard startup")
+        tail_title(after_a_title).as_deref(),
+        Some("Import client repayment data into MIFOS")
+    );
+    assert_eq!(
+        label(after_a_title).as_deref(),
+        Some("Import client repayment data into MIFOS")
+    );
+}
+
+#[test]
+fn claimed_titles_are_the_two_ai_titles_and_never_the_prompt() {
+    // The prompt is the floor precisely because it cannot be cross-written;
+    // two sessions starting from the same short instruction must not
+    // disqualify each other's name.
+    let names = names(GOLDEN_TRANSCRIPT);
+    assert_eq!(
+        names.claimed_titles().collect::<Vec<_>>(),
+        vec!["Ingest reliability work", "Initial working title"]
     );
 }
 
@@ -97,7 +187,26 @@ fn junk_auto_name_is_rejected_and_falls_through() {
         r#"{"type":"user","message":{"role":"user","content":"real work description"}}"#,
         "\n",
     );
+    let names = names(head);
+    assert_eq!(names.first_title, None, "junk never occupies a title slot");
+    assert_eq!(names.last_title, None);
     assert_eq!(label(head).as_deref(), Some("real work description"));
+}
+
+#[test]
+fn a_junk_first_record_does_not_cost_the_session_its_real_first_title() {
+    let head = concat!(
+        r#"{"type":"ai-title","aiTitle":"poa-agent-0f"}"#,
+        "\n",
+        r#"{"type":"ai-title","aiTitle":"Build llm_explainer episode 1 video pipeline"}"#,
+        "\n",
+        r#"{"type":"ai-title","aiTitle":"unified-trading-handoff-setup"}"#,
+        "\n",
+    );
+    assert_eq!(
+        names(head).first_title.as_deref(),
+        Some("Build llm_explainer episode 1 video pipeline")
+    );
 }
 
 #[test]
@@ -115,6 +224,7 @@ fn whitespace_only_candidates_are_rejected() {
         "\n",
     );
     assert_eq!(label(head), None);
+    assert!(names(head).is_empty());
 }
 
 #[test]
@@ -144,10 +254,11 @@ fn truncated_final_line_and_garbage_lines_are_skipped() {
 }
 
 #[test]
-fn empty_and_missing_content_yield_none() {
-    assert_eq!(label(""), None);
-    assert_eq!(label("\n\n"), None);
+fn empty_and_missing_content_yield_no_candidates() {
+    assert!(names("").is_empty());
+    assert!(names("\n\n").is_empty());
     let head = concat!(r#"{"type":"user","message":{"role":"user"}}"#, "\n");
+    assert!(names(head).is_empty());
     assert_eq!(label(head), None);
 }
 
@@ -202,44 +313,74 @@ fn project_dir_mangles_dots_underscores_and_spaces() {
 }
 
 #[test]
-fn unreadable_file_resolves_to_none_not_error() {
-    assert_eq!(
-        resolve_label_from_transcript(
+fn unreadable_file_yields_no_candidates_not_an_error() {
+    assert!(
+        read_transcript_names(
             Path::new("/nonexistent/definitely/missing.jsonl"),
             Path::new(CWD)
-        ),
-        None
+        )
+        .is_empty()
     );
 }
 
 #[test]
-fn tail_rename_wins_over_the_head_title() {
-    // The whole point of the tail read: `/rename` appends at EOF, so a
-    // head-only reader would keep showing the session's original name.
-    assert_eq!(
-        tail_label(GOLDEN_TRANSCRIPT).as_deref(),
-        Some("Ingest reliability work")
-    );
-    assert_eq!(
-        label(GOLDEN_TRANSCRIPT).as_deref(),
-        Some("Ingest reliability work"),
-        "head tier also takes the last title it can see"
-    );
-}
-
-#[test]
-fn tail_reads_the_golden_transcript_end_to_end() {
+fn a_short_transcript_is_read_end_to_end_by_the_tail_seek_alone() {
     // Exercises the real seek-based path, not just the pure core: the tail
-    // read starts mid-file, so the first line it sees is normally cut.
+    // read starts mid-file, so its first line is normally cut — but a
+    // transcript smaller than the tail budget is covered from byte 0, and that
+    // one read has to yield the *first* title as well as the last.
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir
         .path()
         .join("61f785ca-1c31-4671-a420-f89c47875750.jsonl");
     std::fs::write(&path, GOLDEN_TRANSCRIPT).unwrap();
+
+    let tail = read_tail(&path).expect("the fixture is readable");
+    assert!(tail.covers_whole_file);
+    let names = read_transcript_names(&path, Path::new(CWD));
+    assert_eq!(names.last_title.as_deref(), Some("Ingest reliability work"));
+    assert_eq!(names.first_title.as_deref(), Some("Initial working title"));
     assert_eq!(
-        resolve_label_from_transcript(&path, Path::new(CWD)).as_deref(),
-        Some("Ingest reliability work")
+        names.prompt.as_deref(),
+        Some("add retries to the ingest DAG")
     );
+}
+
+#[test]
+fn a_rename_past_the_head_window_is_still_seen() {
+    // The whole point of the tail read: `/rename` appends at EOF, so a
+    // head-only reader would keep showing the session's original name.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir
+        .path()
+        .join("61f785ca-1c31-4671-a420-f89c47875750.jsonl");
+    let mut transcript = String::from(r#"{"type":"ai-title","aiTitle":"Initial working title"}"#);
+    transcript.push('\n');
+    transcript.push_str(r#"{"type":"user","message":{"role":"user","content":"start the work"}}"#);
+    transcript.push('\n');
+    let filler = "x".repeat(4096);
+    while transcript.len() < HEAD_READ_BYTES * 2 {
+        transcript.push_str(&format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{filler}"}}]}}}}"#
+        ));
+        transcript.push('\n');
+    }
+    transcript.push_str(r#"{"type":"ai-title","aiTitle":"Ingest reliability work"}"#);
+    transcript.push('\n');
+    std::fs::write(&path, &transcript).unwrap();
+
+    let names = read_transcript_names(&path, Path::new(CWD));
+    assert_eq!(
+        names.last_title.as_deref(),
+        Some("Ingest reliability work"),
+        "the tail read is the only tier that can see a rename"
+    );
+    assert_eq!(
+        names.first_title.as_deref(),
+        Some("Initial working title"),
+        "and the head read is the only tier that can see the original"
+    );
+    assert_eq!(names.prompt.as_deref(), Some("start the work"));
 }
 
 #[test]
@@ -265,27 +406,20 @@ fn head_title_names_a_transcript_whose_tail_window_has_none() {
     );
     std::fs::write(&path, &transcript).unwrap();
 
+    let tail = read_tail(&path).expect("the fixture is readable");
+    assert!(!tail.covers_whole_file);
     assert_eq!(
-        read_tail(&path)
-            .as_deref()
-            .and_then(|tail| label_from_transcript_tail(tail, Path::new(CWD))),
+        last_title_from_tail(&tail.text, Path::new(CWD)),
         None,
         "no title record inside the tail window"
     );
     assert_eq!(
-        resolve_label_from_transcript(&path, Path::new(CWD)).as_deref(),
-        Some("Rerank eval harness")
+        read_transcript_names(&path, Path::new(CWD))
+            .last_title
+            .as_deref(),
+        Some("Rerank eval harness"),
+        "the head read's own last title stands in"
     );
-}
-
-#[test]
-fn agent_name_records_are_read_like_ai_titles() {
-    let tail = concat!(
-        r#"{"type":"agent-name","agentName":"Wire up the rail"}"#,
-        "\n"
-    );
-    assert_eq!(tail_label(tail).as_deref(), Some("Wire up the rail"));
-    assert_eq!(label(tail).as_deref(), Some("Wire up the rail"));
 }
 
 #[test]
@@ -300,6 +434,10 @@ fn injected_wrappers_and_caveats_are_skipped_for_the_next_real_prompt() {
         r#"{"type":"user","message":{"role":"user","content":"port the scan mechanism"}}"#,
         "\n",
     );
+    assert_eq!(
+        names(head).prompt.as_deref(),
+        Some("port the scan mechanism")
+    );
     assert_eq!(label(head).as_deref(), Some("port the scan mechanism"));
 }
 
@@ -311,6 +449,7 @@ fn a_wrapper_only_transcript_yields_no_prompt_name() {
         r#"{"type":"user","message":{"role":"user","content":"Caveat: replayed context"}}"#,
         "\n",
     );
+    assert_eq!(names(head).prompt, None);
     assert_eq!(label(head), None);
 }
 
@@ -348,7 +487,7 @@ fn derived_style_junk_names_are_rejected_at_every_tier() {
         r#"{"type":"user","message":{"role":"user","content":"the actual request"}}"#,
         "\n",
     );
-    assert_eq!(tail_label(head), None, "junk is rejected in the tail too");
+    assert_eq!(tail_title(head), None, "junk is rejected in the tail too");
     assert_eq!(label(head).as_deref(), Some("the actual request"));
 }
 
@@ -360,11 +499,12 @@ fn bare_hex_blobs_are_rejected() {
         r#"{"type":"ai-title","aiTitle":"61f785ca-1c31"}"#,
         r#"{"type":"ai-title","aiTitle":"deadbeefcafe"}"#,
     ] {
-        assert_eq!(tail_label(junk), None, "should reject: {junk}");
+        assert_eq!(tail_title(junk), None, "should reject: {junk}");
+        assert!(names(junk).is_empty(), "should reject: {junk}");
     }
     // Short hex-looking words are real words, and must survive.
     assert_eq!(
-        tail_label(r#"{"type":"ai-title","aiTitle":"decaf"}"#).as_deref(),
+        tail_title(r#"{"type":"ai-title","aiTitle":"decaf"}"#).as_deref(),
         Some("decaf")
     );
 }
@@ -378,5 +518,5 @@ fn tail_skips_a_record_cut_by_the_seek() {
         r#"{"type":"ai-title","aiTitle":"Whole record"}"#,
         "\n",
     );
-    assert_eq!(tail_label(tail).as_deref(), Some("Whole record"));
+    assert_eq!(tail_title(tail).as_deref(), Some("Whole record"));
 }
