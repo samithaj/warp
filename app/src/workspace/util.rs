@@ -46,8 +46,8 @@ pub(super) struct WorkspaceMouseStates {
     pub(super) rail_new_project_button: MouseStateHandle,
     /// The rail header's magnifier, which opens the session-search popup.
     pub(super) rail_session_search_button: MouseStateHandle,
-    /// The rail header's filter button, which hides agent-less shell rows.
-    pub(super) rail_hide_shells_button: MouseStateHandle,
+    /// The rail header's broom, which closes the shells with no agent on them.
+    pub(super) rail_clear_shells_button: MouseStateHandle,
     pub(super) team_switcher_pill: MouseStateHandle,
     #[cfg(target_family = "wasm")]
     pub(super) warp_logo: MouseStateHandle,

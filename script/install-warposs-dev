@@ -72,7 +72,24 @@ echo "==> Giving it a separate identity..."
 # Apple Development identity script/macos/run uses; fall back to ad-hoc.
 # `grep` exits non-zero when there is no Apple Development identity, which
 # under `set -euo pipefail` would abort the script before the ad-hoc fallback.
-SIGNING_CERT="$(security find-identity -p codesigning -v | grep "Apple Development" | awk '{print $2}' | head -1 || true)"
+# Prefer a stable signing identity over ad-hoc. This is not about trust -- it
+# is about macOS privacy (TCC) grants surviving a rebuild.
+#
+# TCC remembers permissions against an app's *designated requirement*. Signed
+# with a certificate, that requirement names the certificate, which does not
+# change when the code does. Signed ad-hoc, it is a cdhash -- a hash of the
+# binary -- so every rebuild looks like a brand-new app and macOS re-asks for
+# Documents, Downloads, Keychain and the rest, every time.
+#
+# Any code-signing certificate fixes this, including a self-signed one made in
+# Keychain Access (Certificate Assistant > Create a Certificate, type "Code
+# Signing", Self Signed Root). Name it "Warp Local Signing", or set
+# WARP_SIGNING_IDENTITY to whatever you called it.
+SIGNING_IDENTITY_NAME="${WARP_SIGNING_IDENTITY:-Warp Local Signing}"
+SIGNING_CERT="$(security find-identity -p codesigning -v 2>/dev/null | grep "${SIGNING_IDENTITY_NAME}" | awk '{print $2}' | head -1 || true)"
+if [[ -z "${SIGNING_CERT}" ]]; then
+  SIGNING_CERT="$(security find-identity -p codesigning -v 2>/dev/null | grep "Apple Development" | awk '{print $2}' | head -1 || true)"
+fi
 codesign --force --deep --options runtime --sign "${SIGNING_CERT:--}" "${APP_DST}" \
   --entitlements script/Debug-Entitlements.plist
 codesign --verify "${APP_DST}" && echo "==> Signature OK"

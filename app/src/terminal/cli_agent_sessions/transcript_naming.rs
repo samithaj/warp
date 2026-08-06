@@ -1,28 +1,60 @@
-//! Conversation-name resolution from a Claude Code transcript.
+//! Conversation-name candidates from a Claude Code transcript.
 //!
 //! The project rail names a task by its conversation, not its directory. For a
 //! dormant task (agent exited, or the app restarted) the only surviving source
-//! is the transcript on disk, so this module derives a display label from it,
-//! first acceptable candidate wins:
+//! is the transcript on disk, so this module derives display candidates from it.
 //!
-//! 1. The **last** `{"type":"ai-title","aiTitle":…}` (or its
-//!    `{"type":"agent-name","agentName":…}` sibling) in a **tail** read —
-//!    Claude Code appends a fresh record every turn, and `/rename` appends one
-//!    at the very end, so only reading from the end can see a rename. This is
-//!    the tier that makes a renamed session show its new name.
-//! 2. The last `ai-title` inside the **head** read — for a transcript longer
-//!    than the tail budget whose titles all sit early (a session that was
-//!    named and then ran a very long tool loop).
-//! 3. The **first** real user prompt, truncated — the guaranteed floor.
-//! 4. The transcript's `slug`, de-kebabed — last resort before no name at all.
+//! # Why the newest name in a transcript cannot be trusted on its own
+//!
+//! Claude Code's `/rename` **broadcasts**: it writes the new name into the
+//! transcripts of other sessions that happen to be live at the same time.
+//! Measured on this machine, the name from a single `/rename`
+//! ("unified-trading-handoff-setup") is the last `aiTitle` record in 13
+//! transcripts spread across 6 project directories, which is exactly the "many
+//! rail rows, one name" bug. The contaminated records carry the *file's own*
+//! `sessionId`, so no per-record validation can spot them.
+//!
+//! What does separate a broadcast from a real rename is **uniqueness, not
+//! position**: across 159 titled transcripts, 44 changed title at least once —
+//! 29 to a value no other session claims (a genuine `/rename`, e.g.
+//! "project-rail-task-status") and 15 to a value shared with other sessions
+//! (contamination). Always taking the first title would therefore destroy 29
+//! correct names to fix 15. So this module no longer picks the name: it reports
+//! every candidate the transcript offers and the caller — the only thing with a
+//! view over *all* sessions — applies the rule ([`TranscriptNames::resolve`]).
+//!
+//! Candidates, best first:
+//!
+//! 1. [`last_title`](TranscriptNames::last_title) — the newest
+//!    `{"type":"ai-title","aiTitle":…}`, found by a **tail** read: Claude
+//!    appends a fresh record every turn and `/rename` appends one at the very
+//!    end, so only reading from the end can see a rename. Correct for a genuine
+//!    rename; another session's name after a broadcast.
+//! 2. [`first_title`](TranscriptNames::first_title) — the oldest `ai-title`,
+//!    from a **head** read. In all 13 contaminated files measured, the first
+//!    title was still correct and session-specific ("Import client repayment
+//!    data into MIFOS", …).
+//! 3. [`prompt`](TranscriptNames::prompt) — the first real user prompt. Written
+//!    once at session start and never rewritten, so it cannot be cross-written
+//!    by another session: the trustworthy floor.
+//! 4. [`slug`](TranscriptNames::slug) — the transcript's own slug, de-kebabed.
+//!    Last resort before no name at all.
+//!
+//! `agent-name` / `agentName` is deliberately **not** a source. It is not a
+//! mirror of `aiTitle`: one measured file carried `aiTitle` "Set up UAT test
+//! data for customer grade scenarios" while its `agentName` simultaneously held
+//! a completely different session's name. It was contaminated in 13 of 13 files
+//! and never contributed a name `aiTitle` did not already have, so reading it
+//! can only ever produce a wrong name.
 //!
 //! Junk names are rejected rather than displayed: Claude's auto-generated
 //! `<dir>-<2hex>` display name (its own docs say it is not a resume handle),
 //! bare hex blobs, whitespace, and the truncated cwd that produced the
 //! original "six rows all reading `..uellig/repos/poa-agent`" bug.
 //!
-//! Reads are **bounded** (64 KiB tail + 256 KiB head) and belong off the
-//! render path: callers resolve in a spawned task and cache the result
+//! Reads are **bounded** (64 KiB tail + 256 KiB head, and a single read when
+//! the whole file fits in the tail window) and belong off the render path:
+//! callers resolve in a spawned task and cache the result
 //! (`AgentSessionHandleOp::SetTitle`, or `session_scan`'s per-mtime memo);
 //! nothing here may run inside element layout. The corpus is multi-gigabyte —
 //! no code path may ever read a whole transcript.
@@ -51,6 +83,88 @@ const MAX_LABEL_LEN: usize = 80;
 /// Prefix Claude injects ahead of replayed context. Never a name.
 const CAVEAT_PREFIX: &str = "Caveat:";
 
+/// Every naming candidate one transcript offers, already tidied and
+/// junk-filtered — a `Some` here is always a string worth displaying.
+///
+/// Deliberately *not* collapsed to a single name: choosing between
+/// [`last_title`](Self::last_title) and [`first_title`](Self::first_title)
+/// requires knowing what other sessions are called, which is knowledge this
+/// module (one file, one read) does not and should not have.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TranscriptNames {
+    /// Newest `ai-title` in the file. The genuine name after a `/rename` —
+    /// or another session's name after a broadcast.
+    pub last_title: Option<String>,
+    /// Oldest `ai-title` in the file. Immune to the broadcast in every
+    /// contaminated file measured.
+    pub first_title: Option<String>,
+    /// First real user prompt: written once, at session start.
+    pub prompt: Option<String>,
+    /// The transcript's `slug`, de-kebabed.
+    pub slug: Option<String>,
+}
+
+impl TranscriptNames {
+    /// The display label for this session, applying the uniqueness rule.
+    ///
+    /// `is_unique` answers "does no *other* session claim this exact title" —
+    /// the caller owns that view. A title only one session claims is that
+    /// session's own name (the 29 genuine renames); a title several claim is a
+    /// broadcast and is dropped in favour of the next candidate, ending at the
+    /// prompt, which cannot be cross-written.
+    pub fn resolve(&self, is_unique: impl Fn(&str) -> bool) -> Option<String> {
+        if let Some(last) = &self.last_title
+            && is_unique(last)
+        {
+            return Some(last.clone());
+        }
+        if let Some(first) = &self.first_title
+            && is_unique(first)
+        {
+            return Some(first.clone());
+        }
+        self.prompt.clone().or_else(|| self.slug.clone())
+    }
+
+    /// The label to show when uniqueness is unknowable — no scan has run, or it
+    /// has not reached this session's directory, so the sibling transcripts a
+    /// broadcast would have contaminated have not been read.
+    ///
+    /// Skips [`last_title`](Self::last_title) rather than trusting it: it was
+    /// the corrupt field in 13 of 13 measured files, while `first_title` was
+    /// correct in all 13, so the first title is the safer of the two whenever
+    /// we cannot tell them apart.
+    pub fn resolve_without_uniqueness(&self) -> Option<String> {
+        self.first_title
+            .clone()
+            .or_else(|| self.prompt.clone())
+            .or_else(|| self.slug.clone())
+    }
+
+    /// The titles this transcript asserts, for a caller building the
+    /// title -> claiming sessions map.
+    ///
+    /// Only the two `ai-title` candidates: those are the records a broadcast
+    /// writes. The prompt is excluded on purpose — it is the floor precisely
+    /// because it cannot be cross-written, and two sessions legitimately
+    /// starting from the same short instruction must not disqualify each other.
+    pub fn claimed_titles(&self) -> impl Iterator<Item = &str> {
+        [self.last_title.as_deref(), self.first_title.as_deref()]
+            .into_iter()
+            .flatten()
+    }
+
+    /// Whether the transcript yielded nothing at all — a normal outcome for a
+    /// tiny or truncated session, and the signal callers use to avoid
+    /// memoising a read that could succeed later.
+    pub fn is_empty(&self) -> bool {
+        self.last_title.is_none()
+            && self.first_title.is_none()
+            && self.prompt.is_none()
+            && self.slug.is_none()
+    }
+}
+
 /// Where Claude Code stores the transcript for `session_id` started in `cwd`:
 /// `<config>/projects/<encoded-cwd>/<session_id>.jsonl`. Derived, not awaited:
 /// the hook only reports `transcript_path` on `stop`, but `cwd` + session id
@@ -76,23 +190,40 @@ pub fn claude_project_dir(cwd: &Path) -> Option<PathBuf> {
     )
 }
 
-/// Resolves a display label for the session behind `transcript_path`.
+/// Reads every naming candidate for the session behind `transcript_path`.
 ///
-/// Returns `None` when the file is unreadable or yields no acceptable name —
-/// a normal outcome (deleted transcript, tiny session), never an error. The
-/// caller falls back to its own floor (`Agent · <short-id>`).
-pub fn resolve_label_from_transcript(transcript_path: &Path, cwd: &Path) -> Option<String> {
+/// An unreadable file yields an empty [`TranscriptNames`] — a normal outcome
+/// (deleted transcript, tiny session), never an error.
+pub fn read_transcript_names(transcript_path: &Path, cwd: &Path) -> TranscriptNames {
     // Tail first: it is the only read that can see a `/rename`, and it is the
-    // smaller of the two. A transcript shorter than the budget is read whole
-    // by this one seek, so the head read below is skipped entirely.
-    if let Some(label) = read_tail(transcript_path)
-        .as_deref()
-        .and_then(|tail| label_from_transcript_tail(tail, cwd))
-    {
-        return Some(label);
+    // smaller of the two.
+    let Some(tail) = read_tail(transcript_path) else {
+        return TranscriptNames::default();
+    };
+    if tail.covers_whole_file {
+        // That one seek already read the entire transcript, so a head read
+        // would be duplicated I/O for bytes we are holding.
+        return names_from_transcript_text(&tail.text, cwd);
     }
-    let head = read_head(transcript_path)?;
-    label_from_transcript_head(&head, cwd)
+
+    let mut names = read_head(transcript_path)
+        .map(|head| names_from_transcript_text(&head, cwd))
+        .unwrap_or_default();
+    // The tail's own newest title wins when it has one: it is the only tier
+    // that can see a `/rename`. When the tail window holds no title at all — a
+    // session named before a very long tool loop — the head read's last title
+    // is left standing, which is closer to the newest name than nothing.
+    if let Some(newest) = last_title_from_tail(&tail.text, cwd) {
+        names.last_title = Some(newest);
+    }
+    names
+}
+
+/// A tail read plus whether it happened to cover the file from byte 0, which
+/// is what lets a short transcript be parsed from a single read.
+struct TailRead {
+    text: String,
+    covers_whole_file: bool,
 }
 
 /// Reads at most [`TAIL_READ_BYTES`] ending at EOF.
@@ -100,15 +231,18 @@ pub fn resolve_label_from_transcript(transcript_path: &Path, cwd: &Path) -> Opti
 /// The *first* line of the slice is normally cut mid-record; the per-line
 /// parse below skips it. No locking: Claude appends without one, so a torn
 /// final line is expected and handled the same way.
-fn read_tail(transcript_path: &Path) -> Option<String> {
+fn read_tail(transcript_path: &Path) -> Option<TailRead> {
     let mut file = File::open(transcript_path).ok()?;
     let len = file.metadata().ok()?.len();
     file.seek(SeekFrom::Start(len.saturating_sub(TAIL_READ_BYTES)))
         .ok()?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).ok()?;
-    // Lossy, not strict: the seek can land inside a multi-byte character.
-    Some(String::from_utf8_lossy(&buffer).into_owned())
+    Some(TailRead {
+        // Lossy, not strict: the seek can land inside a multi-byte character.
+        text: String::from_utf8_lossy(&buffer).into_owned(),
+        covers_whole_file: len <= TAIL_READ_BYTES,
+    })
 }
 
 /// Reads at most [`HEAD_READ_BYTES`] from offset 0.
@@ -126,7 +260,7 @@ fn read_head(transcript_path: &Path) -> Option<String> {
 /// Walks backwards so a `/rename` — appended last — wins over the titles
 /// Claude emits every turn, and so a long tail costs one reversed scan rather
 /// than a full parse.
-fn label_from_transcript_tail(tail: &str, cwd: &Path) -> Option<String> {
+fn last_title_from_tail(tail: &str, cwd: &Path) -> Option<String> {
     tail.lines()
         .rev()
         .filter_map(title_record_text)
@@ -134,81 +268,84 @@ fn label_from_transcript_tail(tail: &str, cwd: &Path) -> Option<String> {
         .find(|candidate| is_acceptable_label(candidate, cwd))
 }
 
-/// Pure core of the head tiers, separated for tests.
+/// Pure core of the bounded read: every candidate carried by `text`, in one
+/// pass.
+///
+/// Both the first and the last title are collected. (This used to keep only the
+/// last, on the reasoning that it was "strictly closer to the newest name" —
+/// the measurement above overturns that: the last title is the field a
+/// `/rename` broadcast corrupts, in 13 of 13 files, and the first is the field
+/// that survived in all 13.)
 ///
 /// The final line of a bounded read is usually truncated mid-record; malformed
 /// lines are skipped, never treated as errors.
-fn label_from_transcript_head(head: &str, cwd: &Path) -> Option<String> {
-    let mut last_ai_title: Option<String> = None;
-    let mut first_user_prompt: Option<String> = None;
-    let mut slug: Option<String> = None;
+fn names_from_transcript_text(text: &str, cwd: &Path) -> TranscriptNames {
+    let mut names = TranscriptNames::default();
 
-    for line in head.lines() {
+    for line in text.lines() {
         // Cheap substring pre-filters keep serde parsing off most lines.
-        let looks_like_title = line.contains("\"ai-title\"") || line.contains("\"agent-name\"");
-        let looks_like_user = first_user_prompt.is_none() && line.contains("\"user\"");
-        let looks_like_slug = slug.is_none() && line.contains("\"slug\"");
+        let looks_like_title = line.contains("\"ai-title\"");
+        let looks_like_user = names.prompt.is_none() && line.contains("\"user\"");
+        let looks_like_slug = names.slug.is_none() && line.contains("\"slug\"");
         if !looks_like_title && !looks_like_user && !looks_like_slug {
             continue;
         }
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if slug.is_none()
+        if names.slug.is_none()
             && let Some(text) = record.get("slug").and_then(Value::as_str)
         {
             // De-kebab: the slug is a filename-safe rendering of a phrase.
-            slug = Some(text.replace('-', " "));
+            names.slug = acceptable(&text.replace('-', " "), cwd);
         }
         match record.get("type").and_then(Value::as_str) {
-            // Deliberately the *last* title in the head, not the first: it
-            // costs the same single pass and is strictly closer to the newest
-            // name, which is what this tier is standing in for.
-            Some("ai-title" | "agent-name") => {
-                if let Some(title) = title_text(&record) {
-                    last_ai_title = Some(title);
+            Some("ai-title") => {
+                if let Some(title) = title_text(&record).and_then(|title| acceptable(&title, cwd)) {
+                    // Junk titles never occupy either slot, so a rejected first
+                    // record does not cost the session its real first title.
+                    names.first_title.get_or_insert_with(|| title.clone());
+                    names.last_title = Some(title);
                 }
             }
             Some("user") => {
-                if first_user_prompt.is_none()
+                if names.prompt.is_none()
                     && let Some(text) = real_user_prompt_text(&record)
                 {
-                    first_user_prompt = Some(text);
+                    names.prompt = acceptable(&text, cwd);
                 }
             }
             // A leading `summary` record describes the *pre-compaction parent*
-            // conversation, not this one, so it is never a name source. Listed
-            // rather than matched by wildcard so a new record type that does
-            // carry a name forces a decision here.
-            _ => {}
+            // conversation, not this one, so it is never a name source.
+            // `agent-name` is listed here to be explicit that it is ignored:
+            // see the module header — it is contaminated, not a mirror of
+            // `aiTitle`, and reading it is what made unrelated sessions share a
+            // name. Listed rather than matched by wildcard so a new record type
+            // that does carry a name forces a decision here.
+            Some("agent-name") | Some(_) | None => {}
         }
     }
 
-    [last_ai_title, first_user_prompt, slug]
-        .into_iter()
-        .flatten()
-        .map(|candidate| tidy(&candidate))
-        .find(|candidate| is_acceptable_label(candidate, cwd))
+    names
 }
 
 /// The title carried by a single transcript line, if it is a title record.
 /// Used by the reversed tail walk, which has no state to accumulate.
 fn title_record_text(line: &str) -> Option<String> {
-    if !line.contains("\"ai-title\"") && !line.contains("\"agent-name\"") {
+    if !line.contains("\"ai-title\"") {
         return None;
     }
     let record = serde_json::from_str::<Value>(line).ok()?;
     match record.get("type").and_then(Value::as_str) {
-        Some("ai-title" | "agent-name") => title_text(&record),
-        _ => None,
+        Some("ai-title") => title_text(&record),
+        Some(_) | None => None,
     }
 }
 
-/// The name field of a title record. `agent-name` mirrors `ai-title`.
+/// The name field of a title record.
 fn title_text(record: &Value) -> Option<String> {
     record
         .get("aiTitle")
-        .or_else(|| record.get("agentName"))
         .and_then(Value::as_str)
         .map(str::to_owned)
 }
@@ -249,6 +386,14 @@ pub(crate) fn user_prompt_text(record: &Value) -> Option<String> {
             .map(str::to_owned),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::Object(_) => None,
     }
+}
+
+/// A candidate tidied for display, or `None` when it is not worth showing.
+/// Applied at capture so every slot of [`TranscriptNames`] holds a usable
+/// string and no tier has to re-check.
+fn acceptable(candidate: &str, cwd: &Path) -> Option<String> {
+    let tidied = tidy(candidate);
+    is_acceptable_label(&tidied, cwd).then_some(tidied)
 }
 
 /// Collapses whitespace and ellipsizes to [`MAX_LABEL_LEN`].
