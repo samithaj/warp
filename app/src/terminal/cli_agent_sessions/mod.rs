@@ -694,6 +694,12 @@ impl CLIAgentSessionsModel {
     /// caches it onto the durable handle (`SetTitle`). Never touches the disk
     /// on the calling thread; failure to resolve is a normal outcome and
     /// leaves the previous cache in place.
+    ///
+    /// Applies the same uniqueness rule the rail's disk scan applies, using the
+    /// scan's claims map: a transcript's newest `aiTitle` is only this
+    /// session's name if no other session claims it, because `/rename`
+    /// broadcasts into concurrently-live sessions' transcripts. This path
+    /// resolves one session at a time and so has no such view of its own.
     fn refresh_cached_title(&self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
         #[cfg(not(target_family = "wasm"))]
         {
@@ -720,14 +726,38 @@ impl CLIAgentSessionsModel {
                 return;
             };
             let agent = session.agent.to_serialized_name();
+            // Snapshotted on this thread — the scan model is a singleton the
+            // spawned task cannot reach. Absent in test harnesses that never
+            // register it, which is the same "cannot tell" case as a scan that
+            // has not run yet.
+            let claims = ctx
+                .has_singleton_model::<session_scan::ClaudeSessionScanModel>()
+                .then(|| {
+                    session_scan::ClaudeSessionScanModel::as_ref(ctx)
+                        .title_claims()
+                        .clone()
+                });
 
             let _ = ctx.spawn(
                 async move {
                     let cwd_path = std::path::PathBuf::from(&cwd);
-                    let title = transcript_naming::claude_transcript_path(&cwd_path, &session_id)
-                        .and_then(|path| {
-                            transcript_naming::resolve_label_from_transcript(&path, &cwd_path)
-                        });
+                    let names = transcript_naming::claude_transcript_path(&cwd_path, &session_id)
+                        .map(|path| transcript_naming::read_transcript_names(&path, &cwd_path))
+                        .unwrap_or_default();
+                    let title = match &claims {
+                        // The scan has read this session's directory, so it has
+                        // also read the siblings a broadcast would have
+                        // contaminated: uniqueness is answerable.
+                        Some(claims) if claims.knows_session(&session_id) => {
+                            names.resolve(|title| claims.is_only_claimant(title, &session_id))
+                        }
+                        // No scan yet, or not this directory. Degrade to the
+                        // session's own first title rather than trusting the
+                        // last: measured, the last `aiTitle` was the corrupt
+                        // field in 13 of 13 contaminated transcripts and the
+                        // first was correct in all 13.
+                        Some(_) | None => names.resolve_without_uniqueness(),
+                    };
                     (agent, session_id, title)
                 },
                 |me: &mut Self, (agent, session_id, title), ctx| {
