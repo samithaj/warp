@@ -34,6 +34,14 @@ fn main() -> Result<()> {
         warp_core::features::FeatureFlag::ResumeProjectTasks,
         // Likewise: defer a restored tab's shell until the tab is opened.
         warp_core::features::FeatureFlag::LazyShellStartup,
+        // Without this the rail's waiting/overdue/done colours and the
+        // nag engine are unreachable, not merely off: the flag gates
+        // whether WARP_CLI_AGENT_PROTOCOL_VERSION is exported into the
+        // shell (see local_tty/unix.rs), the Claude Code plugin refuses to
+        // send structured events when it is absent, and without those a
+        // session never earns rich status — so its row can only ever be
+        // neutral. It belongs to no flag list at all, not even DOGFOOD.
+        warp_core::features::FeatureFlag::HOANotifications,
     ]);
     ChannelState::set(state);
 
