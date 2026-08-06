@@ -68,11 +68,14 @@
 // Only the scanning half of this module needs a map; the browser build keeps
 // the plain data types and a no-op refresh.
 #[cfg(not(target_family = "wasm"))]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use warpui::{Entity, ModelContext, SingletonEntity};
+
+#[cfg(not(target_family = "wasm"))]
+use super::transcript_naming::TranscriptNames;
 
 /// How many sessions a single directory contributes, newest first.
 ///
@@ -92,11 +95,16 @@ const MAX_SCANNED_SESSIONS_PER_DIR: usize = 16;
 #[cfg(not(target_family = "wasm"))]
 const RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Resolved names for one directory, keyed by the transcript they came from
+/// Name *candidates* for one directory, keyed by the transcript they came from
 /// and that file's mtime. Including the mtime is what makes a stale entry
 /// impossible: a rewritten transcript simply misses the memo and is re-read.
+///
+/// Candidates rather than resolved labels: which candidate wins depends on what
+/// *other* sessions are called ([`resolve_labels`]), so a memoised label would
+/// pin a decision that a newly scanned sibling can legitimately overturn
+/// without this file changing at all.
 #[cfg(not(target_family = "wasm"))]
-pub type NameMemo = HashMap<(PathBuf, SystemTime), String>;
+pub type NameMemo = HashMap<(PathBuf, SystemTime), TranscriptNames>;
 
 /// What one directory scan produces: the rows, and the **complete** memo for
 /// the sessions it listed.
@@ -121,8 +129,18 @@ pub struct ScannedSession {
     /// the canonicalized form used to locate the transcript), so it can be
     /// bucketed by exactly the same path the rest of the rail buckets by.
     pub cwd: String,
+    /// Everything the transcript offers as a name. Kept alongside the resolved
+    /// label because the resolution depends on the other rows and is redone
+    /// whenever the set of scanned sessions changes.
+    #[cfg(not(target_family = "wasm"))]
+    pub names: TranscriptNames,
     /// Resolved conversation name, or `None` when the transcript yielded no
     /// acceptable one.
+    ///
+    /// Assigned by [`resolve_labels`] over *all* scanned directories, never by
+    /// the directory scan alone: a broadcast `/rename` corrupts transcripts in
+    /// sibling projects, so the evidence that a title is not this session's own
+    /// is usually in a different directory.
     pub label: Option<String>,
     /// Transcript mtime; the rail orders scanned rows newest-first by it.
     pub modified: SystemTime,
@@ -166,6 +184,77 @@ fn is_session_uuid(id: &str) -> bool {
     groups.next().is_none()
 }
 
+/// Which sessions claim each conversation title, across every scanned
+/// directory.
+///
+/// This is the whole discriminator for the broadcast bug. Claude Code's
+/// `/rename` writes the new name into the transcripts of other sessions that
+/// are live at the same time — measured here, one rename's name is the last
+/// `aiTitle` of 13 transcripts in 6 different project directories, all carrying
+/// their own `sessionId`, so nothing inside a single file can tell it is not
+/// that file's name. A title only one session claims is that session's own; a
+/// title several claim names none of them.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug, Default, Clone)]
+pub struct TitleClaims {
+    by_title: HashMap<String, HashSet<String>>,
+    sessions: HashSet<String>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl TitleClaims {
+    /// Whether the scan has seen this session at all.
+    ///
+    /// The question callers really need answered is "could this map know about
+    /// a collision", and a session the scan has not seen means its *directory*
+    /// has not been scanned either — so the siblings a broadcast would have
+    /// contaminated have not been read, and uniqueness is unknowable rather
+    /// than true. Without this check an empty map would silently certify every
+    /// title as unique, which is exactly the contaminated last-title answer.
+    pub fn knows_session(&self, session_id: &str) -> bool {
+        self.sessions.contains(session_id)
+    }
+
+    /// Whether `session_id` is the only session claiming `title`.
+    pub fn is_only_claimant(&self, title: &str, session_id: &str) -> bool {
+        self.by_title
+            .get(title)
+            .is_none_or(|claimants| claimants.iter().all(|claimant| claimant == session_id))
+    }
+
+    fn claim(&mut self, title: &str, session_id: &str) {
+        self.by_title
+            .entry(title.to_owned())
+            .or_default()
+            .insert(session_id.to_owned());
+    }
+}
+
+/// Assigns every session's label from its candidates, using claims built across
+/// **all** the sessions given, and returns the claims for reuse.
+///
+/// Must be called over the whole scanned set rather than one directory at a
+/// time: the contamination crosses directories (13 transcripts, 6 projects, one
+/// `/rename`), so a per-directory view would certify a broadcast name as unique
+/// and keep showing it.
+#[cfg(not(target_family = "wasm"))]
+pub fn resolve_labels(sessions: &mut [ScannedSession]) -> TitleClaims {
+    let mut claims = TitleClaims::default();
+    for session in sessions.iter() {
+        claims.sessions.insert(session.session_id.clone());
+        for title in session.names.claimed_titles() {
+            claims.claim(title, &session.session_id);
+        }
+    }
+    for session in sessions.iter_mut() {
+        let label = session
+            .names
+            .resolve(|title| claims.is_only_claimant(title, &session.session_id));
+        session.label = label;
+    }
+    claims
+}
+
 pub struct ClaudeSessionScanChanged;
 
 /// Singleton cache of the most recent scan of each project directory.
@@ -183,6 +272,11 @@ pub struct ClaudeSessionScanModel {
     /// bounded: each scan replaces its directory's bucket outright.
     #[cfg(not(target_family = "wasm"))]
     names: HashMap<PathBuf, NameMemo>,
+    /// Who claims each title, over every directory scanned so far. Rebuilt with
+    /// the labels after each scan, and handed to the live-session path, which
+    /// resolves one session at a time and has no such view of its own.
+    #[cfg(not(target_family = "wasm"))]
+    claims: TitleClaims,
     /// Directories with a scan in flight, so overlapping kicks do not stack.
     #[cfg(not(target_family = "wasm"))]
     in_flight: std::collections::HashSet<PathBuf>,
@@ -200,6 +294,17 @@ impl ClaudeSessionScanModel {
     /// Every scanned session, across all scanned directories.
     pub fn sessions(&self) -> &[ScannedSession] {
         &self.sessions
+    }
+
+    /// Who claims each conversation title, over every directory scanned so far.
+    ///
+    /// Exposed for the handle-bound (live) sessions in
+    /// [`CLIAgentSessionsModel`](super::CLIAgentSessionsModel), which resolve a
+    /// title one session at a time: this scan is the only place with a view
+    /// wide enough to spot a name shared with another session.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn title_claims(&self) -> &TitleClaims {
+        &self.claims
     }
 
     /// The scanned session with this id, if the last scan saw it. The join key
@@ -271,6 +376,10 @@ impl ClaudeSessionScanModel {
                     me.sessions.extend(sessions);
                     me.names.insert(dir, names);
                 }
+                // Once, after the whole merge: resolving inside the loop would
+                // judge uniqueness against a half-updated set, and a name is
+                // only trustworthy relative to every session currently known.
+                me.claims = resolve_labels(&mut me.sessions);
                 ctx.emit(ClaudeSessionScanChanged);
                 ctx.notify();
             },
@@ -345,19 +454,24 @@ fn scan_directory(config_root: &Path, dir: &Path, known_names: &NameMemo) -> Dir
     let mut memo = NameMemo::new();
     for (session_id, path, modified) in candidates {
         let key = (path.clone(), modified);
-        let label = match known_names.get(&key) {
-            Some(cached) => Some(cached.clone()),
-            None => super::transcript_naming::resolve_label_from_transcript(&path, &canonical),
+        let names = match known_names.get(&key) {
+            Some(cached) => cached.clone(),
+            None => super::transcript_naming::read_transcript_names(&path, &canonical),
         };
         // Carried forward whether it was a hit or a fresh read, so the returned
-        // memo describes exactly the sessions that still exist.
-        if let Some(label) = &label {
-            memo.insert(key, label.clone());
+        // memo describes exactly the sessions that still exist. A transcript
+        // that yielded nothing is left out, so it is retried next scan.
+        if !names.is_empty() {
+            memo.insert(key, names.clone());
         }
         sessions.push(ScannedSession {
             session_id,
             cwd: cwd.clone(),
-            label,
+            names,
+            // Filled in by `resolve_labels` once every directory's rows are
+            // merged; this scan cannot see the sibling projects a broadcast
+            // rename reached.
+            label: None,
             modified,
         });
     }
