@@ -183,6 +183,17 @@ pub enum WorkspaceAction {
         agent: crate::terminal::CLIAgent,
         session_id: String,
     },
+    /// Closes every live tab in this window that is a plain shell — one idle
+    /// terminal with no agent on it — after confirming the count.
+    ///
+    /// Destructive on purpose, and confirmed rather than filtered: hiding those
+    /// rows left the shells running behind a switch the user then had to
+    /// remember they had flipped, while this actually reclaims the tab. The
+    /// active tab, anything busy, anything shared and anything agent-backed are
+    /// never touched; see
+    /// [`rail_clear_shells`](crate::workspace::rail_clear_shells) for why each
+    /// is exempt.
+    ClearShellsWithoutAgents,
     /// Sets the manual color override for the active tab.
     ///
     /// - `Color(_)` — apply that color.
@@ -992,6 +1003,10 @@ impl WorkspaceAction {
             | CloseNonActiveTabs
             | CloseTabsRight(_)
             | CloseTabsRightActiveTab
+            // Removes tabs from the window layout, exactly like the closes
+            // above it — even though the close itself happens after a
+            // confirmation, so this arm may fire before anything is gone.
+            | ClearShellsWithoutAgents
             | CloseTabGroup(_)
             | ToggleTabGroupCollapsed(_)
             | RenameTabGroup(_)
