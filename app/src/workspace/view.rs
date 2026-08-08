@@ -1359,6 +1359,20 @@ pub struct Workspace {
     create_auth_secret_modal: Option<ViewHandle<Modal<AuthSecretFtuxView>>>,
 }
 
+/// The tab to fall to when `removed_index` is closed, among the indices still
+/// visible: the nearest one after it, else the nearest one before.
+///
+/// Split out from [`Workspace::close_successor_in_selected_project`] so the
+/// rule can be tested without standing up a workspace — the surrounding
+/// machinery needs a live `AppContext`, this does not.
+fn nearest_remaining_tab(visible: &[usize], removed_index: usize) -> Option<usize> {
+    visible
+        .iter()
+        .copied()
+        .find(|i| *i >= removed_index)
+        .or_else(|| visible.iter().copied().rfind(|i| *i < removed_index))
+}
+
 impl Workspace {
     pub fn is_tab_drag_preview(&self) -> bool {
         self.is_tab_drag_preview
@@ -8895,6 +8909,40 @@ impl Workspace {
     }
 
     /// Removes a tab group from the workspace if no tabs reference it.
+    /// The tab to activate after closing the active tab, kept inside the
+    /// project the user is looking at.
+    ///
+    /// `self.tabs` is one flat list across every project, while the rail groups
+    /// by project and the tab strip is filtered to the selected one. So the
+    /// flat neighbour of a closed tab frequently belongs to a *different*
+    /// project — and `set_active_tab_index` then faithfully re-points
+    /// `selected_project` at it, swapping the rail selection and the whole tab
+    /// strip to an unrelated project's tasks in the same frame. Closing the
+    /// rightmost tab of a project's run was enough to trigger it, even with
+    /// other tabs of that project still open.
+    ///
+    /// Every other navigation path in project mode is already scoped this way
+    /// (`activate_prev_tab`, `activate_next_tab`, `activate_tab_by_number`,
+    /// the Ctrl-Tab palette); this one was missed.
+    ///
+    /// The project comes from `selected_project` rather than from the removed
+    /// tab: `detach_panes_for_close` has already run by this point, so the
+    /// closed tab's `active_session_path` may no longer resolve, and the
+    /// active∈selected invariant means the two are the same project anyway.
+    ///
+    /// Returns `None` when project mode is off, or when the project has no
+    /// tabs left — the caller then keeps the flat-neighbour behaviour.
+    fn close_successor_in_selected_project(
+        &self,
+        removed_index: usize,
+        ctx: &AppContext,
+    ) -> Option<usize> {
+        // `visible` is computed after the removal, so it already excludes the
+        // closed tab and its indices refer to the current `self.tabs`.
+        let visible = self.project_visible_indices(ctx)?;
+        nearest_remaining_tab(&visible, removed_index)
+    }
+
     fn prune_empty_tab_group(&mut self, group_id: TabGroupId, ctx: &mut ViewContext<Self>) {
         let has_members = group_member_indices(&self.tabs, group_id).next().is_some();
         if !has_members {
@@ -13276,7 +13324,10 @@ impl Workspace {
                 // tab occupies the same index. If the closed tab was the last one, fall
                 // back to the new last tab (the previous neighbor). This matches the
                 // browser / macOS convention for both layouts.
-                let active_index = index.min(self.tabs.len() - 1);
+                let flat_successor = index.min(self.tabs.len() - 1);
+                let active_index = self
+                    .close_successor_in_selected_project(index, ctx)
+                    .unwrap_or(flat_successor);
                 self.activate_tab_internal(active_index, ctx);
             }
             Ordering::Less => {
@@ -22081,8 +22132,18 @@ impl Workspace {
     fn render_tab_bar_hoverable(&self, content: Box<dyn Element>) -> Box<dyn Element> {
         Hoverable::new(self.tab_bar_hover_state.clone(), |_| content)
             .with_hover_out_delay(Duration::from_millis(500))
-            .on_hover(|_is_hovered, ctx, _app, _position| {
+            .on_hover(|is_hovered, ctx, _app, _position| {
                 ctx.dispatch_typed_action(WorkspaceAction::SyncTrafficLights);
+                if !is_hovered {
+                    // Tab widths are content-driven, so closing a tab re-measures
+                    // every surviving one. Hovering a close button pins them so the
+                    // × cannot slide out from under the cursor; releasing that pin
+                    // per-button meant the whole bar resized between consecutive
+                    // closes. Holding it until the pointer leaves the bar keeps the
+                    // strip still for as long as the user is working in it, and
+                    // settles once on the way out.
+                    ctx.dispatch_typed_action(WorkspaceAction::TabHoverWidthEnd);
+                }
             })
             .finish()
     }
