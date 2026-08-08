@@ -789,6 +789,49 @@ fn cli_agent_blocked_since_survives_repeated_blocked_events() {
     ));
 }
 
+/// An agent parked at its prompt is waiting on the user, and for anyone who
+/// runs with permissions pre-accepted it is the *only* wait that ever
+/// happens — measured on a real profile, 15 idle prompts against zero
+/// permission requests and zero questions. Dropping the event meant the rail
+/// could never show a colour for that person.
+#[test]
+fn cli_agent_idle_prompt_is_a_wait() {
+    let mut session = in_progress_claude_session();
+    session.apply_event(&rich_event(CLIAgentEventType::IdlePrompt));
+
+    assert!(
+        matches!(session.status, CLIAgentSessionStatus::Blocked { .. }),
+        "an agent sitting at its prompt is waiting on the user, got {:?}",
+        session.status
+    );
+    assert!(
+        session.blocked_since.is_some(),
+        "the wait needs a clock, or the rail cannot escalate it"
+    );
+}
+
+/// The reason the event was originally dropped, kept: a finished agent is
+/// also, trivially, sitting at its prompt. Green must not flip to yellow.
+#[test]
+fn cli_agent_idle_prompt_never_overrides_a_finished_run() {
+    for terminal in [CLIAgentEventType::Stop, CLIAgentEventType::StopFailure] {
+        let mut session = in_progress_claude_session();
+        session.apply_event(&rich_event(terminal.clone()));
+        let finished = session.status.clone();
+
+        session.apply_event(&rich_event(CLIAgentEventType::IdlePrompt));
+
+        assert_eq!(
+            session.status, finished,
+            "{terminal:?} then IdlePrompt must keep the finished status"
+        );
+        assert!(
+            session.blocked_since.is_none(),
+            "a finished run is not waiting on anyone"
+        );
+    }
+}
+
 /// Events that leave the status untouched (and so return `None` from
 /// `apply_event`) must not disturb an in-flight wait either.
 #[test]
