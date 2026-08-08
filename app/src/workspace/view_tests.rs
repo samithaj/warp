@@ -4968,3 +4968,37 @@ fn test_tools_panel_warp_drive_toggle_updates_available_views() {
         });
     });
 }
+
+/// Closing the active tab used to fall to `index.min(len - 1)` over the flat,
+/// all-projects tab list. The rail groups by project and the strip is filtered
+/// to the selected one, so that neighbour was often another project's tab — and
+/// the active-belongs-to-selected invariant then faithfully swapped the rail
+/// and the whole strip to it. Closing the rightmost tab of a project was enough,
+/// with other tabs of that project still open.
+#[test]
+fn close_successor_stays_inside_the_project() {
+    // Flat [X0, X1, Y0, Y1], selected X, closing X1 (index 1).
+    // After removal the surviving X tab is index 0; the flat rule would have
+    // picked index 1, which is now Y0.
+    assert_eq!(super::nearest_remaining_tab(&[0], 1), Some(0));
+
+    // Interleaved [X0, Y0, X1], selected X, closing X0 (index 0): the flat
+    // rule picks index 0 — Y0 — so the bug fired on the leftmost tab too.
+    assert_eq!(super::nearest_remaining_tab(&[1], 0), Some(1));
+}
+
+/// After-then-before, so closing a tab moves right like the browser convention
+/// the flat rule documented, and only falls left at the end of the run.
+#[test]
+fn close_successor_prefers_the_tab_after_it() {
+    assert_eq!(super::nearest_remaining_tab(&[0, 2, 5], 2), Some(2));
+    assert_eq!(super::nearest_remaining_tab(&[0, 2, 5], 3), Some(5));
+    assert_eq!(super::nearest_remaining_tab(&[0, 2], 4), Some(2));
+}
+
+/// A project with nothing left yields `None`, and the caller keeps the old
+/// flat-neighbour behaviour rather than inventing a tab.
+#[test]
+fn close_successor_is_none_when_the_project_is_empty() {
+    assert_eq!(super::nearest_remaining_tab(&[], 3), None);
+}
