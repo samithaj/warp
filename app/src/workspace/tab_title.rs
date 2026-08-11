@@ -303,19 +303,14 @@ fn stored_handle_lookup(
     if !FeatureFlag::ResumeProjectTasks.is_enabled() {
         return None;
     }
-    // `active_session_path` resolves through the group's focus state, which a
-    // restored tab that has never been opened does not have — and under
-    // `LazyShellStartup` that is most of them after a restart. Falling back to
-    // the retained startup directory is what lets such a tab still be
-    // recognised as holding an agent session.
+    // `held_session_directory` rather than `active_session_path` so this agrees
+    // with the dormant-row suppression and the resume path about which tab
+    // hosts a stored session; all three compare the answer to a handle's `cwd`.
     //
     // This matters beyond naming: `pane_has_agent` consults this lookup, and
     // "Clear shells without agents" closes panes it reports as agent-less. A
     // missing cwd must not be allowed to read as "no agent ever ran here".
-    let pane_cwd = pane_group
-        .active_session_path(app)
-        .or_else(|| pane_group.restored_terminal_startup_directory())
-        .and_then(|path| path.to_str().map(str::to_owned))?;
+    let pane_cwd = pane_group.held_session_directory(app)?;
     AgentSessionHandlesModel::as_ref(app)
         .find_by_pane_and_cwd(&pane_cwd, |pane_uuid| {
             pane_group
