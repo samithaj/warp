@@ -4464,7 +4464,7 @@ fn compact_branch_subtitle_display(
         })
 }
 
-fn render_git_branch_text(
+pub(crate) fn render_git_branch_text(
     branch: &str,
     text_color: WarpThemeFill,
     font_size: f32,
