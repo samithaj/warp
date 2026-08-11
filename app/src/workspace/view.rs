@@ -5699,9 +5699,7 @@ impl Workspace {
                 pane_group
                     .find_terminal_pane_by_session_uuid(&pane_uuid)
                     .is_some()
-                    && pane_group
-                        .active_session_path(ctx)
-                        .is_some_and(|path| path.to_str() == Some(cwd.as_str()))
+                    && pane_group.held_session_directory(ctx).as_deref() == Some(cwd.as_str())
             })
         });
         if let Some(tab_index) = owning_pane {

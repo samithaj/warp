@@ -4348,6 +4348,27 @@ impl PaneGroup {
             .cloned()
     }
 
+    /// The directory this group holds a terminal session in, as the string an
+    /// `AgentSessionHandle`'s `cwd` is compared against.
+    ///
+    /// Every site that asks "does this tab still host that stored session"
+    /// must ask it the same way, or they disagree about the same tab: the rail
+    /// offers a row as resumable in place while the resume path decides no pane
+    /// owns the session and opens a second tab for it, and the dormant-row
+    /// suppression lets the same session appear twice.
+    ///
+    /// `active_session_path` answers for most groups — the active session id
+    /// defaults to the lowest terminal pane at construction, so it is set even
+    /// for a tab that has never been focused. It still goes `None` when *that*
+    /// pane has neither a local path nor a startup directory (a remote session,
+    /// say) while another terminal pane in the group does hold the restored
+    /// directory, which is what the fallback covers.
+    pub(crate) fn held_session_directory(&self, ctx: &AppContext) -> Option<String> {
+        self.active_session_path(ctx)
+            .or_else(|| self.restored_terminal_startup_directory())
+            .and_then(|path| path.to_str().map(str::to_owned))
+    }
+
     fn content_by_pane_index(&self, index: usize) -> Option<&dyn AnyPaneContent> {
         self.content_by_pane_id(self.pane_id_by_index(index)?)
     }
