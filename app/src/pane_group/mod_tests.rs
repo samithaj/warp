@@ -3395,3 +3395,62 @@ fn restored_terminal_startup_directory_resolves_for_never_focused_tab() {
         });
     });
 }
+
+/// The same never-focused restored tab, through the accessor every
+/// "does this tab still host that stored agent session" check uses.
+///
+/// Three call sites ask that question — the rail's resumable-row lookup, the
+/// dormant-row suppression, and the resume path's owning-pane search — and each
+/// compares the answer against an `AgentSessionHandle`'s `cwd`. They must
+/// resolve the directory identically or they contradict each other about one
+/// tab: the rail offers a row as resumable in place, the resume path then finds
+/// no owning pane and opens a *second* tab for a session already on screen, and
+/// the suppression lets that same session also show a dormant row.
+#[test]
+fn held_session_directory_resolves_for_never_focused_tab() {
+    let _lazy_shell = FeatureFlag::LazyShellStartup.override_enabled(true);
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let layout = PanesLayout::Snapshot(Box::new(PaneNodeSnapshot::Leaf(LeafSnapshot {
+            is_focused: false,
+            custom_vertical_tabs_title: None,
+            contents: LeafContents::Terminal(TerminalPaneSnapshot {
+                uuid: Uuid::new_v4().as_bytes().to_vec(),
+                cwd: Some("/tmp".to_owned()),
+                shell_launch_data: None,
+                is_active: false,
+                is_read_only: false,
+                input_config: None,
+                llm_model_override: None,
+                active_profile_id: None,
+                conversation_ids_to_restore: Vec::new(),
+                active_conversation_id: None,
+            }),
+        })));
+
+        let pane_group = mock_pane_group(
+            &mut app,
+            MockOptions {
+                layout,
+                ..Default::default()
+            },
+        );
+
+        pane_group.read(&app, |panes, ctx| {
+            assert_eq!(
+                panes.held_session_directory(ctx),
+                Some("/tmp".to_owned()),
+                "the tab still holds its session's directory"
+            );
+            // Whenever focus state does resolve a path, the accessor must be
+            // exactly it: the fallback may only add answers, never change one.
+            if let Some(active) = panes.active_session_path(ctx) {
+                assert_eq!(
+                    panes.held_session_directory(ctx).as_deref(),
+                    active.to_str(),
+                );
+            }
+        });
+    });
+}
