@@ -1,3 +1,4 @@
+pub(crate) mod agent_cli_launch_modal;
 pub(crate) mod auto_handoff_sleep_modal;
 mod build_plan_migration_modal;
 pub(crate) mod cloud_agent_capacity_modal;
@@ -511,6 +512,9 @@ use crate::workspace::tab_settings::TabCloseButtonPosition;
 use crate::workspace::toast_stack::{
     ToastStack, ToastStack as WorkspaceToastStack, ToastStackEvent as WorkspaceToastStackEvent,
 };
+use crate::workspace::view::agent_cli_launch_modal::{
+    AgentCliLaunchModal, AgentCliLaunchModalEvent,
+};
 use crate::workspace::view::auto_handoff_sleep_modal::{
     AutoHandoffSleepModal, AutoHandoffSleepModalEvent,
 };
@@ -631,7 +635,6 @@ const THEME_CHOOSER_RATIO: f32 = 3.5;
 /// Save position for the tab bar.
 pub(crate) const TAB_BAR_POSITION_ID: &str = "workspace_view:tab_bar";
 const TEAM_SWITCHER_PILL_POSITION_ID: &str = "workspace_view:team_switcher_pill";
-const TEAM_HEADER_TINT_ALPHA: u8 = 96;
 const TEAM_SWITCHER_DOT_ALPHA: u8 = 204;
 
 /// Save position for the vertical tabs panel.
@@ -1181,6 +1184,7 @@ pub struct Workspace {
     oz_launch_modal: ModalWithTab<LaunchModal<OzLaunchSlide>>,
     openwarp_launch_modal: ViewHandle<OpenWarpLaunchModal>,
     orchestration_launch_modal: ViewHandle<OrchestrationLaunchModal>,
+    agent_cli_launch_modal: ViewHandle<AgentCliLaunchModal>,
     feature_intro_modal: ViewHandle<FeatureIntroModal>,
     /// Tab that first received the feature-intro popover. The popover stays
     /// pinned to this tab for the rest of its lifetime so switching tabs does
@@ -3096,6 +3100,11 @@ impl Workspace {
             me.handle_orchestration_launch_modal_event(event, ctx);
         });
 
+        let agent_cli_launch_view = ctx.add_typed_action_view(AgentCliLaunchModal::new);
+        ctx.subscribe_to_view(&agent_cli_launch_view, |me, _, event, ctx| {
+            me.handle_agent_cli_launch_modal_event(event, ctx);
+        });
+
         let feature_intro_view = ctx.add_typed_action_view(FeatureIntroModal::new);
         ctx.subscribe_to_view(&feature_intro_view, |me, _, event, ctx| {
             me.handle_feature_intro_modal_event(event, ctx);
@@ -3428,6 +3437,8 @@ impl Workspace {
                         me.focus_openwarp_launch_modal(ctx);
                     } else if model_ref.is_orchestration_launch_modal_open() {
                         me.focus_orchestration_launch_modal(ctx);
+                    } else if model_ref.is_agent_cli_launch_modal_open() {
+                        me.focus_agent_cli_launch_modal(ctx);
                     } else if model_ref.is_auto_handoff_sleep_modal_open() {
                         me.focus_auto_handoff_sleep_modal(ctx);
                     } else if model_ref.is_free_ai_removal_modal_open() {
@@ -3581,6 +3592,7 @@ impl Workspace {
             },
             openwarp_launch_modal: openwarp_launch_view,
             orchestration_launch_modal: orchestration_launch_view,
+            agent_cli_launch_modal: agent_cli_launch_view,
             feature_intro_modal: feature_intro_view,
             feature_intro_tab_pane_group_id: None,
             auto_handoff_sleep_modal: auto_handoff_sleep_view,
@@ -5720,9 +5732,7 @@ impl Workspace {
                 pane_group
                     .find_terminal_pane_by_session_uuid(&pane_uuid)
                     .is_some()
-                    && pane_group
-                        .active_session_path(ctx)
-                        .is_some_and(|path| path.to_str() == Some(cwd.as_str()))
+                    && pane_group.held_session_directory(ctx).as_deref() == Some(cwd.as_str())
             })
         });
         if let Some(tab_index) = owning_pane {
@@ -19479,6 +19489,22 @@ impl Workspace {
         }
     }
 
+    fn handle_agent_cli_launch_modal_event(
+        &mut self,
+        event: &AgentCliLaunchModalEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            AgentCliLaunchModalEvent::Close => {
+                OneTimeModalModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.mark_agent_cli_launch_modal_dismissed(ctx);
+                });
+                self.focus_active_tab(ctx);
+                ctx.notify();
+            }
+        }
+    }
+
     fn handle_feature_intro_modal_event(
         &mut self,
         event: &FeatureIntroModalEvent,
@@ -21853,7 +21879,7 @@ impl Workspace {
         let tab_bar_border =
             Border::bottom(TAB_BAR_BORDER_HEIGHT).with_border_fill(appearance.theme().outline());
 
-        let mut tab_bar_container = Container::new(
+        let tab_bar_element = Container::new(
             EventHandler::new(Clipped::new(self.render_tab_bar_hoverable(bar_contents)).finish())
                 .on_back_mouse_down(move |ctx, _app, _position| {
                     ctx.dispatch_typed_action(WorkspaceAction::ActivatePrevTab);
@@ -21865,21 +21891,8 @@ impl Workspace {
                 })
                 .finish(),
         )
-        .with_border(tab_bar_border);
-        let is_multi_team = UserWorkspaces::as_ref(ctx).can_switch_teams();
-        let team_color = is_multi_team
-            .then(|| UserWorkspaces::as_ref(ctx).team_for_window(self.window_id))
-            .flatten()
-            .and_then(|team| team.color.as_deref())
-            .and_then(|hex| warp_core::ui::color::hex_color::coloru_from_hex_string(hex).ok())
-            .map(|mut color| {
-                color.a = TEAM_HEADER_TINT_ALPHA;
-                color
-            });
-        if let Some(team_color) = team_color {
-            tab_bar_container = tab_bar_container.with_background(Fill::Solid(team_color));
-        }
-        let tab_bar_element = tab_bar_container.finish();
+        .with_border(tab_bar_border)
+        .finish();
 
         let dimming_color = appearance.theme().background().into();
         SavePosition::new(
@@ -23328,8 +23341,57 @@ impl Workspace {
                 // rather than merely focusing a dead shell.
                 let resumable = crate::workspace::tab_title::stored_handle_for_tab(pane_group, ctx)
                     .map(|(agent, session_id, _)| (agent, session_id));
-                let task_icon = pane_group
-                    .focused_session_view(ctx)
+                let focused_view = pane_group.focused_session_view(ctx);
+                // Branch + PR line under the label. The branch shows whenever
+                // the terminal knows one; the PR chip only when this terminal
+                // already subscribes to its repo's GitHub model
+                // (`needs_pr_info`) — the rail never starts a `gh` poller of
+                // its own, so rows without a subscription show branch only.
+                let task_meta = focused_view.as_ref().and_then(|view| {
+                    let view = view.as_ref(ctx);
+                    let branch = view.current_git_branch(ctx);
+                    let pr = view.current_pr_info(ctx);
+                    if branch.is_none() && pr.is_none() {
+                        return None;
+                    }
+                    let mut meta = Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_spacing(6.);
+                    if let Some(branch) = branch {
+                        // Shrinkable, as at the vertical-tabs call sites: the
+                        // branch element is a row with a flexible child, so it
+                        // must be laid out with a bounded width.
+                        meta.add_child(
+                            Shrinkable::new(
+                                1.,
+                                vertical_tabs::render_git_branch_text(
+                                    &branch,
+                                    muted_color,
+                                    10.,
+                                    appearance,
+                                ),
+                            )
+                            .finish(),
+                        );
+                    }
+                    if let Some(pr) = pr {
+                        let pr_color = match pr.state.as_str() {
+                            "OPEN" => theme.ansi_fg_green(),
+                            "MERGED" => theme.ansi_fg_magenta(),
+                            _ => theme.ansi_fg_red(),
+                        };
+                        let draft = if pr.draft { " (draft)" } else { "" };
+                        meta.add_child(
+                            Text::new_inline(format!("#{}{draft}", pr.number), font_family, 10.)
+                                .with_clip(ClipConfig::ellipsis())
+                                .with_color(pr_color)
+                                .finish(),
+                        );
+                    }
+                    Some(meta.finish())
+                });
+                let task_icon = focused_view
+                    .as_ref()
                     .and_then(|view| terminal_view_agent_icon_variant(view.as_ref(ctx), ctx))
                     .map(|variant| {
                         render_icon_with_status(
@@ -23347,22 +23409,24 @@ impl Workspace {
                     if let Some(icon) = task_icon {
                         row_content.add_child(icon);
                     }
-                    row_content.add_child(
-                        Expanded::new(
-                            1.,
-                            // `Text::new` soft-wraps, so a long session name or
-                            // instruction spills onto another line instead of
-                            // being cut off.
-                            Text::new(task_label, font_family, 12.)
-                                .with_color(if is_active {
-                                    text_color.into()
-                                } else {
-                                    muted_color.into()
-                                })
-                                .finish(),
-                        )
-                        .finish(),
+                    let mut label_column =
+                        Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Start);
+                    label_column.add_child(
+                        // `Text::new` soft-wraps, so a long session name or
+                        // instruction spills onto another line instead of
+                        // being cut off.
+                        Text::new(task_label, font_family, 12.)
+                            .with_color(if is_active {
+                                text_color.into()
+                            } else {
+                                muted_color.into()
+                            })
+                            .finish(),
                     );
+                    if let Some(meta) = task_meta {
+                        label_column.add_child(meta);
+                    }
+                    row_content.add_child(Expanded::new(1., label_column.finish()).finish());
                     let mut container = Container::new(row_content.finish())
                         .with_padding_left(10.)
                         .with_padding_right(10.)
@@ -24510,6 +24574,10 @@ impl Workspace {
 
     fn focus_orchestration_launch_modal(&mut self, ctx: &mut ViewContext<Self>) {
         ctx.focus(&self.orchestration_launch_modal);
+    }
+
+    fn focus_agent_cli_launch_modal(&mut self, ctx: &mut ViewContext<Self>) {
+        ctx.focus(&self.agent_cli_launch_modal);
     }
 
     fn show_feature_intro_modal(&mut self, id: FeatureIntroId, ctx: &mut ViewContext<Self>) {
@@ -26394,24 +26462,34 @@ impl TypedActionView for Workspace {
                 session_id,
                 task_id,
             } => {
-                if let Some((_, locator)) =
-                    self.find_pane_with_ambient_agent_conversation(*task_id, ctx)
+                // An existing pane for this run is only reusable if it can host the live session.
+                // A read-only pane (e.g. a conversation transcript viewer opened earlier for the
+                // same run) must not be reused: focusing it would leave the user staring at a
+                // non-interactive transcript instead of a writable terminal. In that case fall
+                // through to opening a fresh shared-session tab.
+                let existing_pane = self.find_pane_with_ambient_agent_conversation(*task_id, ctx);
+                let mut attached_locator = None;
+                if let Some((_, locator)) = existing_pane
+                    && let Some(pane_group) = self
+                        .get_pane_group_view_with_id(locator.pane_group_id)
+                        .cloned()
                 {
-                    self.focus_pane(locator, ctx);
-                    if let Some(pane_group) =
-                        self.get_pane_group_view_with_id(locator.pane_group_id)
-                    {
-                        pane_group.update(ctx, |pane_group, ctx| {
-                            pane_group.attach_execution_session_to_ambient_pane(
-                                locator.pane_id,
-                                *session_id,
-                                ctx,
-                            );
-                        });
+                    let attached = pane_group.update(ctx, |pane_group, ctx| {
+                        pane_group.attach_execution_session_to_ambient_pane(
+                            locator.pane_id,
+                            *session_id,
+                            ctx,
+                        )
+                    });
+                    if attached {
+                        attached_locator = Some(locator);
                     }
-                } else {
+                }
+
+                match attached_locator {
+                    Some(locator) => self.focus_pane(locator, ctx),
                     // Attaching to a known ambient run: build the pane in ambient mode.
-                    self.add_tab_for_joining_shared_session(*session_id, true, ctx);
+                    None => self.add_tab_for_joining_shared_session(*session_id, true, ctx),
                 }
             }
             OpenConversationTranscriptViewer {
@@ -26711,6 +26789,34 @@ impl TypedActionView for Workspace {
                 log::info!(
                     "Orchestration launch modal state: old={old_value}, new={new_value}, feature_flag_enabled={}",
                     FeatureFlag::OrchestrationLaunchModal.is_enabled()
+                );
+            }
+            #[cfg(debug_assertions)]
+            OpenAgentCliLaunchModal => {
+                OneTimeModalModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.force_open_agent_cli_launch_modal(ctx);
+                });
+                ctx.notify();
+            }
+            #[cfg(debug_assertions)]
+            ResetAgentCliLaunchModalState => {
+                let old_value =
+                    *AISettings::as_ref(ctx).did_check_to_trigger_agent_cli_launch_modal;
+                AISettings::handle(ctx).update(ctx, |ai_settings, ctx| {
+                    if let Err(e) = ai_settings
+                        .did_check_to_trigger_agent_cli_launch_modal
+                        .set_value(false, ctx)
+                    {
+                        log::warn!(
+                            "Failed to reset Warp Agent CLI launch modal dismissed setting: {e}"
+                        );
+                    }
+                });
+                let new_value =
+                    *AISettings::as_ref(ctx).did_check_to_trigger_agent_cli_launch_modal;
+                log::info!(
+                    "Warp Agent CLI launch modal state: old={old_value}, new={new_value}, feature_flag_enabled={}",
+                    FeatureFlag::AgentCliLaunchModal.is_enabled()
                 );
             }
             #[cfg(debug_assertions)]
@@ -28131,6 +28237,10 @@ impl View for Workspace {
             stack.add_child(ChildView::new(&self.orchestration_launch_modal).finish());
         }
 
+        if should_show_modal && one_time_modal_model.is_agent_cli_launch_modal_open() {
+            stack.add_child(ChildView::new(&self.agent_cli_launch_modal).finish());
+        }
+
         if should_show_modal && one_time_modal_model.is_auto_handoff_sleep_modal_open() {
             stack.add_child(ChildView::new(&self.auto_handoff_sleep_modal).finish());
         }
@@ -28447,7 +28557,9 @@ impl View for Workspace {
             );
         }
 
-        let window_corner_radius = app.windows().window_corner_radius();
+        let window_corner_radius = app
+            .windows()
+            .window_corner_radius_for_window(self.window_id);
         let workspace = Container::new(stack.finish()).with_corner_radius(window_corner_radius);
 
         let mut stack = Stack::new();

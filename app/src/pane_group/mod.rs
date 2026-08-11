@@ -4361,6 +4361,27 @@ impl PaneGroup {
             .cloned()
     }
 
+    /// The directory this group holds a terminal session in, as the string an
+    /// `AgentSessionHandle`'s `cwd` is compared against.
+    ///
+    /// Every site that asks "does this tab still host that stored session"
+    /// must ask it the same way, or they disagree about the same tab: the rail
+    /// offers a row as resumable in place while the resume path decides no pane
+    /// owns the session and opens a second tab for it, and the dormant-row
+    /// suppression lets the same session appear twice.
+    ///
+    /// `active_session_path` answers for most groups — the active session id
+    /// defaults to the lowest terminal pane at construction, so it is set even
+    /// for a tab that has never been focused. It still goes `None` when *that*
+    /// pane has neither a local path nor a startup directory (a remote session,
+    /// say) while another terminal pane in the group does hold the restored
+    /// directory, which is what the fallback covers.
+    pub(crate) fn held_session_directory(&self, ctx: &AppContext) -> Option<String> {
+        self.active_session_path(ctx)
+            .or_else(|| self.restored_terminal_startup_directory())
+            .and_then(|path| path.to_str().map(str::to_owned))
+    }
+
     fn content_by_pane_index(&self, index: usize) -> Option<&dyn AnyPaneContent> {
         self.content_by_pane_id(self.pane_id_by_index(index)?)
     }
@@ -7041,6 +7062,13 @@ impl PaneGroup {
             .map(|session| session.terminal_view(ctx))
     }
 
+    /// Connects an existing ambient pane to `session_id` so the user lands on a live, writable
+    /// terminal rather than a stale read-only view of the run.
+    ///
+    /// Returns `false` when this pane cannot host a live session — a read-only conversation
+    /// transcript viewer, or any pane whose terminal manager is not a shared-session viewer.
+    /// Callers **must** treat `false` as "reuse is not possible" and open a fresh pane instead;
+    /// reporting success leaves the user focused on a pane with no input box.
     pub fn attach_execution_session_to_ambient_pane(
         &mut self,
         pane_id: PaneId,
@@ -7052,6 +7080,25 @@ impl PaneGroup {
             return false;
         };
 
+        // A conversation transcript viewer renders a snapshot of an ended conversation and can
+        // never be turned into a writable session, so refuse it instead of focusing a dead pane.
+        if terminal_view
+            .as_ref(ctx)
+            .model
+            .lock()
+            .is_conversation_transcript_viewer()
+        {
+            log::warn!(
+                "Tried to attach execution session to conversation transcript viewer pane {pane_id:?}"
+            );
+            return false;
+        }
+
+        // The pane may have been left in a finished/read-only state (ended-conversation tombstone,
+        // `FinishedViewer` status, non-editable input) by an earlier end-of-session transition.
+        // Only cleared once a join is actually underway: a caller that gets `false` opens a fresh
+        // pane instead, and this one would otherwise be left looking writable while attached to
+        // nothing.
         if let Some(ambient_agent_view_model) = terminal_view
             .as_ref(ctx)
             .ambient_agent_view_model()
@@ -7059,6 +7106,9 @@ impl PaneGroup {
         {
             ambient_agent_view_model.update(ctx, |model, ctx| {
                 model.attach_execution_session(session_id, ctx);
+            });
+            terminal_view.update(ctx, |view, ctx| {
+                view.prepare_for_live_session_reattach(ctx);
             });
             return true;
         }
@@ -7071,6 +7121,7 @@ impl PaneGroup {
             return false;
         };
 
+        let mut attached = false;
         terminal_manager.update(ctx, |terminal_manager, ctx| {
             let Some(manager) = terminal_manager
                 .as_any_mut()
@@ -7079,9 +7130,15 @@ impl PaneGroup {
                 log::warn!("Tried to attach execution session to non-viewer terminal manager");
                 return;
             };
-            manager.attach_execution_session(session_id, ctx);
+            attached = manager.attach_execution_session(session_id, ctx);
         });
-        true
+
+        if attached {
+            terminal_view.update(ctx, |view, ctx| {
+                view.prepare_for_live_session_reattach(ctx);
+            });
+        }
+        attached
     }
 
     /// Resolve the pane id that owns a given conversation's `TerminalView`,
