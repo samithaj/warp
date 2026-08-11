@@ -27,6 +27,8 @@ diesel::table! {
         title -> Nullable<Text>,
         created_at -> Timestamp,
         last_seen_at -> Timestamp,
+        success_seen -> Bool,
+        marked_unread -> Bool,
     }
 }
 

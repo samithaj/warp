@@ -940,6 +940,10 @@ pub struct AgentSessionHandleRecord {
     pub title: Option<String>,
     pub created_at: NaiveDateTime,
     pub last_seen_at: NaiveDateTime,
+    /// Whether the user has looked at the session's finished result.
+    pub success_seen: bool,
+    /// Manual "mark as unread" flag; forces the row green until cleared.
+    pub marked_unread: bool,
 }
 
 #[derive(Debug, PartialEq, Queryable, Selectable)]

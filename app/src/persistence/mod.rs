@@ -375,6 +375,14 @@ pub enum AgentSessionHandleOp {
         session_id: String,
         title: String,
     },
+    /// Persist the read/unread acknowledgement bits so they survive the pane
+    /// and app restarts.
+    SetReadState {
+        agent: String,
+        session_id: String,
+        success_seen: bool,
+        marked_unread: bool,
+    },
     /// The user explicitly discarded the task from the rail.
     Forget { agent: String, session_id: String },
 }

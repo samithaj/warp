@@ -44,6 +44,7 @@ pub fn open_cli_agent_rich_input(tab_index: usize) -> TestStep {
                             received_rich_notification: false,
                             blocked_since: None,
                             success_seen: false,
+                            marked_unread: false,
                         },
                         ctx,
                     );

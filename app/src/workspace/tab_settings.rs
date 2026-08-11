@@ -5,7 +5,9 @@ use settings::macros::define_settings_group;
 use settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
 use warp_core::ui::theme::AnsiColorIdentifier;
 
+use super::project_key::ProjectKey;
 use super::project_priorities::ProjectPriorities;
+use crate::workspace::nag_engine::NagPolicy;
 
 #[derive(
     Default,
@@ -242,6 +244,110 @@ settings::macros::implement_setting_for_enum!(
     description: "Ordered list of prioritized projects, highest priority first.",
     feature_flag: warp_core::features::FeatureFlag::Projects,
 );
+
+/// Per-project notification policy overrides, keyed by
+/// [`ProjectKey::to_storage_key`]. A project with no entry follows its rank:
+/// ranked projects nag urgently, unranked ones politely.
+#[derive(
+    Default,
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Mapping of projects to their blocked-agent notification policy.")]
+pub struct ProjectNagPolicies(pub(crate) HashMap<String, NagPolicy>);
+
+settings::macros::implement_setting_for_enum!(
+    ProjectNagPolicies,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Never,
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.project_layout.nag_policies",
+    description: "Mapping of projects to their blocked-agent notification policy.",
+    feature_flag: warp_core::features::FeatureFlag::Projects,
+);
+
+impl ProjectNagPolicies {
+    /// The user's override for this project, if any.
+    pub fn policy_for(&self, key: &ProjectKey) -> Option<NagPolicy> {
+        self.0.get(&key.to_storage_key()).copied()
+    }
+
+    /// Returns a copy with `key`'s override set, or removed when `policy` is
+    /// `None` (the project falls back to its rank-derived policy).
+    pub fn with_policy(&self, key: &ProjectKey, policy: Option<NagPolicy>) -> Self {
+        let mut map = self.0.clone();
+        match policy {
+            Some(policy) => {
+                map.insert(key.to_storage_key(), policy);
+            }
+            None => {
+                map.remove(&key.to_storage_key());
+            }
+        }
+        Self(map)
+    }
+}
+
+/// Per-project identity colours, keyed by [`ProjectKey::to_storage_key`].
+///
+/// Deliberately the same value type as [`DirectoryTabColors`] entries (an
+/// ANSI palette pick, not a free-form hex) so the project rail and the tab
+/// bar can never drift into two colour systems.
+#[derive(
+    Default,
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Mapping of projects to their rail identity colour.")]
+pub struct ProjectColors(pub(crate) HashMap<String, AnsiColorIdentifier>);
+
+settings::macros::implement_setting_for_enum!(
+    ProjectColors,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Never,
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.project_layout.project_colors",
+    description: "Mapping of projects to their rail identity colour.",
+    feature_flag: warp_core::features::FeatureFlag::Projects,
+);
+
+impl ProjectColors {
+    /// The user's identity colour for this project, if any.
+    pub fn color_for(&self, key: &ProjectKey) -> Option<AnsiColorIdentifier> {
+        self.0.get(&key.to_storage_key()).copied()
+    }
+
+    /// Returns a copy with `key`'s colour set, or removed when `color` is
+    /// `None`.
+    pub fn with_color(&self, key: &ProjectKey, color: Option<AnsiColorIdentifier>) -> Self {
+        let mut map = self.0.clone();
+        match color {
+            Some(color) => {
+                map.insert(key.to_storage_key(), color);
+            }
+            None => {
+                map.remove(&key.to_storage_key());
+            }
+        }
+        Self(map)
+    }
+}
 
 /// Canonicalizes `path` into the string key used in [`DirectoryTabColors`].
 pub fn canonical_directory_key(path: &Path) -> String {
@@ -815,6 +921,8 @@ define_settings_group!(TabSettings, settings: [
     close_button_position: TabCloseButtonPosition,
     directory_tab_colors: DirectoryTabColors,
     project_priorities: ProjectPriorities,
+    project_nag_policies: ProjectNagPolicies,
+    project_colors: ProjectColors,
 ]);
 
 /// Whether the vertical-tabs sidebar layout is active.
