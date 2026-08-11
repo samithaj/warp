@@ -24350,8 +24350,57 @@ impl Workspace {
                 // rather than merely focusing a dead shell.
                 let resumable = crate::workspace::tab_title::stored_handle_for_tab(pane_group, ctx)
                     .map(|(agent, session_id, _)| (agent, session_id));
-                let task_icon = pane_group
-                    .focused_session_view(ctx)
+                let focused_view = pane_group.focused_session_view(ctx);
+                // Branch + PR line under the label. The branch shows whenever
+                // the terminal knows one; the PR chip only when this terminal
+                // already subscribes to its repo's GitHub model
+                // (`needs_pr_info`) — the rail never starts a `gh` poller of
+                // its own, so rows without a subscription show branch only.
+                let task_meta = focused_view.as_ref().and_then(|view| {
+                    let view = view.as_ref(ctx);
+                    let branch = view.current_git_branch(ctx);
+                    let pr = view.current_pr_info(ctx);
+                    if branch.is_none() && pr.is_none() {
+                        return None;
+                    }
+                    let mut meta = Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_spacing(6.);
+                    if let Some(branch) = branch {
+                        // Shrinkable, as at the vertical-tabs call sites: the
+                        // branch element is a row with a flexible child, so it
+                        // must be laid out with a bounded width.
+                        meta.add_child(
+                            Shrinkable::new(
+                                1.,
+                                vertical_tabs::render_git_branch_text(
+                                    &branch,
+                                    muted_color,
+                                    10.,
+                                    appearance,
+                                ),
+                            )
+                            .finish(),
+                        );
+                    }
+                    if let Some(pr) = pr {
+                        let pr_color = match pr.state.as_str() {
+                            "OPEN" => theme.ansi_fg_green(),
+                            "MERGED" => theme.ansi_fg_magenta(),
+                            _ => theme.ansi_fg_red(),
+                        };
+                        let draft = if pr.draft { " (draft)" } else { "" };
+                        meta.add_child(
+                            Text::new_inline(format!("#{}{draft}", pr.number), font_family, 10.)
+                                .with_clip(ClipConfig::ellipsis())
+                                .with_color(pr_color)
+                                .finish(),
+                        );
+                    }
+                    Some(meta.finish())
+                });
+                let task_icon = focused_view
+                    .as_ref()
                     .and_then(|view| terminal_view_agent_icon_variant(view.as_ref(ctx), ctx))
                     .map(|variant| {
                         render_icon_with_status(
@@ -24369,27 +24418,29 @@ impl Workspace {
                     if let Some(icon) = task_icon {
                         row_content.add_child(icon);
                     }
-                    row_content.add_child(
-                        Expanded::new(
-                            1.,
-                            // `Text::new` soft-wraps, so a long session name or
-                            // instruction spills onto another line instead of
-                            // being cut off.
-                            Text::new(task_label, font_family, 12.)
-                                // The tint outranks the active/inactive
-                                // shading: "this agent is waiting on you" is
-                                // the more urgent thing for the label to say
-                                // than "this is the row you are standing on",
-                                // which the row background already says.
-                                .with_color(match &task_tint {
-                                    Some(tint) => (*tint).into(),
-                                    None if is_active => text_color.into(),
-                                    None => muted_color.into(),
-                                })
-                                .finish(),
-                        )
-                        .finish(),
+                    let mut label_column =
+                        Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Start);
+                    label_column.add_child(
+                        // `Text::new` soft-wraps, so a long session name or
+                        // instruction spills onto another line instead of
+                        // being cut off.
+                        Text::new(task_label, font_family, 12.)
+                            // The tint outranks the active/inactive
+                            // shading: "this agent is waiting on you" is
+                            // the more urgent thing for the label to say
+                            // than "this is the row you are standing on",
+                            // which the row background already says.
+                            .with_color(match &task_tint {
+                                Some(tint) => (*tint).into(),
+                                None if is_active => text_color.into(),
+                                None => muted_color.into(),
+                            })
+                            .finish(),
                     );
+                    if let Some(meta) = task_meta {
+                        label_column.add_child(meta);
+                    }
+                    row_content.add_child(Expanded::new(1., label_column.finish()).finish());
                     // The wait age rides on the row rather than only the
                     // header, so a glance down the rail ranks the fires
                     // without having to open any of them.
