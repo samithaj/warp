@@ -12038,6 +12038,7 @@ impl TerminalView {
                                                         received_rich_notification: false,
                                                         blocked_since: None,
                                                         success_seen: false,
+                                                        marked_unread: false,
                                                     },
                                                     ctx,
                                                 );

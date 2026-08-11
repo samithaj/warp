@@ -66,11 +66,18 @@ pub struct TaskTriage {
     /// conversation-backed `Success` is never green — we have no honest way
     /// to know whether it was read.
     pub has_unseen_success: bool,
+    /// The user's manual "mark as unread". Wins over everything, including a
+    /// missing status: it is how dormant rows (no live session, no status)
+    /// can be pinned green.
+    pub marked_unread: bool,
 }
 
 impl TaskTriage {
     /// The row's color state, or `None` when it should render neutral.
     pub fn urgency(&self) -> Option<RailUrgency> {
+        if self.marked_unread {
+            return Some(RailUrgency::Unseen);
+        }
         match self.status.as_ref()? {
             ConversationStatus::Blocked { .. } => Some(match self.blocked_for {
                 Some(waited) if waited >= BLOCKED_ESCALATION_THRESHOLD => RailUrgency::Overdue,

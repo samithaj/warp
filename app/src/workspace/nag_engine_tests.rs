@@ -4,7 +4,7 @@ use instant::Instant;
 use warpui::EntityId;
 
 use super::{
-    ACKNOWLEDGE_GRACE, BlockedTask, FOCUS_POLL_INTERVAL, NagEngine, NagSummary,
+    ACKNOWLEDGE_GRACE, BlockedTask, FOCUS_POLL_INTERVAL, NagEngine, NagPolicy, NagSummary,
     RANKED_REPEAT_INTERVAL, UNRANKED_DEBOUNCE, UNRANKED_REPEAT_INTERVAL,
 };
 
@@ -17,7 +17,7 @@ fn id(raw: usize) -> EntityId {
 fn ranked(raw: usize, project: &str) -> BlockedTask {
     BlockedTask {
         id: id(raw),
-        ranked: true,
+        policy: NagPolicy::Urgent,
         project: project.to_owned(),
         in_view: false,
     }
@@ -25,7 +25,7 @@ fn ranked(raw: usize, project: &str) -> BlockedTask {
 
 fn unranked(raw: usize, project: &str) -> BlockedTask {
     BlockedTask {
-        ranked: false,
+        policy: NagPolicy::Normal,
         ..ranked(raw, project)
     }
 }
@@ -412,5 +412,49 @@ fn reset_forgets_everything() {
     assert_eq!(
         engine.poll(&[ranked(1, "warp")], now + secs(1)).announced,
         vec![id(1)]
+    );
+}
+
+// -- per-project policy ----------------------------------------------------
+
+#[test]
+fn policy_override_beats_rank_in_both_directions() {
+    assert_eq!(
+        NagPolicy::resolve(Some(NagPolicy::Muted), true),
+        NagPolicy::Muted,
+        "a muted ranked project stays muted"
+    );
+    assert_eq!(
+        NagPolicy::resolve(Some(NagPolicy::Urgent), false),
+        NagPolicy::Urgent,
+        "an unranked project can be promoted"
+    );
+    assert_eq!(NagPolicy::resolve(None, true), NagPolicy::Urgent);
+    assert_eq!(NagPolicy::resolve(None, false), NagPolicy::Normal);
+}
+
+/// The muted filter lives in `blocked_nag_tasks`, but if a muted task ever
+/// does reach the engine it must behave like the quietest policy rather than
+/// inheriting urgency from a stale phase entry.
+#[test]
+fn muted_policy_degrades_to_the_quiet_cadence() {
+    let mut engine = NagEngine::default();
+    let now = Instant::now();
+    let muted = BlockedTask {
+        policy: NagPolicy::Muted,
+        ..unranked(1, "scratch")
+    };
+
+    assert_eq!(
+        engine.poll(std::slice::from_ref(&muted), now).announced,
+        Vec::<EntityId>::new(),
+        "muted announces nothing immediately"
+    );
+    assert_eq!(
+        engine
+            .poll(&[muted], now + UNRANKED_DEBOUNCE + secs(1))
+            .announced,
+        vec![id(1)],
+        "and then follows the unranked path"
     );
 }

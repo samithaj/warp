@@ -276,6 +276,7 @@ fn apply_event_preserves_input_session() {
         received_rich_notification: false,
         blocked_since: None,
         success_seen: false,
+        marked_unread: false,
     };
 
     let event = CLIAgentEvent {
@@ -313,6 +314,7 @@ fn is_remote_returns_true_when_remote_host_is_set() {
         received_rich_notification: false,
         blocked_since: None,
         success_seen: false,
+        marked_unread: false,
     };
     assert!(session.is_remote());
 }
@@ -333,6 +335,7 @@ fn is_remote_returns_false_when_remote_host_is_none() {
         received_rich_notification: false,
         blocked_since: None,
         success_seen: false,
+        marked_unread: false,
     };
     assert!(!session.is_remote());
 }
@@ -404,6 +407,7 @@ fn session_start_sets_plugin_version() {
         received_rich_notification: false,
         blocked_since: None,
         success_seen: false,
+        marked_unread: false,
     };
 
     let event = CLIAgentEvent {
@@ -440,6 +444,7 @@ fn session_start_without_plugin_version_leaves_none() {
         received_rich_notification: false,
         blocked_since: None,
         success_seen: false,
+        marked_unread: false,
     };
 
     let event = CLIAgentEvent {
@@ -475,6 +480,7 @@ fn codex_session_not_rich_until_rich_notification() {
         received_rich_notification: false,
         blocked_since: None,
         success_seen: false,
+        marked_unread: false,
     };
     assert!(!session.supports_rich_status());
 
@@ -499,6 +505,7 @@ fn non_codex_session_rich_after_rich_notification() {
         received_rich_notification: false,
         blocked_since: None,
         success_seen: false,
+        marked_unread: false,
     };
     // No listener and no rich notification yet.
     assert!(!session.supports_rich_status());
@@ -532,6 +539,7 @@ fn blocked_claude_session_with_permission_state() -> CLIAgentSession {
         received_rich_notification: false,
         blocked_since: None,
         success_seen: false,
+        marked_unread: false,
     }
 }
 
@@ -681,6 +689,7 @@ fn permission_request_still_populates_summary_and_tool_fields() {
         received_rich_notification: false,
         blocked_since: None,
         success_seen: false,
+        marked_unread: false,
     };
 
     let event = CLIAgentEvent {
@@ -733,6 +742,7 @@ fn in_progress_claude_session() -> CLIAgentSession {
         received_rich_notification: true,
         blocked_since: None,
         success_seen: false,
+        marked_unread: false,
     }
 }
 

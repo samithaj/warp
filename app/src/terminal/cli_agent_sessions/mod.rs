@@ -186,6 +186,11 @@ pub struct CLIAgentSession {
     /// reads it through [`Self::has_unseen_success`], which checks the status
     /// too. See [`CLIAgentSessionsModel::mark_success_seen`] for who sets it.
     pub success_seen: bool,
+    /// Manual "mark as unread" flag. Unlike [`Self::success_seen`] it is
+    /// meaningful for any status: it pins the row green until the pane is
+    /// focused, even when there is no fresh `Success` result. Persisted on
+    /// the durable handle so dormant rows keep it.
+    pub marked_unread: bool,
 }
 
 impl CLIAgentSession {
@@ -504,7 +509,9 @@ impl CLIAgentSessionsModel {
     }
 
     /// Acknowledges a finished session because the user is now looking at it,
-    /// clearing the rail's green "results unseen" tint for that row.
+    /// clearing the rail's green "results unseen" tint for that row. Also
+    /// clears a manual "mark as unread": whatever the status, looking at the
+    /// pane means it has been seen.
     ///
     /// Called from `TerminalPane::focus` — the one funnel every "this terminal
     /// pane is now the focused pane" passes through (`PaneGroup::focus` →
@@ -520,11 +527,18 @@ impl CLIAgentSessionsModel {
         let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
             return;
         };
-        if !matches!(session.status, CLIAgentSessionStatus::Success) || session.success_seen {
+        let had_marked_unread = session.marked_unread;
+        session.marked_unread = false;
+        let unseen_success =
+            matches!(session.status, CLIAgentSessionStatus::Success) && !session.success_seen;
+        if unseen_success {
+            session.success_seen = true;
+        }
+        let agent = session.agent;
+        if !unseen_success && !had_marked_unread {
             return;
         }
-        session.success_seen = true;
-        let agent = session.agent;
+        self.persist_read_state(terminal_view_id, ctx);
         // The rail renders from this model, so the row only loses its tint if
         // subscribers hear about it.
         ctx.emit(CLIAgentSessionsModelEvent::SessionUpdated {
@@ -532,6 +546,69 @@ impl CLIAgentSessionsModel {
             agent,
         });
         ctx.notify();
+    }
+
+    /// Manually marks a session unread: the rail row goes green and stays
+    /// green until the pane is focused, even with no fresh `Success` result.
+    /// For a `Success` session this is exactly "un-acknowledge".
+    pub fn mark_unread(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            return;
+        };
+        if session.marked_unread {
+            return;
+        }
+        session.marked_unread = true;
+        if matches!(session.status, CLIAgentSessionStatus::Success) {
+            session.success_seen = false;
+        }
+        let agent = session.agent;
+        self.persist_read_state(terminal_view_id, ctx);
+        ctx.emit(CLIAgentSessionsModelEvent::SessionUpdated {
+            terminal_view_id,
+            agent,
+        });
+        ctx.notify();
+    }
+
+    /// Read-state entry point for dormant rows, which have no live session:
+    /// the durable handle is all there is to mark.
+    pub fn set_dormant_read_state(
+        &mut self,
+        agent: CLIAgent,
+        session_id: String,
+        marked_unread: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.send_handle_op(
+            AgentSessionHandleOp::SetReadState {
+                agent: agent.to_serialized_name(),
+                session_id,
+                success_seen: !marked_unread,
+                marked_unread,
+            },
+            ctx,
+        );
+    }
+
+    /// Writes the session's read bits through to the durable handle; no-op
+    /// for remote or unidentified sessions (same rules as every handle op).
+    fn persist_read_state(&self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        let Some(session) = self.sessions.get(&terminal_view_id) else {
+            return;
+        };
+        let success_seen = session.success_seen;
+        let marked_unread = session.marked_unread;
+        if let Some(op) = Self::identified_session_op(session, |agent, session_id| {
+            AgentSessionHandleOp::SetReadState {
+                agent,
+                session_id,
+                success_seen,
+                marked_unread,
+            }
+        }) {
+            self.send_handle_op(op, ctx);
+        }
     }
 
     /// Whether any tracked session is currently waiting on the user.
@@ -622,6 +699,7 @@ impl CLIAgentSessionsModel {
                 received_rich_notification: false,
                 blocked_since: None,
                 success_seen: false,
+                marked_unread: false,
             },
             ctx,
         );

@@ -9,6 +9,7 @@ fn blocked(secs: u64) -> TaskTriage {
         }),
         blocked_for: Some(Duration::from_secs(secs)),
         has_unseen_success: false,
+        marked_unread: false,
     }
 }
 
@@ -29,6 +30,56 @@ fn success(seen: bool) -> TaskTriage {
 
 fn task(tab_index: usize, urgency: Option<RailUrgency>) -> RailTask {
     RailTask { tab_index, urgency }
+}
+
+// -- manual unread -----------------------------------------------------------
+
+/// A manual unread mark is the one state that needs no agent status at all:
+/// it is the only way a dormant row (no live session) can be green, and it
+/// outranks every live status including a fresh block.
+#[test]
+fn marked_unread_is_green_for_any_status_and_none() {
+    for status in [
+        None,
+        Some(ConversationStatus::InProgress),
+        Some(ConversationStatus::Success),
+        Some(ConversationStatus::Blocked {
+            blocked_action: "Wants to run bash: ls".to_owned(),
+        }),
+        Some(ConversationStatus::Error),
+        Some(ConversationStatus::Cancelled),
+    ] {
+        let triage = TaskTriage {
+            status,
+            marked_unread: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            triage.urgency(),
+            Some(RailUrgency::Unseen),
+            "marked_unread must pin the row green"
+        );
+    }
+}
+
+/// Clearing the manual mark hands the row back to the ordinary rules.
+#[test]
+fn cleared_unread_mark_restores_status_driven_triage() {
+    let mut triage = TaskTriage {
+        status: Some(ConversationStatus::InProgress),
+        marked_unread: true,
+        ..Default::default()
+    };
+    triage.marked_unread = false;
+    assert_eq!(triage.urgency(), Some(RailUrgency::Running));
+
+    let mut triage = TaskTriage {
+        status: None,
+        marked_unread: true,
+        ..Default::default()
+    };
+    triage.marked_unread = false;
+    assert_eq!(triage.urgency(), None);
 }
 
 // -- threshold math -------------------------------------------------------
@@ -134,6 +185,7 @@ fn rail_triage_green_needs_success_and_unseen() {
             status: Some(status.clone()),
             blocked_for: None,
             has_unseen_success: true,
+            marked_unread: false,
         };
         assert_ne!(
             triage.urgency(),

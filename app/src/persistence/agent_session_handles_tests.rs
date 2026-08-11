@@ -135,6 +135,26 @@ fn set_title_caches_the_label() {
 }
 
 #[test]
+fn set_read_state_round_trips_both_bits() {
+    let mut conn = test_connection();
+    identify(&mut conn, "Claude", PANE_A, CWD, "11111111-aaaa").unwrap();
+
+    let row = all_rows(&mut conn).remove(0);
+    assert!(
+        !row.success_seen && !row.marked_unread,
+        "defaults are unread-neutral"
+    );
+
+    set_read_state(&mut conn, "Claude", "11111111-aaaa", false, true).unwrap();
+    let row = all_rows(&mut conn).remove(0);
+    assert!(!row.success_seen && row.marked_unread);
+
+    set_read_state(&mut conn, "Claude", "11111111-aaaa", true, false).unwrap();
+    let row = all_rows(&mut conn).remove(0);
+    assert!(row.success_seen && !row.marked_unread);
+}
+
+#[test]
 fn forget_removes_exactly_the_named_task() {
     let mut conn = test_connection();
     identify(&mut conn, "Claude", PANE_A, CWD, "11111111-aaaa").unwrap();

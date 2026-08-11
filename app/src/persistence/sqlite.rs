@@ -841,6 +841,19 @@ fn handle_model_event(event: ModelEvent, connection: &mut SqliteConnection) -> a
                 title,
             } => super::agent_session_handles::set_title(connection, &agent, &session_id, &title)
                 .context("error caching agent session handle title"),
+            AgentSessionHandleOp::SetReadState {
+                agent,
+                session_id,
+                success_seen,
+                marked_unread,
+            } => super::agent_session_handles::set_read_state(
+                connection,
+                &agent,
+                &session_id,
+                success_seen,
+                marked_unread,
+            )
+            .context("error persisting agent session read state"),
             AgentSessionHandleOp::Forget { agent, session_id } => {
                 super::agent_session_handles::forget(connection, &agent, &session_id)
                     .context("error forgetting agent session handle")

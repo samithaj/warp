@@ -59,6 +59,7 @@ use crate::server::telemetry::{AgentModeEntrypoint, PaletteSource};
 use crate::settings_view::{self, SettingsSection, flags};
 use crate::tab::{NewSessionMenuItem, uses_vertical_tabs};
 use crate::util::bindings::{self, CustomAction, cmd_or_ctrl_shift, is_binding_pty_compliant};
+use crate::workspace::nag_engine::NagPolicy;
 use crate::{code, modal, notebooks, tab_configs};
 
 // Helper function to access panel header corner radius from other modules
@@ -1117,6 +1118,42 @@ pub fn init(app: &mut AppContext) {
             id!("Workspace")
                 & id!(flags::PROJECT_LAYOUT_CONTEXT_FLAG)
                 & id!("Workspace_SelectedProjectRanked"),
+        ),
+        EditableBinding::new(
+            "workspace:mute_project_notifications",
+            "Mute project notifications",
+            WorkspaceAction::SetProjectNagPolicy(None, Some(NagPolicy::Muted)),
+        )
+        .with_enabled(|| FeatureFlag::Projects.is_enabled())
+        .with_group(bindings::BindingGroup::Navigation.as_str())
+        .with_context_predicate(
+            id!("Workspace")
+                & id!(flags::PROJECT_LAYOUT_CONTEXT_FLAG)
+                & id!("Workspace_SelectedProjectRankable"),
+        ),
+        EditableBinding::new(
+            "workspace:unmute_project_notifications",
+            "Unmute project notifications",
+            WorkspaceAction::SetProjectNagPolicy(None, Some(NagPolicy::Normal)),
+        )
+        .with_enabled(|| FeatureFlag::Projects.is_enabled())
+        .with_group(bindings::BindingGroup::Navigation.as_str())
+        .with_context_predicate(
+            id!("Workspace")
+                & id!(flags::PROJECT_LAYOUT_CONTEXT_FLAG)
+                & id!("Workspace_SelectedProjectRankable"),
+        ),
+        EditableBinding::new(
+            "workspace:clear_project_color",
+            "Clear project color",
+            WorkspaceAction::SetProjectColor(None, None),
+        )
+        .with_enabled(|| FeatureFlag::Projects.is_enabled())
+        .with_group(bindings::BindingGroup::Navigation.as_str())
+        .with_context_predicate(
+            id!("Workspace")
+                & id!(flags::PROJECT_LAYOUT_CONTEXT_FLAG)
+                & id!("Workspace_SelectedProjectRankable"),
         ),
     ]);
 
