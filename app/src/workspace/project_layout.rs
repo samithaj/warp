@@ -180,9 +180,8 @@ impl ProjectLayout {
                 pane_group
                     .find_terminal_pane_by_session_uuid(&handle.pane_uuid)
                     .is_some()
-                    && pane_group
-                        .active_session_path(ctx)
-                        .is_some_and(|path| path.to_str() == Some(handle.cwd.as_str()))
+                    && pane_group.held_session_directory(ctx).as_deref()
+                        == Some(handle.cwd.as_str())
             }) {
                 continue;
             }
