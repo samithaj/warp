@@ -131,8 +131,8 @@ use self::vertical_tabs::{
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use super::action::AutoCloudHandoffTrigger;
 use super::action::{
-    InitContent, NewSessionMenuAnchor, RestoreConversationLayout, TabContextMenuAnchor,
-    VerticalTabsPaneContextMenuTarget, WorkspaceAction,
+    InitContent, NewSessionMenuAnchor, RailTaskMenuTarget, RestoreConversationLayout,
+    TabContextMenuAnchor, VerticalTabsPaneContextMenuTarget, WorkspaceAction,
 };
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use super::auto_handoff::AutoCloudHandoffController;
@@ -376,9 +376,10 @@ use crate::settings_view::{SettingsSection, SettingsView, SettingsViewEvent, fla
 use crate::shell_indicator::ShellIndicatorType;
 use crate::tab::{
     COMPACT_TAB_WIDTH_THRESHOLD, ColorPickerTarget, MOVE_TO_GROUP_LABEL, NewSessionMenuItem,
-    PaneNameMenuTarget, SelectedTabColor, TAB_BAR_BORDER_HEIGHT, TAB_INDICATOR_HEIGHT,
-    TAB_PIN_INDICATOR_ICON_SIZE, TAB_PIN_VANISH_THRESHOLD, TabBarState, TabComponent, TabData,
-    TabTelemetryAction, color_picker_menu_items, tab_position_id, uses_vertical_tabs,
+    PaneNameMenuTarget, SelectedTabColor, TAB_BAR_BORDER_HEIGHT, TAB_COLOR_ICON_PATH,
+    TAB_INDICATOR_HEIGHT, TAB_NO_COLOR_ICON_PATH, TAB_PIN_INDICATOR_ICON_SIZE,
+    TAB_PIN_VANISH_THRESHOLD, TabBarState, TabComponent, TabData, TabTelemetryAction,
+    color_picker_menu_items, tab_position_id, uses_vertical_tabs,
 };
 use crate::tab_configs::action_sidecar::SidecarItemKind;
 use crate::tab_configs::remove_confirmation_dialog::{
@@ -460,6 +461,7 @@ use crate::tips::{TipsEvent, TipsView};
 use crate::ui_components::agent_icon::terminal_view_agent_icon_variant;
 use crate::ui_components::avatar::{Avatar, AvatarContent, StatusElementTypes};
 use crate::ui_components::buttons::{combo_inner_button, icon_button_with_color};
+use crate::ui_components::color_dot::TAB_COLOR_OPTIONS;
 use crate::ui_components::icon_with_status::{IconWithStatusVariant, render_icon_with_status};
 use crate::ui_components::red_notification_dot::RedNotificationDot;
 use crate::ui_components::window_focus_dimming::WindowFocusDimming;
@@ -517,7 +519,7 @@ use crate::workspace::cross_window_tab_drag::{
 };
 use crate::workspace::header_toolbar_editor::{HeaderToolbarEditorEvent, HeaderToolbarEditorModal};
 use crate::workspace::header_toolbar_item::HeaderToolbarItemKind;
-use crate::workspace::nag_engine::{BlockedTask, NagEngine, NagOutcome, NagSummary};
+use crate::workspace::nag_engine::{BlockedTask, NagEngine, NagOutcome, NagPolicy, NagSummary};
 use crate::workspace::one_time_modal_model::OneTimeModalModel;
 use crate::workspace::project_key::ProjectKey;
 use crate::workspace::project_layout::{self, ProjectId, ProjectLayout};
@@ -1257,6 +1259,9 @@ pub struct Workspace {
     project_rail_context_menu: ViewHandle<Menu<WorkspaceAction>>,
     /// Where the project rail's context menu is anchored, when open.
     show_project_rail_context_menu: Option<Vector2F>,
+    task_rail_context_menu: ViewHandle<Menu<WorkspaceAction>>,
+    /// Where the rail task row's context menu is anchored, when open.
+    show_task_rail_context_menu: Option<Vector2F>,
     /// Dropdown menu for the title-bar team-switcher pill.
     team_switcher_menu: ViewHandle<Menu<WorkspaceAction>>,
     show_team_switcher_menu: bool,
@@ -3657,6 +3662,8 @@ impl Workspace {
             show_header_toolbar_context_menu: None,
             project_rail_context_menu: Self::build_project_rail_context_menu(ctx),
             show_project_rail_context_menu: None,
+            task_rail_context_menu: Self::build_task_rail_context_menu(ctx),
+            show_task_rail_context_menu: None,
             team_switcher_menu: Self::build_team_switcher_menu(ctx),
             show_team_switcher_menu: false,
             is_user_menu_open: false,
@@ -4019,6 +4026,10 @@ impl Workspace {
             return Vec::new();
         }
         let priorities = TabSettings::as_ref(ctx).project_priorities.value().clone();
+        let nag_policies = TabSettings::as_ref(ctx)
+            .project_nag_policies
+            .value()
+            .clone();
         let mut tasks = Vec::new();
         for (index, tab) in self.tabs.iter().enumerate() {
             let pane_group = tab.pane_group.as_ref(ctx);
@@ -4045,6 +4056,17 @@ impl Workspace {
             // tab shares the tab's project anyway.
             let project = ProjectLayout::project_of_tab_data(tab, ctx);
             let ranked = priorities.contains(&project);
+            let override_policy = match &project {
+                ProjectId::Key(key) => nag_policies.policy_for(key),
+                ProjectId::Other => None,
+            };
+            let policy = NagPolicy::resolve(override_policy, ranked);
+            // Muted projects never reach the engine at all: `summarize` counts
+            // and names whatever it is given, so a muted task passed in would
+            // still inflate the banner it was meant to be silent for.
+            if policy == NagPolicy::Muted {
+                continue;
+            }
             let label = project.display_name();
             // "Seen" needs the pane to actually be on screen, so being in the
             // active tab of a frontmost window is necessary but not sufficient
@@ -4062,7 +4084,7 @@ impl Workspace {
             };
             tasks.extend(waiting.into_iter().map(|id| BlockedTask {
                 id,
-                ranked,
+                policy,
                 project: label.clone(),
                 in_view: on_screen.contains(&id),
             }));
@@ -4316,6 +4338,18 @@ impl Workspace {
             TabSettingsChangedEvent::ProjectPriorities { .. } => {
                 // The rail's banding is derived from the list at render time,
                 // so a repaint is the whole update.
+                ctx.notify();
+            }
+            TabSettingsChangedEvent::ProjectNagPolicies { .. } => {
+                // A project may have just been muted while one of its agents
+                // sits blocked and armed: re-poll so the engine drops it now
+                // rather than at the next status event.
+                self.poll_nag_engine(ctx);
+                ctx.notify();
+            }
+            TabSettingsChangedEvent::ProjectColors { .. } => {
+                // Header labels read the map at render time; a repaint is the
+                // whole update.
                 ctx.notify();
             }
             TabSettingsChangedEvent::TabLineCount { .. } => {
@@ -7371,11 +7405,150 @@ impl Workspace {
                     .into_item(),
             );
         }
+        // Notification policy: one radio row per level, the checkmark showing
+        // the *effective* policy (override or rank-derived default) so the
+        // menu reads as the current state, not just the stored override.
+        if let ProjectId::Key(key) = project {
+            let nag_policies = TabSettings::as_ref(ctx).project_nag_policies.value();
+            let effective =
+                NagPolicy::resolve(nag_policies.policy_for(key), priorities.contains(project));
+            for (label, level) in [
+                ("Notifications: muted", NagPolicy::Muted),
+                ("Notifications: normal", NagPolicy::Normal),
+                ("Notifications: urgent", NagPolicy::Urgent),
+            ] {
+                let mut fields = MenuItemFields::new(label).with_on_select_action(
+                    WorkspaceAction::SetProjectNagPolicy(Some(project.clone()), Some(level)),
+                );
+                if level == effective {
+                    fields = fields.with_icon(icons::Icon::Check);
+                }
+                items.push(fields.into_item());
+            }
+
+            // Identity colour: the same dot palette the tab-bar color picker
+            // uses. Clicking the current colour clears it (toggle), matching
+            // the tab picker's behavior.
+            let terminal_colors = Appearance::as_ref(ctx).theme().terminal_colors().normal;
+            let current_color = TabSettings::as_ref(ctx)
+                .project_colors
+                .value()
+                .color_for(key);
+            items.push(MenuItem::ItemsRow {
+                items: TAB_COLOR_OPTIONS
+                    .iter()
+                    .map(|color_option| {
+                        let color = color_option.to_ansi_color(&terminal_colors);
+                        let selected = current_color == Some(*color_option);
+                        MenuItemFields::new_with_icon(
+                            if selected {
+                                TAB_NO_COLOR_ICON_PATH
+                            } else {
+                                TAB_COLOR_ICON_PATH
+                            },
+                            color.into(),
+                            color_option.to_string(),
+                        )
+                        .no_highlight_on_hover()
+                        .with_on_select_action(
+                            WorkspaceAction::SetProjectColor(
+                                Some(project.clone()),
+                                if selected { None } else { Some(*color_option) },
+                            ),
+                        )
+                    })
+                    .collect(),
+            });
+        }
         self.project_rail_context_menu
             .update(ctx, |menu, ctx| menu.set_items(items, ctx));
         self.show_project_rail_context_menu = Some(position);
         ctx.focus(&self.project_rail_context_menu);
         ctx.notify();
+    }
+
+    fn build_task_rail_context_menu(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Menu<WorkspaceAction>> {
+        // `prevent_interaction_with_other_elements` for the same reason as the
+        // project menu: the menu floats over clickable task rows.
+        let menu = ctx.add_typed_action_view(|_| {
+            Menu::new()
+                .with_drop_shadow()
+                .prevent_interaction_with_other_elements()
+        });
+        ctx.subscribe_to_view(&menu, |me, _, event, ctx| {
+            if let MenuEvent::Close { .. } = event {
+                me.show_task_rail_context_menu = None;
+                ctx.notify();
+            }
+        });
+        menu
+    }
+
+    /// Opens the right-click menu for one rail task row. The single entry
+    /// reflects the row's current read state; rows with nothing to mark (a
+    /// plain shell, a scanned session with no handle) get no menu at all.
+    fn show_task_rail_context_menu(
+        &mut self,
+        task: &RailTaskMenuTarget,
+        position: Vector2F,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !FeatureFlag::Projects.is_enabled() {
+            return;
+        }
+        let unread = match task {
+            RailTaskMenuTarget::Live(terminal_view_id) => {
+                let Some(session) = CLIAgentSessionsModel::as_ref(ctx).session(*terminal_view_id)
+                else {
+                    return;
+                };
+                session.has_unseen_success() || session.marked_unread
+            }
+            RailTaskMenuTarget::Dormant { agent, session_id } => {
+                use crate::terminal::cli_agent_sessions::handle_store::AgentSessionHandlesModel;
+                let Some(handle) = AgentSessionHandlesModel::as_ref(ctx).get(*agent, session_id)
+                else {
+                    return;
+                };
+                handle.marked_unread
+            }
+        };
+        let item = if unread {
+            MenuItemFields::new("Mark as read")
+                .with_on_select_action(WorkspaceAction::MarkRailTaskRead(task.clone()))
+                .into_item()
+        } else {
+            MenuItemFields::new("Mark as unread")
+                .with_on_select_action(WorkspaceAction::MarkRailTaskUnread(task.clone()))
+                .into_item()
+        };
+        self.task_rail_context_menu
+            .update(ctx, |menu, ctx| menu.set_items(vec![item], ctx));
+        self.show_task_rail_context_menu = Some(position);
+        ctx.focus(&self.task_rail_context_menu);
+        ctx.notify();
+    }
+
+    fn set_rail_task_unread(
+        &mut self,
+        task: &RailTaskMenuTarget,
+        unread: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| match task {
+            RailTaskMenuTarget::Live(terminal_view_id) => {
+                if unread {
+                    sessions.mark_unread(*terminal_view_id, ctx);
+                } else {
+                    sessions.mark_success_seen(*terminal_view_id, ctx);
+                }
+            }
+            RailTaskMenuTarget::Dormant { agent, session_id } => {
+                sessions.set_dormant_read_state(*agent, session_id.clone(), unread, ctx);
+            }
+        });
     }
 
     /// Applies `update` to the priority list for `target`, or for the rail's
@@ -7399,6 +7572,53 @@ impl Workspace {
         TabSettings::handle(ctx).update(ctx, |settings, ctx| {
             let updated = update(settings.project_priorities.value(), &key);
             report_if_error!(settings.project_priorities.set_value(updated, ctx));
+        });
+        ctx.notify();
+    }
+
+    /// Sets or clears the per-project notification override; see
+    /// [`ProjectNagPolicies`](super::tab_settings::ProjectNagPolicies). A
+    /// `None` target falls back to the rail's selected project (the Command
+    /// Palette path).
+    fn update_project_nag_policy(
+        &mut self,
+        target: Option<&ProjectId>,
+        policy: Option<NagPolicy>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !FeatureFlag::Projects.is_enabled() {
+            return;
+        }
+        let Some(ProjectId::Key(key)) = target.or(self.selected_project.as_ref()).cloned() else {
+            return;
+        };
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            let updated = settings
+                .project_nag_policies
+                .value()
+                .with_policy(&key, policy);
+            report_if_error!(settings.project_nag_policies.set_value(updated, ctx));
+        });
+        ctx.notify();
+    }
+
+    /// Sets or clears the project's rail identity colour. A `None` target
+    /// falls back to the rail's selected project (the Command Palette path).
+    fn update_project_color(
+        &mut self,
+        target: Option<&ProjectId>,
+        color: Option<AnsiColorIdentifier>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !FeatureFlag::Projects.is_enabled() {
+            return;
+        }
+        let Some(ProjectId::Key(key)) = target.or(self.selected_project.as_ref()).cloned() else {
+            return;
+        };
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            let updated = settings.project_colors.value().with_color(&key, color);
+            report_if_error!(settings.project_colors.set_value(updated, ctx));
         });
         ctx.notify();
     }
@@ -24143,6 +24363,7 @@ impl Workspace {
             status: Self::tab_conversation_status(tab, ctx),
             blocked_for: session.and_then(CLIAgentSession::blocked_duration),
             has_unseen_success: session.is_some_and(CLIAgentSession::has_unseen_success),
+            marked_unread: session.is_some_and(|session| session.marked_unread),
         }
     }
 
@@ -24595,6 +24816,7 @@ impl Workspace {
         // spatial memory, so a project must not move because one of its agents
         // changed state.
         let priorities = TabSettings::as_ref(ctx).project_priorities.value().clone();
+        let project_colors = TabSettings::as_ref(ctx).project_colors.value().clone();
         let projects = layout.projects();
         let rows = rail_project_rows(projects, &priorities);
         // Reserve the gutter only once something is ranked, so a user who
@@ -24641,6 +24863,15 @@ impl Workspace {
                 .or_default()
                 .clone();
             let label = entry.display_name.clone();
+            // Identity colour (option B): only the project header label wears
+            // it. Task rows keep their urgency tint — a green task row must
+            // never be mistaken for a green-chosen project.
+            let identity_color: Option<ColorU> = match &entry.id {
+                ProjectId::Key(key) => project_colors.color_for(key).map(|identifier| {
+                    theme.ansi_fg(identifier.to_ansi_color(&theme.terminal_colors().normal))
+                }),
+                ProjectId::Other => None,
+            };
             let dispatch_id = entry.id.clone();
             // The click closure takes ownership of `dispatch_id`, so the
             // right-click path needs its own copy of the row's identity.
@@ -24679,7 +24910,10 @@ impl Workspace {
                         1.,
                         Text::new_inline(label, font_family, 13.)
                             .with_clip(ClipConfig::ellipsis())
-                            .with_color(text_color.into())
+                            .with_color(match identity_color {
+                                Some(color) => color,
+                                None => text_color.into(),
+                            })
                             .finish(),
                     )
                     .finish(),
@@ -24763,7 +24997,20 @@ impl Workspace {
                 // rather than merely focusing a dead shell.
                 let resumable = crate::workspace::tab_title::stored_handle_for_tab(pane_group, ctx)
                     .map(|(agent, session_id, _)| (agent, session_id));
+                // Right-click identity: a tab whose agent exited is marked
+                // through its durable handle (the live session is gone); any
+                // other row marks its live session. Rows with neither (plain
+                // shells) get no menu — `show_task_rail_context_menu` no-ops.
                 let focused_view = pane_group.focused_session_view(ctx);
+                let menu_target = match &resumable {
+                    Some((agent, session_id)) => Some(RailTaskMenuTarget::Dormant {
+                        agent: *agent,
+                        session_id: session_id.clone(),
+                    }),
+                    None => focused_view
+                        .as_ref()
+                        .map(|view| RailTaskMenuTarget::Live(view.id())),
+                };
                 // Branch + PR line under the label. The branch shows whenever
                 // the terminal knows one; the PR chip only when this terminal
                 // already subscribes to its repo's GitHub model
@@ -24898,6 +25145,14 @@ impl Workspace {
                         pane_group_id,
                     )),
                 })
+                .on_right_click(move |ctx, _, position| {
+                    if let Some(task) = &menu_target {
+                        ctx.dispatch_typed_action(WorkspaceAction::ShowTaskRailContextMenu {
+                            task: task.clone(),
+                            position,
+                        });
+                    }
+                })
                 .finish();
                 column.add_child(task_row);
             }
@@ -24919,6 +25174,12 @@ impl Workspace {
                     .or_default()
                     .clone();
                 let label = task.label.clone();
+                // A manually unread-marked dormant row wears the same green a
+                // live "results unseen" row does — it is the same signal.
+                let dormant_tint = task
+                    .marked_unread
+                    .then(|| Self::rail_urgency_color(RailUrgency::Unseen, theme))
+                    .flatten();
                 let icon = render_icon_with_status(
                     IconWithStatusVariant::CLIAgent {
                         agent: task.agent,
@@ -24932,6 +25193,7 @@ impl Workspace {
                     theme.background(),
                 );
                 let (agent, session_id) = key;
+                let menu_session_id = session_id.clone();
                 let dormant_row = Hoverable::new(dormant_mouse_state, move |state| {
                     let mut row_content = Flex::row()
                         .with_cross_axis_alignment(CrossAxisAlignment::Start)
@@ -24941,7 +25203,10 @@ impl Workspace {
                         Expanded::new(
                             1.,
                             Text::new(label, font_family, 12.)
-                                .with_color(muted_color.into())
+                                .with_color(match dormant_tint {
+                                    Some(tint) => tint,
+                                    None => muted_color.into(),
+                                })
                                 .finish(),
                         )
                         .finish(),
@@ -24967,6 +25232,15 @@ impl Workspace {
                     ctx.dispatch_typed_action(WorkspaceAction::ResumeDormantAgentTask {
                         agent,
                         session_id: session_id.clone(),
+                    });
+                })
+                .on_right_click(move |ctx, _, position| {
+                    ctx.dispatch_typed_action(WorkspaceAction::ShowTaskRailContextMenu {
+                        task: RailTaskMenuTarget::Dormant {
+                            agent,
+                            session_id: menu_session_id.clone(),
+                        },
+                        position,
                     });
                 })
                 .finish();
@@ -26270,6 +26544,11 @@ impl TypedActionView for Workspace {
             ShowProjectRailContextMenu { project, position } => {
                 self.show_project_rail_context_menu(project, *position, ctx)
             }
+            ShowTaskRailContextMenu { task, position } => {
+                self.show_task_rail_context_menu(task, *position, ctx)
+            }
+            MarkRailTaskRead(task) => self.set_rail_task_unread(task, false, ctx),
+            MarkRailTaskUnread(task) => self.set_rail_task_unread(task, true, ctx),
             AddProjectToPriorities(project) => self.update_project_priorities(
                 project.as_ref(),
                 ctx,
@@ -26290,6 +26569,12 @@ impl TypedActionView for Workspace {
                 ctx,
                 ProjectPriorities::with_moved_down,
             ),
+            SetProjectNagPolicy(project, policy) => {
+                self.update_project_nag_policy(project.as_ref(), *policy, ctx)
+            }
+            SetProjectColor(project, color) => {
+                self.update_project_color(project.as_ref(), *color, ctx)
+            }
             ActivateTaskByPaneGroupId(pane_group_id) => {
                 self.activate_tab_by_pane_group_id(*pane_group_id, ctx)
             }
@@ -29171,6 +29456,18 @@ impl View for Workspace {
         if let Some(position) = self.show_project_rail_context_menu {
             stack.add_positioned_overlay_child(
                 ChildView::new(&self.project_rail_context_menu).finish(),
+                OffsetPositioning::offset_from_parent(
+                    position,
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::TopLeft,
+                    ChildAnchor::TopLeft,
+                ),
+            );
+        }
+
+        if let Some(position) = self.show_task_rail_context_menu {
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.task_rail_context_menu).finish(),
                 OffsetPositioning::offset_from_parent(
                     position,
                     ParentOffsetBounds::WindowByPosition,

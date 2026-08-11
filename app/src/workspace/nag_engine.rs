@@ -73,9 +73,9 @@ pub struct BlockedTask {
     /// and [`CLIAgentSessionsModel`](crate::terminal::cli_agent_sessions::CLIAgentSessionsModel)
     /// key sessions on.
     pub id: EntityId,
-    /// Whether this task's project is in the user's priority list. Decides
-    /// both the debounce and the repeat cadence.
-    pub ranked: bool,
+    /// How loudly this task may nag, resolved by the caller from the user's
+    /// per-project override and the project's rank.
+    pub policy: NagPolicy,
     /// The project's rail label, used to name it in a coalesced banner.
     pub project: String,
     /// Whether the user is looking at this task right now.
@@ -86,13 +86,56 @@ pub struct BlockedTask {
     pub in_view: bool,
 }
 
+/// How loudly one project's blocked agents may nag.
+///
+/// `Muted` never reaches the engine at all — the caller drops it while
+/// building the poll set, so [`NagEngine::summarize`] can never count or name
+/// a muted project. The engine still answers for it (with the quietest
+/// cadence) rather than panic, because a policy can change mid-poll.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "Per-project notification policy for blocked agents.",
+    rename_all = "snake_case"
+)]
+pub enum NagPolicy {
+    /// Never banner or sound for this project.
+    Muted,
+    /// The unranked cadence: debounce first, slow repeat.
+    #[default]
+    Normal,
+    /// The ranked cadence: announce immediately, repeat briskly.
+    Urgent,
+}
+
+impl NagPolicy {
+    /// The effective policy for a project: the user's per-project override if
+    /// set, otherwise rank decides (ranked projects nag urgently, unranked
+    /// ones politely).
+    pub fn resolve(override_policy: Option<NagPolicy>, ranked: bool) -> NagPolicy {
+        override_policy.unwrap_or(match ranked {
+            true => NagPolicy::Urgent,
+            false => NagPolicy::Normal,
+        })
+    }
+}
+
 impl BlockedTask {
     /// This task's repeat cadence.
     fn repeat_interval(&self) -> Duration {
-        if self.ranked {
-            RANKED_REPEAT_INTERVAL
-        } else {
-            UNRANKED_REPEAT_INTERVAL
+        match self.policy {
+            NagPolicy::Urgent => RANKED_REPEAT_INTERVAL,
+            NagPolicy::Normal | NagPolicy::Muted => UNRANKED_REPEAT_INTERVAL,
         }
     }
 }
@@ -221,11 +264,12 @@ impl NagEngine {
     fn initial_phase(task: &BlockedTask, now: Instant) -> NagPhase {
         if task.in_view {
             NagPhase::Acknowledged { rearm_at: None }
-        } else if task.ranked {
-            NagPhase::Armed { due: now }
         } else {
-            NagPhase::Debouncing {
-                due: now + UNRANKED_DEBOUNCE,
+            match task.policy {
+                NagPolicy::Urgent => NagPhase::Armed { due: now },
+                NagPolicy::Normal | NagPolicy::Muted => NagPhase::Debouncing {
+                    due: now + UNRANKED_DEBOUNCE,
+                },
             }
         }
     }

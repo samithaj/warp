@@ -46,6 +46,7 @@ fn dormant(project: ProjectId, session_id: &str, label: &str) -> (ProjectId, Dor
             label: label.to_owned(),
             cwd: "/dev/example".to_owned(),
             origin: DormantTaskOrigin::Handle,
+            marked_unread: false,
         },
     )
 }

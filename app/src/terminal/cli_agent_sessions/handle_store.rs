@@ -33,6 +33,10 @@ pub struct AgentSessionHandle {
     /// transcript resolver has produced one.
     pub title: Option<String>,
     pub last_seen_at: NaiveDateTime,
+    /// Whether the user has looked at the session's finished result.
+    pub success_seen: bool,
+    /// Manual "mark as unread" flag; forces the row green until cleared.
+    pub marked_unread: bool,
 }
 
 pub struct AgentSessionHandlesChanged;
@@ -70,6 +74,8 @@ impl AgentSessionHandlesModel {
                     pane_uuid: record.pane_uuid.clone(),
                     title: record.title.clone(),
                     last_seen_at: record.last_seen_at,
+                    success_seen: record.success_seen,
+                    marked_unread: record.marked_unread,
                 })
             })
             .collect();
@@ -138,6 +144,8 @@ impl AgentSessionHandlesModel {
                         pane_uuid: pane_uuid.clone(),
                         title: None,
                         last_seen_at: Utc::now().naive_utc(),
+                        success_seen: false,
+                        marked_unread: false,
                     },
                 );
             }
@@ -165,6 +173,22 @@ impl AgentSessionHandlesModel {
                     .find(|handle| handle.agent == agent && handle.session_id == *session_id)
                 {
                     handle.title = Some(title.clone());
+                }
+            }
+            AgentSessionHandleOp::SetReadState {
+                agent,
+                session_id,
+                success_seen,
+                marked_unread,
+            } => {
+                let agent = CLIAgent::from_serialized_name(agent);
+                if let Some(handle) = self
+                    .handles
+                    .iter_mut()
+                    .find(|handle| handle.agent == agent && handle.session_id == *session_id)
+                {
+                    handle.success_seen = *success_seen;
+                    handle.marked_unread = *marked_unread;
                 }
             }
             AgentSessionHandleOp::Forget { agent, session_id } => {
