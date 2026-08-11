@@ -167,6 +167,25 @@ pub(super) fn set_title(
     Ok(())
 }
 
+/// Persists the read/unread bits so a dormant row keeps its acknowledgement
+/// state and a manual "mark as unread" shows on it.
+pub(super) fn set_read_state(
+    conn: &mut SqliteConnection,
+    agent_name: &str,
+    session: &str,
+    seen: bool,
+    unread: bool,
+) -> Result<(), diesel::result::Error> {
+    diesel::update(
+        dsl::agent_session_handles
+            .filter(dsl::agent.eq(agent_name))
+            .filter(dsl::session_id.eq(session)),
+    )
+    .set((dsl::success_seen.eq(seen), dsl::marked_unread.eq(unread)))
+    .execute(conn)?;
+    Ok(())
+}
+
 /// Loads every handle, most recently seen first. The in-memory model is the
 /// read surface; this runs once at startup (and after external rebuilds).
 pub(super) fn load_all(

@@ -624,6 +624,20 @@ impl PaneContent for TerminalPane {
         // restored tab and defeats deferral entirely -- measured: 46 of 48 tabs
         // spawned. The start belongs on the paths that mean a *user* opened
         // something: `Workspace::focus_active_tab` and `PaneGroup::focus_pane`.
+        // Focusing the pane is how the user "sees" a finished agent's result,
+        // which is what clears the project rail's green row tint. This is the
+        // only focus signal that reaches `CLIAgentSessionsModel` — pane focus
+        // otherwise lives entirely in `PaneGroupFocusState`, which the sessions
+        // model neither owns nor observes — and every real focus change funnels
+        // through here via `PaneGroup::focus` → `focused_pane_content().focus()`.
+        //
+        // The construction-time calls noted above are harmless here: a pane
+        // being built has no agent session yet, so the acknowledgement no-ops.
+        let terminal_view_id = self.terminal_view(ctx).id();
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+            sessions.mark_success_seen(terminal_view_id, ctx);
+        });
+
         self.terminal_view(ctx)
             .update(ctx, |view, ctx| view.redetermine_global_focus(ctx));
     }

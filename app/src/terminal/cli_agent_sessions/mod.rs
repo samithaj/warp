@@ -162,6 +162,31 @@ pub struct CLIAgentSession {
     /// notification. Codex's OSC 9 fallback never sets it, so this is the
     /// single source of truth for whether the session is plugin-backed.
     pub received_rich_notification: bool,
+    /// When the session *entered* its current `Blocked` state, or `None` when
+    /// it is not blocked. Deliberately a session field rather than a payload on
+    /// `CLIAgentSessionStatus::Blocked`: the status derives `PartialEq`, and a
+    /// timestamp inside the variant would make two otherwise identical blocked
+    /// states unequal and leak a clock into `to_conversation_status`.
+    ///
+    /// `instant::Instant` (not `std::time::Instant`) because the app also
+    /// builds for wasm; see the workspace's `disallowed-types` lint.
+    pub blocked_since: Option<instant::Instant>,
+    /// Whether the user has looked at this session's finished result.
+    ///
+    /// A session field for the same reason as [`Self::blocked_since`]: the
+    /// status derives `PartialEq`, and an acknowledgement bit inside
+    /// `Success` would make a seen and an unseen success unequal.
+    ///
+    /// Only meaningful while the status is `Success` — it is reset on every
+    /// entry into `Success` so a *new* result is always unseen, and the rail
+    /// reads it through [`Self::has_unseen_success`], which checks the status
+    /// too. See [`CLIAgentSessionsModel::mark_success_seen`] for who sets it.
+    pub success_seen: bool,
+    /// Manual "mark as unread" flag. Unlike [`Self::success_seen`] it is
+    /// meaningful for any status: it pins the row green until the pane is
+    /// focused, even when there is no fresh `Success` result. Persisted on
+    /// the durable handle so dormant rows keep it.
+    pub marked_unread: bool,
 }
 
 impl CLIAgentSession {
@@ -177,6 +202,71 @@ impl CLIAgentSession {
     /// an actual rich notification arrives.
     pub fn supports_rich_status(&self) -> bool {
         self.received_rich_notification
+    }
+
+    /// How long the session has been waiting on the user, or `None` when it is
+    /// not blocked. Measured from when the session *first* entered `Blocked`,
+    /// so a second permission prompt arriving while the first is unanswered
+    /// does not restart the clock — the rail's escalation and the nag engine
+    /// both want the age of the wait, not the age of the last event.
+    pub fn blocked_duration(&self) -> Option<std::time::Duration> {
+        self.blocked_since.map(|since| since.elapsed())
+    }
+
+    /// Whether the agent has finished and the user has not looked at the
+    /// result yet — the rail's green row state.
+    ///
+    /// Gated on the status as well as the bit, so a session that left
+    /// `Success` can never read as an unseen result no matter what the bit
+    /// happens to hold.
+    pub fn has_unseen_success(&self) -> bool {
+        matches!(self.status, CLIAgentSessionStatus::Success) && !self.success_seen
+    }
+
+    /// Stamps or clears [`Self::blocked_since`] for a transition from the
+    /// current status to `new_status`. Must be called *before* `self.status` is
+    /// overwritten, since the decision depends on the state being left.
+    fn track_blocked_since(&mut self, new_status: &CLIAgentSessionStatus) {
+        let was_blocked = matches!(self.status, CLIAgentSessionStatus::Blocked { .. });
+        match new_status {
+            // Blocked → Blocked keeps the original stamp: repeated prompts are
+            // the same unanswered wait from the user's point of view.
+            CLIAgentSessionStatus::Blocked { .. } => {
+                if !was_blocked {
+                    self.blocked_since = Some(instant::Instant::now());
+                }
+            }
+            // Any exit from Blocked ends the wait; clearing unconditionally
+            // also keeps a never-blocked session's stamp at `None`.
+            CLIAgentSessionStatus::InProgress
+            | CLIAgentSessionStatus::Success
+            | CLIAgentSessionStatus::Failed { .. } => self.blocked_since = None,
+        }
+    }
+
+    /// Resets [`Self::success_seen`] for a transition to `new_status`. Like
+    /// [`Self::track_blocked_since`] this must run *before* `self.status` is
+    /// overwritten, since the decision depends on the state being left.
+    fn track_success_seen(&mut self, new_status: &CLIAgentSessionStatus) {
+        let was_success = matches!(self.status, CLIAgentSessionStatus::Success);
+        match new_status {
+            // A fresh finish is by definition unseen. Success → Success keeps
+            // the acknowledgement: a second `Stop` without an intervening
+            // prompt is the same result being re-announced, and re-arming the
+            // green would make a chatty agent's row impossible to clear.
+            CLIAgentSessionStatus::Success => {
+                if !was_success {
+                    self.success_seen = false;
+                }
+            }
+            // Leaving `Success` ends the result's life; clearing
+            // unconditionally also keeps a never-finished session at `false`,
+            // which `has_unseen_success` reads as "nothing to see" because it
+            // checks the status too.
+            CLIAgentSessionStatus::InProgress
+            | CLIAgentSessionStatus::Blocked { .. }
+            | CLIAgentSessionStatus::Failed { .. } => self.success_seen = false,
+        }
     }
 
     /// Clears state populated by `PermissionRequest`. Called whenever the
@@ -265,6 +355,8 @@ impl CLIAgentSession {
             CLIAgentEventType::Unknown(_) => return None,
         };
 
+        self.track_blocked_since(&new_status);
+        self.track_success_seen(&new_status);
         self.status = new_status.clone();
         Some(new_status)
     }
@@ -385,6 +477,119 @@ impl CLIAgentSessionsModel {
             .collect()
     }
 
+    /// Acknowledges a finished session because the user is now looking at it,
+    /// clearing the rail's green "results unseen" tint for that row. Also
+    /// clears a manual "mark as unread": whatever the status, looking at the
+    /// pane means it has been seen.
+    ///
+    /// Called from `TerminalPane::focus` — the one funnel every "this terminal
+    /// pane is now the focused pane" passes through (`PaneGroup::focus` →
+    /// `focused_pane_content().focus()`), and the only focus signal that
+    /// reaches this model at all. Pane-group *construction* also calls it (see
+    /// the note on `TerminalPane::focus`), which is harmless: a pane being
+    /// built has no session yet, so this is a no-op.
+    ///
+    /// Only a `Success` session is acknowledged. Focusing a pane whose agent is
+    /// still working or blocked must not pre-acknowledge the result it has not
+    /// produced yet — that would let a row finish silently, never going green.
+    pub fn mark_success_seen(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            return;
+        };
+        let had_marked_unread = session.marked_unread;
+        session.marked_unread = false;
+        let unseen_success =
+            matches!(session.status, CLIAgentSessionStatus::Success) && !session.success_seen;
+        if unseen_success {
+            session.success_seen = true;
+        }
+        let agent = session.agent;
+        if !unseen_success && !had_marked_unread {
+            return;
+        }
+        self.persist_read_state(terminal_view_id, ctx);
+        // The rail renders from this model, so the row only loses its tint if
+        // subscribers hear about it.
+        ctx.emit(CLIAgentSessionsModelEvent::SessionUpdated {
+            terminal_view_id,
+            agent,
+        });
+        ctx.notify();
+    }
+
+    /// Manually marks a session unread: the rail row goes green and stays
+    /// green until the pane is focused, even with no fresh `Success` result.
+    /// For a `Success` session this is exactly "un-acknowledge".
+    pub fn mark_unread(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            return;
+        };
+        if session.marked_unread {
+            return;
+        }
+        session.marked_unread = true;
+        if matches!(session.status, CLIAgentSessionStatus::Success) {
+            session.success_seen = false;
+        }
+        let agent = session.agent;
+        self.persist_read_state(terminal_view_id, ctx);
+        ctx.emit(CLIAgentSessionsModelEvent::SessionUpdated {
+            terminal_view_id,
+            agent,
+        });
+        ctx.notify();
+    }
+
+    /// Read-state entry point for dormant rows, which have no live session:
+    /// the durable handle is all there is to mark.
+    pub fn set_dormant_read_state(
+        &mut self,
+        agent: CLIAgent,
+        session_id: String,
+        marked_unread: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.send_handle_op(
+            AgentSessionHandleOp::SetReadState {
+                agent: agent.to_serialized_name(),
+                session_id,
+                success_seen: !marked_unread,
+                marked_unread,
+            },
+            ctx,
+        );
+    }
+
+    /// Writes the session's read bits through to the durable handle; no-op
+    /// for remote or unidentified sessions (same rules as every handle op).
+    fn persist_read_state(&self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        let Some(session) = self.sessions.get(&terminal_view_id) else {
+            return;
+        };
+        let success_seen = session.success_seen;
+        let marked_unread = session.marked_unread;
+        if let Some(op) = Self::identified_session_op(session, |agent, session_id| {
+            AgentSessionHandleOp::SetReadState {
+                agent,
+                session_id,
+                success_seen,
+                marked_unread,
+            }
+        }) {
+            self.send_handle_op(op, ctx);
+        }
+    }
+
+    /// Whether any tracked session is currently waiting on the user.
+    ///
+    /// Drives the lifecycle of the rail's wait-age refresh timer: with nothing
+    /// blocked there is no age on screen to keep current, so no timer runs.
+    pub fn any_blocked(&self) -> bool {
+        self.sessions
+            .values()
+            .any(|session| matches!(session.status, CLIAgentSessionStatus::Blocked { .. }))
+    }
+
     /// Returns `true` if the rich input editor is currently open for this terminal.
     pub fn is_input_open(&self, terminal_view_id: EntityId) -> bool {
         self.sessions
@@ -427,6 +632,8 @@ impl CLIAgentSessionsModel {
                 .as_deref()
                 .is_some_and(is_valid_session_id);
             // Upgrade existing session with plugin context.
+            session.track_blocked_since(&CLIAgentSessionStatus::InProgress);
+            session.track_success_seen(&CLIAgentSessionStatus::InProgress);
             session.status = CLIAgentSessionStatus::InProgress;
             session.listener = Some(listener);
             session.plugin_version = plugin_version;
@@ -459,6 +666,9 @@ impl CLIAgentSessionsModel {
                 draft_text: None,
                 custom_command_prefix: None,
                 received_rich_notification: false,
+                blocked_since: None,
+                success_seen: false,
+                marked_unread: false,
             },
             ctx,
         );

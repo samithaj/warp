@@ -69,6 +69,33 @@ fn start_inflight_is_not_mirrored() {
 }
 
 #[test]
+fn set_read_state_updates_only_the_named_handle() {
+    let mut model = AgentSessionHandlesModel::default();
+    model.apply_op(&identify("aaaa", "/dev/one"));
+    model.apply_op(&identify("bbbb", "/dev/two"));
+
+    model.apply_op(&AgentSessionHandleOp::SetReadState {
+        agent: "Claude".to_owned(),
+        session_id: "aaaa".to_owned(),
+        success_seen: false,
+        marked_unread: true,
+    });
+    let marked = model.get(CLIAgent::Claude, "aaaa").unwrap();
+    assert!(marked.marked_unread && !marked.success_seen);
+    let other = model.get(CLIAgent::Claude, "bbbb").unwrap();
+    assert!(!other.marked_unread && !other.success_seen);
+
+    model.apply_op(&AgentSessionHandleOp::SetReadState {
+        agent: "Claude".to_owned(),
+        session_id: "aaaa".to_owned(),
+        success_seen: true,
+        marked_unread: false,
+    });
+    let cleared = model.get(CLIAgent::Claude, "aaaa").unwrap();
+    assert!(cleared.success_seen && !cleared.marked_unread);
+}
+
+#[test]
 fn hydration_skips_unidentified_and_unknown_agent_rows() {
     let now = chrono::Utc::now().naive_utc();
     let record = |agent: &str, session_id: Option<&str>| AgentSessionHandleRecord {
@@ -80,6 +107,8 @@ fn hydration_skips_unidentified_and_unknown_agent_rows() {
         title: None,
         created_at: now,
         last_seen_at: now,
+        success_seen: false,
+        marked_unread: false,
     };
     let model = AgentSessionHandlesModel::from_records(&[
         record("Claude", Some("aaaa")),

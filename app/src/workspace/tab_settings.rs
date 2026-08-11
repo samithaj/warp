@@ -5,6 +5,10 @@ use settings::macros::define_settings_group;
 use settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
 use warp_core::ui::theme::AnsiColorIdentifier;
 
+use super::project_key::ProjectKey;
+use super::project_priorities::ProjectPriorities;
+use crate::workspace::nag_engine::NagPolicy;
+
 #[derive(
     Default,
     Debug,
@@ -225,6 +229,122 @@ impl DirectoryTabColors {
     pub fn with_color(&self, path: &Path, color: DirectoryTabColor) -> Self {
         let mut map = self.0.clone();
         map.insert(canonical_directory_key(path), color);
+        Self(map)
+    }
+}
+
+settings::macros::implement_setting_for_enum!(
+    ProjectPriorities,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Never,
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.project_layout.project_priorities",
+    description: "Ordered list of prioritized projects, highest priority first.",
+    feature_flag: warp_core::features::FeatureFlag::Projects,
+);
+
+/// Per-project notification policy overrides, keyed by
+/// [`ProjectKey::to_storage_key`]. A project with no entry follows its rank:
+/// ranked projects nag urgently, unranked ones politely.
+#[derive(
+    Default,
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Mapping of projects to their blocked-agent notification policy.")]
+pub struct ProjectNagPolicies(pub(crate) HashMap<String, NagPolicy>);
+
+settings::macros::implement_setting_for_enum!(
+    ProjectNagPolicies,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Never,
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.project_layout.nag_policies",
+    description: "Mapping of projects to their blocked-agent notification policy.",
+    feature_flag: warp_core::features::FeatureFlag::Projects,
+);
+
+impl ProjectNagPolicies {
+    /// The user's override for this project, if any.
+    pub fn policy_for(&self, key: &ProjectKey) -> Option<NagPolicy> {
+        self.0.get(&key.to_storage_key()).copied()
+    }
+
+    /// Returns a copy with `key`'s override set, or removed when `policy` is
+    /// `None` (the project falls back to its rank-derived policy).
+    pub fn with_policy(&self, key: &ProjectKey, policy: Option<NagPolicy>) -> Self {
+        let mut map = self.0.clone();
+        match policy {
+            Some(policy) => {
+                map.insert(key.to_storage_key(), policy);
+            }
+            None => {
+                map.remove(&key.to_storage_key());
+            }
+        }
+        Self(map)
+    }
+}
+
+/// Per-project identity colours, keyed by [`ProjectKey::to_storage_key`].
+///
+/// Deliberately the same value type as [`DirectoryTabColors`] entries (an
+/// ANSI palette pick, not a free-form hex) so the project rail and the tab
+/// bar can never drift into two colour systems.
+#[derive(
+    Default,
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Mapping of projects to their rail identity colour.")]
+pub struct ProjectColors(pub(crate) HashMap<String, AnsiColorIdentifier>);
+
+settings::macros::implement_setting_for_enum!(
+    ProjectColors,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Never,
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.project_layout.project_colors",
+    description: "Mapping of projects to their rail identity colour.",
+    feature_flag: warp_core::features::FeatureFlag::Projects,
+);
+
+impl ProjectColors {
+    /// The user's identity colour for this project, if any.
+    pub fn color_for(&self, key: &ProjectKey) -> Option<AnsiColorIdentifier> {
+        self.0.get(&key.to_storage_key()).copied()
+    }
+
+    /// Returns a copy with `key`'s colour set, or removed when `color` is
+    /// `None`.
+    pub fn with_color(&self, key: &ProjectKey, color: Option<AnsiColorIdentifier>) -> Self {
+        let mut map = self.0.clone();
+        match color {
+            Some(color) => {
+                map.insert(key.to_storage_key(), color);
+            }
+            None => {
+                map.remove(&key.to_storage_key());
+            }
+        }
         Self(map)
     }
 }
@@ -704,6 +824,17 @@ define_settings_group!(TabSettings, settings: [
         description: "List each project's tasks under it in the project rail, each with its own status.",
         feature_flag: warp_core::features::FeatureFlag::Projects,
     },
+    rail_hide_shells_without_agents: RailHideShellsWithoutAgents {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.tabs.rail_hide_shells_without_agents",
+        description: "Hide project rail rows for tabs that are plain shells, with no agent session now or before. The active tab always stays visible.",
+        feature_flag: warp_core::features::FeatureFlag::Projects,
+    },
     use_project_layout: UseProjectLayout {
         type: bool,
         default: false,
@@ -789,6 +920,9 @@ define_settings_group!(TabSettings, settings: [
     workspace_decoration_visibility: WorkspaceDecorationVisibility,
     close_button_position: TabCloseButtonPosition,
     directory_tab_colors: DirectoryTabColors,
+    project_priorities: ProjectPriorities,
+    project_nag_policies: ProjectNagPolicies,
+    project_colors: ProjectColors,
 ]);
 
 /// Whether the vertical-tabs sidebar layout is active.
