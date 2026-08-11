@@ -1459,10 +1459,13 @@ impl<'a> TabComponent<'a> {
                                 width: rect.width(),
                             });
                         }
-                    } else {
-                        // When hover ends, dispatch action to clear stored width
-                        ctx.dispatch_typed_action(WorkspaceAction::TabHoverWidthEnd);
                     }
+                    // Deliberately no `TabHoverWidthEnd` here. Releasing the pin
+                    // the moment the pointer leaves *this* close button made every
+                    // tab resize between one close and the next, which is exactly
+                    // when the user is moving along the bar closing several. The
+                    // tab bar clears it on the way out instead — see
+                    // `Workspace::render_tab_bar_hoverable`.
                 })
                 .on_click(move |ctx, _, _| {
                     if is_last_tab {

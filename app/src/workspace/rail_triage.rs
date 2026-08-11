@@ -294,6 +294,31 @@ pub fn next_chip_target(
         .map(|task| task.tab_index)
 }
 
+/// Which controls the rail header renders beside its chips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RailHeaderControls {
+    /// The magnifier that opens the session-search popup.
+    pub session_search: bool,
+    /// The button that closes the shells with no agent on them.
+    pub clear_shells: bool,
+}
+
+/// Decides the header's two controls from the only two inputs they depend on.
+///
+/// They deliberately disagree about `show_tasks`, and the asymmetry is the
+/// point: clearing shells destroys exactly the task rows listed under each
+/// project, so with those rows hidden the button would ask the user to approve
+/// closing tabs they cannot see, and it disappears with them — while session
+/// search reaches sessions that have **no row at all** (the rail caps its
+/// dormant rows, and a project with no open tab may not be listed), so hiding
+/// rows makes it more useful, not less.
+pub fn rail_header_controls(session_search_enabled: bool, show_tasks: bool) -> RailHeaderControls {
+    RailHeaderControls {
+        session_search: session_search_enabled,
+        clear_shells: show_tasks,
+    }
+}
+
 #[cfg(test)]
 #[path = "rail_triage_tests.rs"]
 mod tests;

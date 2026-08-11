@@ -7,6 +7,10 @@ pub(crate) mod plugin_manager;
 /// state. Unconditional (unlike `transcript_naming`) so the rail's projection
 /// needs no `cfg`; the filesystem work inside it is what is gated.
 pub mod session_scan;
+/// Literal substring search inside the transcripts `session_scan` discovers.
+/// Unconditional for the same reason as `session_scan`: the palette's data
+/// source and the model's state exist everywhere, only the reading is gated.
+pub mod transcript_digest;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod transcript_naming;
 
@@ -345,9 +349,36 @@ impl CLIAgentSession {
                 self.clear_permission_scoped_state();
                 CLIAgentSessionStatus::InProgress
             }
-            // IdlePrompt means the agent is sitting at its prompt waiting for input.
-            // This should not affect status — otherwise it would override Success after a Stop event.
-            CLIAgentEventType::IdlePrompt => return None,
+            // IdlePrompt means the agent is sitting at its prompt waiting for
+            // the user to type. That is a wait, and the rail's whole job is to
+            // surface waits — but only when nothing fresher already describes
+            // the session.
+            //
+            // The original rule dropped it outright, to stop it overriding
+            // `Success` after a `Stop`. That concern is real and is preserved
+            // below; what has changed is the cost of over-correcting. When
+            // this was written, status drove only a badge. It now drives the
+            // rail's colour, the "waiting" chip and the nag engine — so
+            // discarding the event means the one waiting state that occurs
+            // constantly for anyone running agents with permissions
+            // pre-accepted (measured on a real profile: 15 idle prompts, and
+            // *zero* permission requests or questions) is the single state
+            // never shown.
+            //
+            // `Success` therefore wins: a finished agent stays green rather
+            // than flipping to yellow because it is also, trivially, sitting
+            // at its prompt. Anything else becomes a wait.
+            CLIAgentEventType::IdlePrompt => {
+                if matches!(
+                    self.status,
+                    CLIAgentSessionStatus::Success | CLIAgentSessionStatus::Failed { .. }
+                ) {
+                    return None;
+                }
+                CLIAgentSessionStatus::Blocked {
+                    message: Some("Waiting for your input".to_owned()),
+                }
+            }
             CLIAgentEventType::SessionStart => {
                 self.plugin_version = event.payload.plugin_version.clone();
                 return None;

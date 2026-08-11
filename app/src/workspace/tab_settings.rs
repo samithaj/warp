@@ -824,17 +824,6 @@ define_settings_group!(TabSettings, settings: [
         description: "List each project's tasks under it in the project rail, each with its own status.",
         feature_flag: warp_core::features::FeatureFlag::Projects,
     },
-    rail_hide_shells_without_agents: RailHideShellsWithoutAgents {
-        type: bool,
-        default: false,
-        supported_platforms: SupportedPlatforms::ALL,
-        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
-        surface: settings::SettingSurfaces::GUI,
-        private: false,
-        toml_path: "appearance.tabs.rail_hide_shells_without_agents",
-        description: "Hide project rail rows for tabs that are plain shells, with no agent session now or before. The active tab always stays visible.",
-        feature_flag: warp_core::features::FeatureFlag::Projects,
-    },
     use_project_layout: UseProjectLayout {
         type: bool,
         default: false,

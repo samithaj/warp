@@ -49,6 +49,7 @@ use anyhow::Context as _;
 #[cfg(target_os = "macos")]
 use anyhow::Result;
 use autoupdate::AutoupdateStage;
+use chrono::{DateTime, Utc};
 #[cfg(target_os = "macos")]
 use command::blocking::Command;
 use futures::Future;
@@ -105,7 +106,7 @@ use warpui::elements::{
 use warpui::fonts::{FamilyId, Properties, Weight};
 use warpui::geometry::vector::{Vector2F, vec2f};
 use warpui::keymap::Context;
-use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback};
+use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback, ModalButton};
 use warpui::notification::{NotificationSendError, RequestPermissionsOutcome, UserNotification};
 use warpui::platform::{
     Cursor, FilePickerConfiguration, FullscreenState, SystemTheme, TerminationMode,
@@ -323,6 +324,9 @@ use crate::resource_center::{
 };
 use crate::reward_view::{RewardEvent, RewardKind, RewardView};
 use crate::root_view::{NewWorkspaceSource, OpenLaunchConfigArg, quake_mode_window_id};
+use crate::search::command_palette::agent_sessions::{
+    self, AgentSessionCandidate, CandidateOrigin,
+};
 use crate::search::command_palette::view::{
     Event as CommandPaletteEvent, NavigationMode, View as CommandPalette,
 };
@@ -348,7 +352,9 @@ use crate::server::telemetry::{
     OpenedWarpAISource, PaletteSource, SharingDialogSource, TabRenameEvent, TierLimitHitEvent,
     WarpDriveSource,
 };
-use crate::session_management::{SessionNavigationData, SessionSource, TabNavigationData};
+use crate::session_management::{
+    RunningSessionSummary, SessionNavigationData, SessionSource, TabNavigationData,
+};
 use crate::settings::cloud_preferences::CloudPreferencesSettings;
 use crate::settings::{
     AISettings, AISettingsChangedEvent, AccessibilitySettings, AliasExpansionSettings,
@@ -358,7 +364,6 @@ use crate::settings::{
     PrivacySettings, SelectionSettings, Settings, SshSettings, ThemeSettings, active_theme_kind,
     respect_system_theme,
 };
-use crate::settings_view::appearance_page::AppearancePageAction;
 use crate::settings_view::environments_page::EnvironmentsPage;
 use crate::settings_view::handoff_environment_creation_modal::{
     HandoffEnvironmentCreationModal, HandoffEnvironmentCreationModalEvent,
@@ -366,9 +371,7 @@ use crate::settings_view::handoff_environment_creation_modal::{
 use crate::settings_view::keybindings::{KeybindingChangedEvent, KeybindingChangedNotifier};
 use crate::settings_view::mcp_servers_page::MCPServersSettingsPage;
 use crate::settings_view::pane_manager::SettingsPaneManager;
-use crate::settings_view::{
-    SettingsAction, SettingsSection, SettingsView, SettingsViewEvent, flags,
-};
+use crate::settings_view::{SettingsSection, SettingsView, SettingsViewEvent, flags};
 #[cfg(all(target_os = "windows", feature = "local_tty"))]
 use crate::shell_indicator::ShellIndicatorType;
 use crate::tab::{
@@ -521,12 +524,13 @@ use crate::workspace::one_time_modal_model::OneTimeModalModel;
 use crate::workspace::project_key::ProjectKey;
 use crate::workspace::project_layout::{self, ProjectId, ProjectLayout};
 use crate::workspace::project_priorities::{ProjectPriorities, RailProjectRow, rail_project_rows};
-use crate::workspace::rail_shells::{
-    RailLiveRow, RailShellFilter, hidden_shells_label, visible_live_rows,
+use crate::workspace::rail_clear_shells::{
+    RailShellRow, clear_shells_detail, clear_shells_prompt, cleared_shells_label, projects_of,
+    shells_to_clear,
 };
 use crate::workspace::rail_triage::{
     self, ProjectTriage, RailChip, RailTask, RailUrgency, TaskTriage, chip_counts,
-    next_chip_target, rail_task_order,
+    next_chip_target, rail_header_controls, rail_task_order,
 };
 use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
@@ -740,6 +744,14 @@ pub(crate) const TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME: &str = "workspace:toggle_
 /// binding's action, so its tooltip can show whatever shortcut the user has
 /// assigned).
 pub(crate) const NEW_PROJECT_BINDING_NAME: &str = "workspace:new_project";
+/// Opens the session-search popup (the rail header's magnifier dispatches this
+/// same binding's action, so its tooltip shows whatever shortcut the user has
+/// assigned).
+pub(crate) const SESSION_SEARCH_BINDING_NAME: &str = "workspace:open_session_search";
+/// Closes the shells with no agent on them (the rail header's trash can
+/// dispatches this same binding's action, so its tooltip shows whatever
+/// shortcut the user has assigned — by default, none).
+pub(crate) const CLEAR_SHELLS_BINDING_NAME: &str = "workspace:clear_shells_without_agents";
 
 // Editable left panel toolbelt keybindings.
 pub(crate) const LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME: &str =
@@ -1194,6 +1206,11 @@ pub struct Workspace {
     changelog_model: ModelHandle<ChangelogModel>,
     palette: ViewHandle<CommandPalette>,
     ctrl_tab_palette: ViewHandle<CommandPalette>,
+    /// The session-search popup. A third palette instance rather than a mode of
+    /// the main one, because its mixer holds a single source whose contents are
+    /// a snapshot taken on open — resetting the main palette's mixer to that and
+    /// back would race with whatever it was already showing.
+    session_search_palette: ViewHandle<CommandPalette>,
     mouse_states: WorkspaceMouseStates,
     settings_pane: ViewHandle<SettingsView>,
     import_modal: ViewHandle<ImportModal>,
@@ -1349,6 +1366,20 @@ pub struct Workspace {
     /// orchestration cards' "New API key…" flow. Cloud mode renders the
     /// FTUX view inline and does not use this.
     create_auth_secret_modal: Option<ViewHandle<Modal<AuthSecretFtuxView>>>,
+}
+
+/// The tab to fall to when `removed_index` is closed, among the indices still
+/// visible: the nearest one after it, else the nearest one before.
+///
+/// Split out from [`Workspace::close_successor_in_selected_project`] so the
+/// rule can be tested without standing up a workspace — the surrounding
+/// machinery needs a live `AppContext`, this does not.
+fn nearest_remaining_tab(visible: &[usize], removed_index: usize) -> Option<usize> {
+    visible
+        .iter()
+        .copied()
+        .find(|i| *i >= removed_index)
+        .or_else(|| visible.iter().copied().rfind(|i| *i < removed_index))
 }
 
 impl Workspace {
@@ -3043,6 +3074,18 @@ impl Workspace {
             me.handle_palette_event(event, ctx);
         });
 
+        // `SessionSearch` and not `CtrlTab`: this popup is driven by typing, and
+        // the ctrl-tab mode hides the search bar. It renders like `Normal` for
+        // exactly that reason, and differs only in what the mode switches on —
+        // the debounced transcript-content search, its footer, and the
+        // suppressed "no results" placeholder, none of which the two ordinary
+        // palettes should carry.
+        let session_search_palette = ctx
+            .add_typed_action_view(|ctx| CommandPalette::new(NavigationMode::SessionSearch, ctx));
+        ctx.subscribe_to_view(&session_search_palette, |me, _, event, ctx| {
+            me.handle_palette_event(event, ctx);
+        });
+
         let auth_manager = AuthManager::handle(ctx);
         ctx.subscribe_to_model(&auth_manager, Self::handle_auth_manager_event);
 
@@ -3580,6 +3623,7 @@ impl Workspace {
             welcome_tips_view,
             palette,
             ctrl_tab_palette,
+            session_search_palette,
             mouse_states: Default::default(),
             previous_theme: None,
             settings_pane,
@@ -4301,7 +4345,6 @@ impl Workspace {
             TabSettingsChangedEvent::TabPrimaryInfo { .. }
             | TabSettingsChangedEvent::TabSecondaryInfo { .. }
             | TabSettingsChangedEvent::RailShowTasks { .. }
-            | TabSettingsChangedEvent::RailHideShellsWithoutAgents { .. }
             | TabSettingsChangedEvent::RailTaskInfo { .. } => {
                 // Tab text is derived at render time, so a repaint is enough.
                 ctx.notify();
@@ -6206,6 +6249,190 @@ impl Workspace {
             }),
             None => log::warn!("No terminal view to prefill after resuming a dormant agent task"),
         }
+    }
+
+    /// One [`RailShellRow`] per live tab, with every reason *not* to close it
+    /// already resolved.
+    ///
+    /// Deliberately computed on demand rather than per frame: `pane_has_agent`
+    /// repeats the conversation and handle lookups a row's label already does,
+    /// and `pane_sessions` walks every pane, so the rail must not pay for any
+    /// of it on each repaint merely to keep a button enabled.
+    fn rail_shell_rows(&self, ctx: &AppContext) -> Vec<RailShellRow> {
+        let layout = ProjectLayout::compute(&self.tabs, ctx);
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(tab_index, tab)| {
+                let pane_group = tab.pane_group.as_ref(ctx);
+                let sessions: Vec<_> = pane_group
+                    .pane_sessions(tab.pane_group.id(), tab.pane_group.window_id(ctx), ctx)
+                    .collect();
+                RailShellRow {
+                    tab_index,
+                    has_agent: crate::workspace::tab_title::pane_has_agent(pane_group, ctx),
+                    // The same source of truth the quit warning counts
+                    // processes with, one level down: `RunningSessionSummary`
+                    // is what `UnsavedStateSummary` asks, and asking it
+                    // directly keeps this read-only (no auto-save side effect,
+                    // no `&mut AppContext`).
+                    is_busy: !RunningSessionSummary::new(&sessions)
+                        .long_running_cmds
+                        .is_empty(),
+                    // Two counts rather than one because they exclude different
+                    // things: the tree length rules out splits, while the
+                    // terminal-view count reaches `pane_contents` and so also
+                    // rules out an off-tree child agent pane or a swapped-in
+                    // replacement — neither of which the agent check above
+                    // would see, since their conversations hang off a
+                    // different view. The last condition is what makes the
+                    // pane a terminal at all: a code or notebook pane (whose
+                    // unsaved edits nothing here has vouched for) has no
+                    // focused session view.
+                    is_lone_terminal: pane_group.pane_count() == 1
+                        && pane_group.terminal_views(ctx).len() == 1
+                        && pane_group.focused_session_view(ctx).is_some(),
+                    is_shared: pane_group.is_terminal_pane_being_shared(ctx),
+                    project: layout
+                        .project_of_tab(tab_index)
+                        .map(ProjectId::display_name)
+                        .unwrap_or_default(),
+                }
+            })
+            .collect()
+    }
+
+    /// Closes every plain shell in this window, after asking.
+    ///
+    /// Confirm-then-close rather than a filter: a mis-click on a filter costs a
+    /// second click, a mis-click here costs tabs. The dialog names the count
+    /// and the projects so the user can recognise what is about to disappear,
+    /// and it is built the same way `close_tabs` builds its quit warning — a
+    /// platform-native alert, so this reads as the same weight of decision as
+    /// closing a tab with a process in it.
+    ///
+    /// Scoped to this window: `self.tabs` is per-window, so a second window's
+    /// shells are that window's button to press.
+    fn clear_shells_without_agents(&mut self, ctx: &mut ViewContext<Self>) {
+        if !FeatureFlag::Projects.is_enabled() {
+            return;
+        }
+        let rows = self.rail_shell_rows(ctx);
+        let selection = shells_to_clear(&rows, Some(self.active_tab_index));
+        if selection.is_empty() {
+            // Not a confirmation — there is nothing to confirm. But a button
+            // that does nothing visible reads as broken, so say why.
+            let window_id = ctx.window_id();
+            WorkspaceToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                toast_stack.add_ephemeral_toast(
+                    DismissibleToast::default("No shells without agents to close.".to_owned()),
+                    window_id,
+                    ctx,
+                );
+            });
+            return;
+        }
+
+        // Identified by pane group, never by index: tabs can open and close
+        // while the dialog is up, and an index would then name a different tab.
+        let targets: Vec<EntityId> = selection
+            .iter()
+            .filter_map(|index| self.tabs.get(*index).map(|tab| tab.pane_group.id()))
+            .collect();
+        let prompt = clear_shells_prompt(selection.len());
+        let detail = clear_shells_detail(&projects_of(&rows, &selection));
+        let confirm_self = ctx.handle();
+        let dialog = AlertDialogWithCallbacks::for_app(
+            prompt,
+            detail,
+            vec![
+                ModalButton::for_app("Close", move |ctx| {
+                    if let Some(workspace) = confirm_self.upgrade(ctx) {
+                        workspace.update(ctx, |workspace, ctx| {
+                            workspace.close_shells_by_pane_group_id(&targets, ctx);
+                        });
+                    }
+                }),
+                ModalButton::for_app("Cancel", |_ctx| { /* Dismissing is the whole action. */ }),
+            ],
+            |_ctx| { /* Nothing to suppress: this modal is only ever asked for. */ },
+        );
+
+        // Same two-platform split as `close_tabs`: macOS gets the real native
+        // sheet, Linux and Windows get the in-window stand-in.
+        if cfg!(all(not(target_family = "wasm"), target_os = "macos")) {
+            AppContext::show_native_platform_modal(ctx, dialog);
+        } else if cfg!(all(
+            not(target_family = "wasm"),
+            any(target_os = "linux", windows)
+        )) {
+            self.show_native_modal(dialog, ctx);
+        }
+    }
+
+    /// Closes the confirmed shells, re-checking each one first.
+    ///
+    /// The re-check is not paranoia: a command can start, an agent can attach
+    /// or the user can switch tabs while the dialog is up, and every one of
+    /// those makes a tab ineligible after it was counted.
+    ///
+    /// Closes through [`PaneGroup::close_pane`] rather than closing the tab
+    /// directly so the close takes the repo's own undo path: with a single
+    /// visible pane, `close_pane` emits `Event::Exited { add_to_undo_stack:
+    /// true }`, which this workspace turns into `close_tab` and so into an
+    /// entry on the undo-close stack.
+    ///
+    /// The toast counts the tabs this dispatched a close for, which is the most
+    /// it can honestly claim: `Event::Exited` is delivered after this update
+    /// finishes, so `self.tabs` still holds every closing tab when the count is
+    /// taken and there is no survivor set to recount against.
+    fn close_shells_by_pane_group_id(
+        &mut self,
+        pane_group_ids: &[EntityId],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let rows = self.rail_shell_rows(ctx);
+        let still_eligible: Vec<EntityId> = shells_to_clear(&rows, Some(self.active_tab_index))
+            .iter()
+            .filter_map(|index| self.tabs.get(*index).map(|tab| tab.pane_group.id()))
+            .collect();
+        let closing: Vec<EntityId> = pane_group_ids
+            .iter()
+            .filter(|pane_group_id| still_eligible.contains(pane_group_id))
+            .copied()
+            .collect();
+
+        for pane_group_id in &closing {
+            let Some(pane_group) = self
+                .tabs
+                .iter()
+                .find(|tab| tab.pane_group.id() == *pane_group_id)
+                .map(|tab| tab.pane_group.clone())
+            else {
+                continue;
+            };
+            // Safe by construction rather than by check: `is_lone_terminal`
+            // required `focused_session_view` — which *is*
+            // `terminal_view_from_pane_id(focused_pane_id(..))` — to resolve,
+            // so this group's focused pane is its one terminal pane.
+            let pane_id = pane_group.as_ref(ctx).focused_pane_id(ctx);
+            pane_group.update(ctx, |pane_group, ctx| {
+                pane_group.close_pane(pane_id, ctx);
+            });
+        }
+
+        let closed = closing.len();
+        if closed == 0 {
+            return;
+        }
+        let window_id = ctx.window_id();
+        WorkspaceToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            toast_stack.add_ephemeral_toast(
+                DismissibleToast::default(cleared_shells_label(closed)),
+                window_id,
+                ctx,
+            );
+        });
     }
 
     /// The directory a new tab should open in so it becomes a task under the
@@ -8912,6 +9139,40 @@ impl Workspace {
     }
 
     /// Removes a tab group from the workspace if no tabs reference it.
+    /// The tab to activate after closing the active tab, kept inside the
+    /// project the user is looking at.
+    ///
+    /// `self.tabs` is one flat list across every project, while the rail groups
+    /// by project and the tab strip is filtered to the selected one. So the
+    /// flat neighbour of a closed tab frequently belongs to a *different*
+    /// project — and `set_active_tab_index` then faithfully re-points
+    /// `selected_project` at it, swapping the rail selection and the whole tab
+    /// strip to an unrelated project's tasks in the same frame. Closing the
+    /// rightmost tab of a project's run was enough to trigger it, even with
+    /// other tabs of that project still open.
+    ///
+    /// Every other navigation path in project mode is already scoped this way
+    /// (`activate_prev_tab`, `activate_next_tab`, `activate_tab_by_number`,
+    /// the Ctrl-Tab palette); this one was missed.
+    ///
+    /// The project comes from `selected_project` rather than from the removed
+    /// tab: `detach_panes_for_close` has already run by this point, so the
+    /// closed tab's `active_session_path` may no longer resolve, and the
+    /// active∈selected invariant means the two are the same project anyway.
+    ///
+    /// Returns `None` when project mode is off, or when the project has no
+    /// tabs left — the caller then keeps the flat-neighbour behaviour.
+    fn close_successor_in_selected_project(
+        &self,
+        removed_index: usize,
+        ctx: &AppContext,
+    ) -> Option<usize> {
+        // `visible` is computed after the removal, so it already excludes the
+        // closed tab and its indices refer to the current `self.tabs`.
+        let visible = self.project_visible_indices(ctx)?;
+        nearest_remaining_tab(&visible, removed_index)
+    }
+
     fn prune_empty_tab_group(&mut self, group_id: TabGroupId, ctx: &mut ViewContext<Self>) {
         let has_members = group_member_indices(&self.tabs, group_id).next().is_some();
         if !has_members {
@@ -13054,6 +13315,7 @@ impl Workspace {
             },
             CtrlTabBehavior::CycleMostRecentSession | CtrlTabBehavior::CycleMostRecentTab => {
                 self.current_workspace_state.is_palette_open = false;
+                self.current_workspace_state.is_session_search_palette_open = false;
                 let palette_was_open = self.current_workspace_state.is_ctrl_tab_palette_open;
                 if !palette_was_open {
                     self.open_palette_action(
@@ -13292,7 +13554,10 @@ impl Workspace {
                 // tab occupies the same index. If the closed tab was the last one, fall
                 // back to the new last tab (the previous neighbor). This matches the
                 // browser / macOS convention for both layouts.
-                let active_index = index.min(self.tabs.len() - 1);
+                let flat_successor = index.min(self.tabs.len() - 1);
+                let active_index = self
+                    .close_successor_in_selected_project(index, ctx)
+                    .unwrap_or(flat_successor);
                 self.activate_tab_internal(active_index, ctx);
             }
             Ordering::Less => {
@@ -15687,6 +15952,207 @@ impl Workspace {
         ctx.notify();
     }
 
+    /// Opens the session-search popup over a snapshot of every CLI-agent
+    /// session Warp can name.
+    fn open_session_search_palette(&mut self, ctx: &mut ViewContext<Self>) {
+        // A session started in another terminal only exists on disk, and the
+        // scan is only kicked by user actions. Opening the popup is exactly
+        // such an action; the results land for the next open if the scan is
+        // still running, which is the same deal the rail makes.
+        self.refresh_claude_session_scan(ctx);
+
+        let candidates = self.agent_session_candidates(ctx);
+        // The same list, handed to the content search as its corpus: a popup
+        // that can name a session should be able to look inside it. Set here,
+        // once per open, for the same reason the candidates are — walking the
+        // tabs and resolving a project per directory is far too much to redo
+        // between keystrokes.
+        self.set_transcript_digest_corpus(&candidates, ctx);
+
+        self.session_search_palette.update(ctx, |view, ctx| {
+            view.reset(ctx);
+        });
+
+        let mixer = self
+            .session_search_palette
+            .as_ref(ctx)
+            .search_bar
+            .as_ref(ctx)
+            .mixer()
+            .clone();
+        let data_source_store = self
+            .session_search_palette
+            .as_ref(ctx)
+            .data_source_store
+            .clone();
+        data_source_store.update(ctx, |store, ctx| {
+            store.reset_session_search_mixer(mixer, candidates, ctx);
+        });
+
+        self.session_search_palette.update(ctx, |view, ctx| {
+            // Set the offset BEFORE the filter: the source is synchronous, so
+            // results arrive during `set_active_query_filter` and the offset has
+            // to already be stored when the selection is first placed.
+            //
+            // The offset is 1 because the top row is the section separator, and
+            // `SelectionUpdate::Top` — unlike Up/Down — does not skip
+            // non-interactable items. Without it, Enter on a freshly opened
+            // popup accepts a header and silently does nothing.
+            view.set_initial_selection_offset(1, ctx);
+            view.set_active_query_filter(QueryFilter::AgentSessions, ctx);
+        });
+
+        ctx.notify();
+    }
+
+    /// Hands the transcript digest the sessions it may look inside.
+    ///
+    /// The corpus is the popup's own candidate list, minus nothing: the digest
+    /// drops the agents it cannot read (only Claude keeps a per-cwd transcript
+    /// store) rather than having that rule restated at every call site.
+    /// Replacing it also drops whatever the previous popup published, so a
+    /// reopened popup cannot show hits from a corpus it no longer offers.
+    fn set_transcript_digest_corpus(
+        &self,
+        candidates: &[AgentSessionCandidate],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        use crate::terminal::cli_agent_sessions::transcript_digest::{
+            DigestTarget, TranscriptDigestModel,
+        };
+
+        if !ctx.has_singleton_model::<TranscriptDigestModel>() {
+            return;
+        }
+        let corpus: Vec<DigestTarget> = candidates
+            .iter()
+            .map(|candidate| DigestTarget {
+                agent: candidate.agent,
+                session_id: candidate.session_id.clone(),
+                project_name: candidate.project_name.clone(),
+                task_name: candidate.task_name.clone(),
+                cwd: candidate.cwd.clone(),
+            })
+            .collect();
+        TranscriptDigestModel::handle(ctx).update(ctx, |digest, ctx| {
+            digest.set_corpus(corpus, ctx);
+        });
+    }
+
+    /// Every CLI-agent session the popup can offer, from all three sources:
+    /// the sessions running in open tabs, the durable handle store, and the
+    /// on-disk scan.
+    ///
+    /// Assembled once per open rather than per keystroke — it walks every tab
+    /// and resolves a project for every distinct directory, which is far too
+    /// much to redo between characters.
+    fn agent_session_candidates(&self, ctx: &AppContext) -> Vec<AgentSessionCandidate> {
+        use crate::terminal::cli_agent_sessions::handle_store::AgentSessionHandlesModel;
+
+        if !FeatureFlag::ResumeProjectTasks.is_enabled() {
+            return Vec::new();
+        }
+
+        // `ProjectKey::for_path` can hit repo detection, and a machine with a
+        // few hundred scanned sessions has far fewer distinct directories than
+        // sessions — so resolve each directory once, as `compute_with_handles`
+        // does for the rail.
+        let mut project_name_by_cwd: HashMap<String, String> = HashMap::new();
+        let mut project_name_for_cwd = |cwd: &str| -> String {
+            project_name_by_cwd
+                .entry(cwd.to_owned())
+                .or_insert_with(|| {
+                    ProjectKey::for_path(&LocalOrRemotePath::Local(PathBuf::from(cwd)), ctx)
+                        .map(ProjectId::Key)
+                        .unwrap_or(ProjectId::Other)
+                        .display_name()
+                })
+                .clone()
+        };
+
+        // The scan owns names (a `/rename` lands in the transcript, not in the
+        // cached handle title), so its labels are joined in by session id.
+        let scanned = Self::scanned_sessions(ctx);
+        let scanned_by_id: HashMap<&str, &ScannedSession> = scanned
+            .iter()
+            .map(|session| (session.session_id.as_str(), session))
+            .collect();
+
+        let mut live = Vec::new();
+        for tab in &self.tabs {
+            let pane_group = tab.pane_group.as_ref(ctx);
+            let Some(terminal_view) = pane_group.focused_session_view(ctx) else {
+                continue;
+            };
+            let Some(session) = CLIAgentSessionsModel::as_ref(ctx).session(terminal_view.id())
+            else {
+                continue;
+            };
+            let Some(session_id) = session.session_context.session_id.clone() else {
+                // Still starting up: no id yet means nothing to resume to.
+                continue;
+            };
+            let cwd = pane_group
+                .active_session_path(ctx)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            live.push(AgentSessionCandidate {
+                agent: session.agent,
+                session_id,
+                project_name: project_name_for_cwd(&cwd),
+                // The rail's own label resolution, so a session is called the
+                // same thing in the rail and in the popup.
+                task_name: crate::workspace::tab_title::rail_task_label(pane_group, ctx),
+                cwd,
+                origin: CandidateOrigin::Live,
+                last_active: None,
+            });
+        }
+
+        let handles = AgentSessionHandlesModel::as_ref(ctx)
+            .handles()
+            .iter()
+            .map(|handle| AgentSessionCandidate {
+                agent: handle.agent,
+                session_id: handle.session_id.clone(),
+                project_name: project_name_for_cwd(&handle.cwd),
+                task_name: project_layout::dormant_label(
+                    scanned_by_id
+                        .get(handle.session_id.as_str())
+                        .and_then(|session| session.label.as_deref()),
+                    handle.title.as_deref(),
+                    handle.agent,
+                    &handle.session_id,
+                ),
+                cwd: handle.cwd.clone(),
+                origin: CandidateOrigin::Handle,
+                last_active: Some(handle.last_seen_at.and_utc()),
+            })
+            .collect();
+
+        let scanned = scanned
+            .iter()
+            .map(|session| AgentSessionCandidate {
+                // The scan reads Claude Code's transcript layout, so every
+                // session it produces is a Claude session by construction.
+                agent: CLIAgent::Claude,
+                session_id: session.session_id.clone(),
+                project_name: project_name_for_cwd(&session.cwd),
+                task_name: project_layout::dormant_label(
+                    session.label.as_deref(),
+                    None,
+                    CLIAgent::Claude,
+                    &session.session_id,
+                ),
+                cwd: session.cwd.clone(),
+                origin: CandidateOrigin::Scanned,
+                last_active: Some(DateTime::<Utc>::from(session.modified)),
+            })
+            .collect();
+
+        agent_sessions::candidate::merge(live, handles, scanned)
+    }
+
     fn open_ctrl_tab_palette(
         &mut self,
         query_filter: QueryFilter,
@@ -15811,6 +16277,7 @@ impl Workspace {
     ) {
         self.current_workspace_state.is_palette_open = false;
         self.current_workspace_state.is_ctrl_tab_palette_open = false;
+        self.current_workspace_state.is_session_search_palette_open = false;
         self.tab_bar_pinned_by_popup = false;
         self.sync_window_button_visibility(ctx);
         if focus_active_tab
@@ -15902,6 +16369,8 @@ impl Workspace {
         }
         if matches!(source, PaletteSource::CtrlTab { .. }) {
             self.current_workspace_state.is_ctrl_tab_palette_open = true;
+        } else if matches!(mode, PaletteMode::SessionSearch) {
+            self.current_workspace_state.is_session_search_palette_open = true;
         } else {
             self.current_workspace_state.is_palette_open = true;
         }
@@ -15923,9 +16392,23 @@ impl Workspace {
             PaletteMode::WarpDrive => self.open_warp_drive_palette(ctx),
             PaletteMode::Files => self.open_files_palette(ctx),
             PaletteMode::Conversations => self.open_conversations_palette(ctx),
+            PaletteMode::SessionSearch => self.open_session_search_palette(ctx),
         }
 
-        ctx.focus(&self.palette);
+        // Focus has to follow the palette that is actually rendered. Ctrl+Tab
+        // tolerates focusing the main palette because it takes no typed input,
+        // but the session-search popup is driven entirely by typing: focusing
+        // the wrong instance leaves it on screen swallowing nothing while every
+        // keystroke goes to an off-screen palette.
+        match mode {
+            PaletteMode::SessionSearch => ctx.focus(&self.session_search_palette),
+            PaletteMode::Command
+            | PaletteMode::Navigation
+            | PaletteMode::LaunchConfig
+            | PaletteMode::WarpDrive
+            | PaletteMode::Files
+            | PaletteMode::Conversations => ctx.focus(&self.palette),
+        }
 
         send_telemetry_from_ctx!(TelemetryEvent::PaletteSearchOpened { mode, source }, ctx);
 
@@ -15969,11 +16452,18 @@ impl Workspace {
             .current_workspace_state
             .is_any_non_palette_modal_open(ctx)
         {
-            let is_palette_mode_already_open =
+            // The session-search popup lives in its own palette instance, so
+            // "already open" is its own flag rather than the main palette's
+            // active filter — which never becomes `AgentSessions`.
+            let is_palette_mode_already_open = if matches!(palette_mode, PaletteMode::SessionSearch)
+            {
+                self.current_workspace_state.is_session_search_palette_open
+            } else {
                 self.palette.as_ref(ctx).is_mode_enabled(palette_mode, ctx)
                     && ((matches!(source, PaletteSource::CtrlTab { .. })
                         && self.current_workspace_state.is_ctrl_tab_palette_open)
-                        || self.current_workspace_state.is_palette_open);
+                        || self.current_workspace_state.is_palette_open)
+            };
             if is_palette_mode_already_open {
                 self.close_palette(true, None, ctx);
             } else {
@@ -16279,6 +16769,7 @@ impl Workspace {
     pub fn is_palette_open(&self) -> bool {
         self.current_workspace_state.is_palette_open
             || self.current_workspace_state.is_ctrl_tab_palette_open
+            || self.current_workspace_state.is_session_search_palette_open
     }
 
     pub fn is_workflow_modal_open(&self) -> bool {
@@ -19869,6 +20360,7 @@ impl Workspace {
         // in case it was used to open the theme chooser.
         self.current_workspace_state.is_palette_open = false;
         self.current_workspace_state.is_ctrl_tab_palette_open = false;
+        self.current_workspace_state.is_session_search_palette_open = false;
         self.previous_workspace_state = Some(self.current_workspace_state);
         self.current_workspace_state.is_ai_assistant_panel_open = false;
         self.current_workspace_state.is_theme_chooser_open = true;
@@ -21886,8 +22378,18 @@ impl Workspace {
     fn render_tab_bar_hoverable(&self, content: Box<dyn Element>) -> Box<dyn Element> {
         Hoverable::new(self.tab_bar_hover_state.clone(), |_| content)
             .with_hover_out_delay(Duration::from_millis(500))
-            .on_hover(|_is_hovered, ctx, _app, _position| {
+            .on_hover(|is_hovered, ctx, _app, _position| {
                 ctx.dispatch_typed_action(WorkspaceAction::SyncTrafficLights);
+                if !is_hovered {
+                    // Tab widths are content-driven, so closing a tab re-measures
+                    // every surviving one. Hovering a close button pins them so the
+                    // × cannot slide out from under the cursor; releasing that pin
+                    // per-button meant the whole bar resized between consecutive
+                    // closes. Holding it until the pointer leaves the bar keeps the
+                    // strip still for as long as the user is working in it, and
+                    // settles once on the way out.
+                    ctx.dispatch_typed_action(WorkspaceAction::TabHoverWidthEnd);
+                }
             })
             .finish()
     }
@@ -24115,33 +24617,51 @@ impl Workspace {
             ));
         }
 
-        // The shell filter, next to the chips whose counts it explains. Filled
-        // funnel while filtering, hollow while not, so the rail says at a
-        // glance whether it is showing everything — a rail that quietly hides
-        // rows with no visible sign is worse than a noisy one. Hidden along
-        // with the task rows themselves: with nothing listed there is nothing
-        // to filter.
         let tab_settings = TabSettings::as_ref(ctx);
-        let hide_shells = *tab_settings.rail_hide_shells_without_agents;
-        if *tab_settings.rail_show_tasks {
+        // The two controls disagree about `rail_show_tasks` on purpose; the
+        // reason lives with the decision, in `rail_header_controls`.
+        let controls = rail_header_controls(
+            FeatureFlag::ResumeProjectTasks.is_enabled(),
+            *tab_settings.rail_show_tasks,
+        );
+
+        if controls.session_search {
             header_row.add_child(
                 self.render_tab_bar_icon_button(
                     appearance,
-                    if hide_shells {
-                        icons::Icon::FilterFunnelFilled
-                    } else {
-                        icons::Icon::FilterFunnel
+                    icons::Icon::Search,
+                    &self.mouse_states.rail_session_search_button,
+                    WorkspaceAction::TogglePalette {
+                        mode: PaletteMode::SessionSearch,
+                        source: PaletteSource::RailHeader,
                     },
-                    &self.mouse_states.rail_hide_shells_button,
-                    // Routed through the Appearance page's own toggle so the
-                    // button, the Settings switch and the command palette all
-                    // write the setting through one place.
-                    WorkspaceAction::DispatchToSettingsTab(SettingsAction::AppearancePageToggle(
-                        AppearancePageAction::ToggleRailHideShellsWithoutAgents,
-                    )),
-                    "Hide shells without agents".to_string(),
-                    None,
-                    hide_shells,
+                    "Find a session".to_string(),
+                    keybinding_name_to_display_string(SESSION_SEARCH_BINDING_NAME, ctx),
+                    false,
+                    false,
+                )
+                .finish(),
+            );
+        }
+
+        // Clearing the shells, in the slot the funnel used to occupy. A trash
+        // can rather than a filter glyph because it no longer hides anything —
+        // it closes tabs — and never a lit "on" state: this is a one-shot
+        // command, not a mode the rail can be left in.
+        //
+        // Always enabled, never greyed out on an empty selection: deciding that
+        // would mean running the whole agent/busy/shared scan on every repaint,
+        // and the click path says "no shells without agents to close" for free.
+        if controls.clear_shells {
+            header_row.add_child(
+                self.render_tab_bar_icon_button(
+                    appearance,
+                    icons::Icon::Trash,
+                    &self.mouse_states.rail_clear_shells_button,
+                    WorkspaceAction::ClearShellsWithoutAgents,
+                    "Clear shells without agents".to_string(),
+                    keybinding_name_to_display_string(CLEAR_SHELLS_BINDING_NAME, ctx),
+                    false,
                     false,
                 )
                 .finish(),
@@ -24352,11 +24872,6 @@ impl Workspace {
         };
         let selected = self.selected_project.clone();
         let show_tasks = *TabSettings::as_ref(ctx).rail_show_tasks;
-        // Plain shells are the rail's noise floor: in a rail whose job is
-        // "which agent needs me?", a column of `zsh` rows crowds out the
-        // answer. Dormant rows are not filtered — they exist only because a
-        // session does.
-        let hide_shells = *TabSettings::as_ref(ctx).rail_hide_shells_without_agents;
         // Rank sorts the rail into two bands. The order is a pure function of
         // this list, never of agent activity: a sidebar earns its keep through
         // spatial memory, so a project must not move because one of its agents
@@ -24511,52 +25026,11 @@ impl Workspace {
             if !show_tasks {
                 continue;
             }
-            // Which of this project's live rows survive the shell filter. The
-            // rule lives in `rail_shells` as a pure function; everything the
-            // exemptions need is resolved here, where the active tab and the
-            // MRU order are known.
-            let live_rows: Vec<RailLiveRow> = tasks
-                .iter()
-                .map(|(index, _)| RailLiveRow {
-                    tab_index: *index,
-                    // Resolved only while filtering: it repeats the conversation
-                    // and handle lookups the row's label already does, and a
-                    // rail that is not filtering must not pay for them.
-                    has_agent: hide_shells
-                        && self.tabs.get(*index).is_some_and(|tab| {
-                            crate::workspace::tab_title::pane_has_agent(
-                                tab.pane_group.as_ref(ctx),
-                                ctx,
-                            )
-                        }),
-                })
-                .collect();
-            let visible_rows = visible_live_rows(
-                &live_rows,
-                RailShellFilter {
-                    hide_shells,
-                    active_tab: Some(self.active_tab_index),
-                    // Only the selected project is kept from collapsing to a
-                    // bare header, and it keeps the tab the user was last in.
-                    fallback_row: is_selected
-                        .then(|| {
-                            self.mru_tab_index(
-                                &tasks.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
-                            )
-                        })
-                        .flatten(),
-                },
-            );
             // One row per task, each with its own status. The project row's
             // aggregate can only say "something here needs you"; these say
             // which one.
             for (index, task_triage) in tasks {
                 let index = *index;
-                // Filtered rather than pre-collected so every row below keeps
-                // reading from the one triage pass, in rail order.
-                if !visible_rows.visible.contains(&index) {
-                    continue;
-                }
                 let Some(tab) = self.tabs.get(index) else {
                     continue;
                 };
@@ -24742,28 +25216,6 @@ impl Workspace {
                 })
                 .finish();
                 column.add_child(task_row);
-            }
-
-            // What the filter took away, said out loud. Deliberately inert: it
-            // is a count, not a target — clicking would have to either pick one
-            // arbitrary shell (surprising) or expand into per-project state the
-            // rail deliberately keeps none of. The header toggle is the way
-            // back, and it is one click away.
-            if let Some(label) = hidden_shells_label(visible_rows.hidden_shells) {
-                column.add_child(
-                    Container::new(
-                        Text::new_inline(label, font_family, 11.)
-                            .with_color(rank_color.into())
-                            .finish(),
-                    )
-                    .with_padding_left(10.)
-                    .with_padding_right(10.)
-                    .with_padding_top(2.)
-                    .with_padding_bottom(2.)
-                    .with_margin_left(ROW_SIDE_MARGIN + TASK_ROW_INDENT)
-                    .with_margin_right(ROW_SIDE_MARGIN)
-                    .finish(),
-                );
             }
 
             // Dormant tasks: sessions with no open tab, listed after the live
@@ -25237,12 +25689,6 @@ impl Workspace {
 
         if *tab_settings.use_project_layout {
             context.set.insert(flags::PROJECT_LAYOUT_CONTEXT_FLAG);
-        }
-
-        if *tab_settings.rail_hide_shells_without_agents {
-            context
-                .set
-                .insert(flags::RAIL_HIDE_SHELLS_WITHOUT_AGENTS_FLAG);
         }
 
         if session_settings
@@ -26196,6 +26642,7 @@ impl TypedActionView for Workspace {
             ResumeDormantAgentTask { agent, session_id } => {
                 self.resume_dormant_agent_task(*agent, session_id.clone(), ctx)
             }
+            ClearShellsWithoutAgents => self.clear_shells_without_agents(ctx),
             SetActiveTabColor(color) => {
                 // When the active tab is in a group, redirect to the group's color.
                 // The tab color selection menu is hidden when a tab is part of a group
@@ -29513,6 +29960,13 @@ impl View for Workspace {
 
         if self.current_workspace_state.is_ctrl_tab_palette_open {
             stack.add_child(ChildView::new(&self.ctrl_tab_palette).finish());
+        }
+
+        // An overlay child like the main palette, not a plain child like
+        // ctrl-tab's: the overlay path is what carries the `Dismiss` focus trap
+        // and click-outside-to-close that a typed-into popup needs.
+        if self.current_workspace_state.is_session_search_palette_open {
+            stack.add_overlay_child(ChildView::new(&self.session_search_palette).finish());
         }
 
         if self.current_workspace_state.is_require_login_modal_open {

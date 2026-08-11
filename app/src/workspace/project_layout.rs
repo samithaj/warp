@@ -334,7 +334,8 @@ fn unwitnessed_sessions<'a>(
     unwitnessed
 }
 
-/// The label for one dormant row.
+/// The label for one dormant row, and for the same session's row in the
+/// session-search popup — one name for one session, wherever it is listed.
 ///
 /// The scanned name wins over the cached one even for a witnessed session: the
 /// handle's title was cached when Warp last looked, but `/rename` lands in the
@@ -346,7 +347,7 @@ fn unwitnessed_sessions<'a>(
 /// whatever title a plugin event carried
 /// (`AgentSessionHandleOp::SetTitle` sets it verbatim), so an empty one has to
 /// fall through to the floor rather than name the row nothing at all.
-fn dormant_label(
+pub(crate) fn dormant_label(
     scanned_label: Option<&str>,
     cached_title: Option<&str>,
     agent: CLIAgent,
